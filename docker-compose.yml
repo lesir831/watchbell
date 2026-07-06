@@ -1,0 +1,20 @@
+services:
+  watchbell:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      WATCHBELL_ADDR: ":8080"
+      WATCHBELL_DB: "/data/watchbell.db"
+      WATCHBELL_WEB_DIR: "/app/web/dist"
+      WATCHBELL_WORKERS: "4"
+      WATCHBELL_SCHEDULER_TICK: "10s"
+      WATCHBELL_ADMIN_USERNAME: "${WATCHBELL_ADMIN_USERNAME:-admin}"
+      WATCHBELL_ADMIN_PASSWORD: "${WATCHBELL_ADMIN_PASSWORD:?set WATCHBELL_ADMIN_PASSWORD}"
+      WATCHBELL_SESSION_SECRET: "${WATCHBELL_SESSION_SECRET:?set WATCHBELL_SESSION_SECRET}"
+    volumes:
+      - watchbell-data:/data
+    restart: unless-stopped
+
+volumes:
+  watchbell-data:

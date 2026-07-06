@@ -1,0 +1,298 @@
+package auth
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	defaultUsername        = "admin"
+	defaultCookieName      = "watchbell_session"
+	defaultPBKDF2Iter      = 210_000
+	defaultPasswordKeySize = 32
+)
+
+type Config struct {
+	Enabled       bool
+	Username      string
+	Password      string
+	PasswordHash  string
+	SessionSecret string
+	SessionTTL    time.Duration
+	CookieName    string
+}
+
+type Manager struct {
+	enabled       bool
+	username      string
+	passwordHash  string
+	sessionSecret []byte
+	sessionTTL    time.Duration
+	cookieName    string
+	logger        *slog.Logger
+}
+
+type contextKey struct{}
+
+type sessionPayload struct {
+	Username  string `json:"u"`
+	ExpiresAt int64  `json:"exp"`
+}
+
+func NewManager(cfg Config, logger *slog.Logger) (*Manager, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if !cfg.Enabled {
+		return &Manager{enabled: false, logger: logger}, nil
+	}
+	if strings.TrimSpace(cfg.Username) == "" {
+		cfg.Username = defaultUsername
+	}
+	if cfg.SessionTTL <= 0 {
+		cfg.SessionTTL = 7 * 24 * time.Hour
+	}
+	if strings.TrimSpace(cfg.CookieName) == "" {
+		cfg.CookieName = defaultCookieName
+	}
+	passwordHash := strings.TrimSpace(cfg.PasswordHash)
+	if passwordHash == "" {
+		if cfg.Password == "" {
+			return nil, fmt.Errorf("auth is enabled; set WATCHBELL_ADMIN_PASSWORD or WATCHBELL_ADMIN_PASSWORD_HASH, or set WATCHBELL_AUTH_DISABLED=true for local-only development")
+		}
+		hash, err := HashPassword(cfg.Password)
+		if err != nil {
+			return nil, err
+		}
+		passwordHash = hash
+	}
+	secret := []byte(cfg.SessionSecret)
+	if len(secret) == 0 {
+		secret = make([]byte, 32)
+		if _, err := rand.Read(secret); err != nil {
+			return nil, err
+		}
+		logger.Warn("WATCHBELL_SESSION_SECRET is not set; generated sessions will be invalid after restart")
+	}
+	if len(secret) < 32 {
+		logger.Warn("WATCHBELL_SESSION_SECRET should be at least 32 bytes")
+	}
+	return &Manager{
+		enabled:       true,
+		username:      cfg.Username,
+		passwordHash:  passwordHash,
+		sessionSecret: secret,
+		sessionTTL:    cfg.SessionTTL,
+		cookieName:    cfg.CookieName,
+		logger:        logger,
+	}, nil
+}
+
+func (m *Manager) Enabled() bool {
+	return m != nil && m.enabled
+}
+
+func (m *Manager) Username() string {
+	if m == nil {
+		return ""
+	}
+	return m.username
+}
+
+func (m *Manager) Login(w http.ResponseWriter, r *http.Request, username string, password string) error {
+	if !m.Enabled() {
+		return fmt.Errorf("auth is disabled")
+	}
+	if username != m.username || !VerifyPassword(m.passwordHash, password) {
+		return fmt.Errorf("invalid username or password")
+	}
+	value, err := m.signSession(sessionPayload{
+		Username:  username,
+		ExpiresAt: time.Now().Add(m.sessionTTL).Unix(),
+	})
+	if err != nil {
+		return err
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     m.cookieName,
+		Value:    value,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
+		MaxAge:   int(m.sessionTTL.Seconds()),
+	})
+	return nil
+}
+
+func (m *Manager) Logout(w http.ResponseWriter, r *http.Request) {
+	if m == nil {
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     m.cookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
+		MaxAge:   -1,
+	})
+}
+
+func (m *Manager) Require(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !m.Enabled() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		username, ok := m.verifyRequest(r)
+		if !ok {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "unauthorized"})
+			return
+		}
+		ctx := context.WithValue(r.Context(), contextKey{}, username)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (m *Manager) User(r *http.Request) (string, bool) {
+	if !m.Enabled() {
+		return "", false
+	}
+	if username, ok := r.Context().Value(contextKey{}).(string); ok && username != "" {
+		return username, true
+	}
+	return m.verifyRequest(r)
+}
+
+func (m *Manager) verifyRequest(r *http.Request) (string, bool) {
+	cookie, err := r.Cookie(m.cookieName)
+	if err != nil || cookie.Value == "" {
+		return "", false
+	}
+	payload, ok := m.verifySession(cookie.Value)
+	if !ok || payload.Username != m.username || time.Now().Unix() > payload.ExpiresAt {
+		return "", false
+	}
+	return payload.Username, true
+}
+
+func (m *Manager) signSession(payload sessionPayload) (string, error) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	encodedPayload := base64.RawURLEncoding.EncodeToString(data)
+	sig := m.sign(encodedPayload)
+	return encodedPayload + "." + sig, nil
+}
+
+func (m *Manager) verifySession(value string) (sessionPayload, bool) {
+	var payload sessionPayload
+	parts := strings.Split(value, ".")
+	if len(parts) != 2 {
+		return payload, false
+	}
+	expected := m.sign(parts[0])
+	if subtle.ConstantTimeCompare([]byte(expected), []byte(parts[1])) != 1 {
+		return payload, false
+	}
+	data, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return payload, false
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return payload, false
+	}
+	return payload, true
+}
+
+func (m *Manager) sign(value string) string {
+	mac := hmac.New(sha256.New, m.sessionSecret)
+	_, _ = mac.Write([]byte(value))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func HashPassword(password string) (string, error) {
+	if password == "" {
+		return "", fmt.Errorf("password cannot be empty")
+	}
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	key := pbkdf2SHA256([]byte(password), salt, defaultPBKDF2Iter, defaultPasswordKeySize)
+	return strings.Join([]string{
+		"pbkdf2-sha256",
+		strconv.Itoa(defaultPBKDF2Iter),
+		base64.RawURLEncoding.EncodeToString(salt),
+		base64.RawURLEncoding.EncodeToString(key),
+	}, "$"), nil
+}
+
+func VerifyPassword(encoded string, password string) bool {
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 4 || parts[0] != "pbkdf2-sha256" {
+		return false
+	}
+	iterations, err := strconv.Atoi(parts[1])
+	if err != nil || iterations < 100_000 {
+		return false
+	}
+	salt, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return false
+	}
+	expected, err := base64.RawURLEncoding.DecodeString(parts[3])
+	if err != nil {
+		return false
+	}
+	actual := pbkdf2SHA256([]byte(password), salt, iterations, len(expected))
+	return subtle.ConstantTimeCompare(actual, expected) == 1
+}
+
+func pbkdf2SHA256(password []byte, salt []byte, iterations int, keyLen int) []byte {
+	hLen := sha256.Size
+	numBlocks := (keyLen + hLen - 1) / hLen
+	var derived []byte
+	for block := 1; block <= numBlocks; block++ {
+		u := pbkdf2Block(password, salt, iterations, block)
+		derived = append(derived, u...)
+	}
+	return derived[:keyLen]
+}
+
+func pbkdf2Block(password []byte, salt []byte, iterations int, block int) []byte {
+	mac := hmac.New(sha256.New, password)
+	_, _ = mac.Write(salt)
+	var blockBuf [4]byte
+	binary.BigEndian.PutUint32(blockBuf[:], uint32(block))
+	_, _ = mac.Write(blockBuf[:])
+	u := mac.Sum(nil)
+	out := make([]byte, len(u))
+	copy(out, u)
+	for i := 1; i < iterations; i++ {
+		mac = hmac.New(sha256.New, password)
+		_, _ = mac.Write(u)
+		u = mac.Sum(nil)
+		for j := range out {
+			out[j] ^= u[j]
+		}
+	}
+	return out
+}
