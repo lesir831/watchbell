@@ -62,6 +62,44 @@ admin
 export WATCHBELL_ADMIN_USERNAME='your-name'
 ```
 
+### 使用发布镜像部署
+
+不需要在服务器上检出源码。下载 `compose.deploy.yml` 和 `deploy.env.example` 后，复制并修改部署环境变量：
+
+```bash
+cp deploy.env.example .env.deploy
+chmod 600 .env.deploy
+```
+
+至少需要修改 `WATCHBELL_ADMIN_PASSWORD` 和 `WATCHBELL_SESSION_SECRET`。会话密钥可以这样生成：
+
+```bash
+openssl rand -hex 32
+```
+
+拉取镜像并启动：
+
+```bash
+docker compose --env-file .env.deploy -f compose.deploy.yml pull
+docker compose --env-file .env.deploy -f compose.deploy.yml up -d
+```
+
+查看状态和日志：
+
+```bash
+docker compose --env-file .env.deploy -f compose.deploy.yml ps
+docker compose --env-file .env.deploy -f compose.deploy.yml logs -f watchbell
+```
+
+更新到最新镜像：
+
+```bash
+docker compose --env-file .env.deploy -f compose.deploy.yml pull
+docker compose --env-file .env.deploy -f compose.deploy.yml up -d
+```
+
+默认监听宿主机 `8080` 端口，并使用名为 `watchbell-data` 的 volume 持久化 SQLite 数据库。使用反向代理时，可把 `WATCHBELL_BIND_IP` 改成 `127.0.0.1`。
+
 ### 本地开发
 
 后端：
@@ -343,8 +381,8 @@ ${github.release.assetCount}
 
 `.github/workflows/ci.yml` 负责测试、构建和镜像发布：
 
-- Pull Request：运行 Go 测试、`go vet`、前端生产构建和 `linux/amd64` Docker 构建，不推送镜像。
-- Push 到 `main`：测试通过后构建 `linux/amd64`、`linux/arm64` 镜像，并自动推送 `main`、`sha-*`、`latest` 标签到 `ghcr.io/<owner>/<repo>`。
+- Pull Request：运行 Go 测试、`go vet`、前端生产构建和原生 `linux/amd64`、`linux/arm64` Docker 构建，不推送镜像。
+- Push 到 `main`：测试通过后使用对应架构的原生 Runner 并行构建 `linux/amd64`、`linux/arm64` 镜像，并自动推送 `main`、`sha-*`、`latest` 标签到 `ghcr.io/<owner>/<repo>`。
 - Push `v1.2.3` tag：自动推送 `1.2.3`、`1.2`、`1`、`sha-*` 和 `latest` 标签；预发布 tag 不覆盖 `latest`。
 - `workflow_dispatch`：允许在 GitHub Actions 页面手动执行构建和发布。
 
