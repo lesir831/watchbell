@@ -45,6 +45,7 @@ import type {
   EventRecord,
   Monitor,
   MonitorInput,
+  MonitorPlugin,
   MonitorType,
   NotificationLog,
   NotificationTemplate,
@@ -60,10 +61,26 @@ type PageKey = 'dashboard' | 'monitors' | 'rules' | 'channels' | 'templates' | '
 const { Header, Sider, Content } = Layout;
 const { Text, Title } = Typography;
 
-const monitorTypeOptions = [
-  { label: 'RSS', value: 'rss' },
-  { label: 'TestFlight', value: 'testflight' },
-  { label: 'Webpage', value: 'webpage' }
+const fallbackMonitorPlugins: MonitorPlugin[] = [
+  fallbackPlugin('rss', 'RSS / Atom', 300, {
+    url: 'https://example.com/feed.xml', timeoutSeconds: 15, notifyExisting: false, includeFullText: false
+  }),
+  fallbackPlugin('testflight', 'TestFlight', 60, {
+    url: 'https://testflight.apple.com/join/example', timeoutSeconds: 15
+  }),
+  fallbackPlugin('webpage', 'Webpage', 300, {
+    url: 'https://example.com', selector: '', timeoutSeconds: 15, ignorePatterns: []
+  }),
+  fallbackPlugin('github_release', 'GitHub Releases', 300, {
+    repository: 'owner/repository',
+    token: '',
+    apiUrl: 'https://api.github.com',
+    apiVersion: '2026-03-10',
+    timeoutSeconds: 15,
+    maxReleases: 20,
+    includePrereleases: false,
+    notifyExisting: false
+  })
 ];
 
 const channelTypeOptions = [
@@ -259,6 +276,9 @@ function MonitorsPage() {
   const [editing, setEditing] = useState<Monitor | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors });
+  const plugins = useQuery({ queryKey: ['plugins'], queryFn: api.listPlugins });
+  const monitorPlugins = plugins.data?.length ? plugins.data : fallbackMonitorPlugins;
+  const pluginByID = useMemo(() => new Map(monitorPlugins.map((item) => [item.id, item])), [monitorPlugins]);
 
   const saveMutation = useMutation({
     mutationFn: (payload: { id?: number; input: MonitorInput }) =>
@@ -293,7 +313,7 @@ function MonitorsPage() {
 
   const columns: ColumnsType<Monitor> = [
     { title: 'Name', dataIndex: 'name' },
-    { title: 'Type', dataIndex: 'type', render: (value: MonitorType) => <Tag>{value}</Tag> },
+    { title: 'Type', dataIndex: 'type', render: (value: MonitorType) => <Tag>{pluginByID.get(value)?.name ?? value}</Tag> },
     { title: 'Enabled', dataIndex: 'enabled', render: (value: boolean) => <StatusTag ok={value} okText="On" badText="Off" /> },
     { title: 'Interval', dataIndex: 'intervalSeconds', render: (value: number) => `${value}s` },
     { title: 'Last Status', dataIndex: 'lastStatus', render: (value: string) => <StatusTag ok={value !== 'error'} okText={value || 'pending'} badText="error" /> },
@@ -331,6 +351,7 @@ function MonitorsPage() {
       <MonitorDrawer
         open={drawerOpen}
         record={editing}
+        plugins={monitorPlugins}
         saving={saveMutation.isPending}
         onClose={() => setDrawerOpen(false)}
         onSave={(input) => saveMutation.mutate({ id: editing?.id, input })}
@@ -603,6 +624,7 @@ function LogsPage() {
 function MonitorDrawer(props: {
   open: boolean;
   record: Monitor | null;
+  plugins: MonitorPlugin[];
   saving: boolean;
   onClose: () => void;
   onSave: (input: MonitorInput) => void;
@@ -618,12 +640,13 @@ function MonitorDrawer(props: {
       destroyOnClose
       afterOpenChange={(open) => {
         if (!open) return;
+        const plugin = pluginFor(props.record?.type ?? 'rss', props.plugins);
         form.setFieldsValue({
           name: props.record?.name ?? '',
-          type: props.record?.type ?? 'rss',
+          type: plugin.id,
           enabled: props.record?.enabled ?? true,
-          intervalSeconds: props.record?.intervalSeconds ?? 300,
-          configText: jsonText(props.record?.config ?? defaultMonitorConfig('rss'))
+          intervalSeconds: props.record?.intervalSeconds ?? plugin.defaultIntervalSeconds,
+          configText: jsonText(props.record?.config ?? plugin.defaultConfig)
         });
       }}
       footer={
@@ -640,7 +663,11 @@ function MonitorDrawer(props: {
         layout="vertical"
         onValuesChange={(changed) => {
           if (changed.type) {
-            form.setFieldValue('configText', jsonText(defaultMonitorConfig(changed.type)));
+            const plugin = pluginFor(changed.type, props.plugins);
+            form.setFieldsValue({
+              intervalSeconds: plugin.defaultIntervalSeconds,
+              configText: jsonText(plugin.defaultConfig)
+            });
           }
         }}
         onFinish={(values) => {
@@ -663,7 +690,7 @@ function MonitorDrawer(props: {
         <Row gutter={12}>
           <Col span={12}>
             <Form.Item name="type" label="Type" rules={[{ required: true }]}>
-              <Select options={monitorTypeOptions} />
+              <Select options={props.plugins.map((item) => ({ label: item.name, value: item.id }))} />
             </Form.Item>
           </Col>
           <Col span={12}>
@@ -866,7 +893,7 @@ function TemplateDrawer(props: {
         form.setFieldsValue({
           name: props.record?.name ?? '',
           subjectTemplate: props.record?.subjectTemplate ?? '${monitor.name}: ${event.type}',
-          bodyTemplate: props.record?.bodyTemplate ?? 'Monitor: ${monitor.name}\nTime: ${event.time}\n${rss.title}${testflight.message}${webpage.summary}'
+          bodyTemplate: props.record?.bodyTemplate ?? 'Monitor: ${monitor.name}\nTime: ${event.time}\n${rss.title}${testflight.message}${webpage.summary}${github.release.name} ${github.release.tagName}\n${github.release.url}'
         });
       }}
       footer={
@@ -939,27 +966,22 @@ function titleForPage(page: PageKey) {
   }[page];
 }
 
-function defaultMonitorConfig(type: MonitorType): Record<string, unknown> {
-  if (type === 'testflight') {
-    return {
-      url: 'https://testflight.apple.com/join/example',
-      timeoutSeconds: 15
-    };
-  }
-  if (type === 'webpage') {
-    return {
-      url: 'https://example.com',
-      selector: '',
-      timeoutSeconds: 15,
-      ignorePatterns: []
-    };
-  }
+function fallbackPlugin(id: MonitorType, name: string, interval: number, config: Record<string, unknown>): MonitorPlugin {
   return {
-    url: 'https://example.com/feed.xml',
-    timeoutSeconds: 15,
-    notifyExisting: false,
-    includeFullText: false
+    id,
+    name,
+    description: '',
+    builtin: true,
+    defaultIntervalSeconds: interval,
+    defaultConfig: config,
+    configFields: [],
+    events: [],
+    templateVariables: []
   };
+}
+
+function pluginFor(type: MonitorType, plugins: MonitorPlugin[]): MonitorPlugin {
+  return plugins.find((item) => item.id === type) ?? plugins[0] ?? fallbackMonitorPlugins[0];
 }
 
 function defaultChannelConfig(type: ChannelType): Record<string, unknown> {

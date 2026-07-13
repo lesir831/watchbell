@@ -54,6 +54,14 @@ func New(store *store.Store, checkers checker.Registry, notifiers notifier.Regis
 	}
 }
 
+func (s *Scheduler) Plugins() []model.MonitorPlugin {
+	return s.checkers.Plugins()
+}
+
+func (s *Scheduler) HasPlugin(pluginID string) bool {
+	return s.checkers.Has(pluginID)
+}
+
 func (s *Scheduler) Start(ctx context.Context) {
 	ticker := time.NewTicker(s.tick)
 	defer ticker.Stop()

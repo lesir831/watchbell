@@ -45,6 +45,26 @@ func (c *RSSChecker) Type() string {
 	return model.MonitorTypeRSS
 }
 
+func (c *RSSChecker) Plugin() model.MonitorPlugin {
+	return model.MonitorPlugin{
+		ID: model.MonitorTypeRSS, Name: "RSS / Atom", Builtin: true,
+		Description:            "Notify when a feed publishes a new matching item.",
+		DefaultIntervalSeconds: 300,
+		DefaultConfig: map[string]any{
+			"url": "https://example.com/feed.xml", "timeoutSeconds": 15,
+			"notifyExisting": false, "includeFullText": false,
+		},
+		ConfigFields: []model.PluginConfigField{
+			{Key: "url", Label: "Feed URL", Type: "url", Required: true},
+			{Key: "timeoutSeconds", Label: "Timeout seconds", Type: "number"},
+			{Key: "notifyExisting", Label: "Notify existing items", Type: "boolean"},
+			{Key: "includeFullText", Label: "Include full text", Type: "boolean"},
+		},
+		Events:            []string{"rss.item"},
+		TemplateVariables: []string{"rss.title", "rss.link", "rss.author", "rss.summary", "rss.content", "rss.publishedAt", "rss.sourceTitle", "rss.sourceLink"},
+	}
+}
+
 func (c *RSSChecker) Check(ctx context.Context, monitor model.Monitor) (model.CheckResult, error) {
 	cfg, err := DecodeConfig(monitor, RSSConfig{
 		UserAgent:      "WatchBell/0.1",

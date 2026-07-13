@@ -10,6 +10,7 @@ WatchBell 是一个自托管的监控和通知小工具。
 ## 当前功能
 
 - TestFlight 公开邀请链接检查
+- GitHub Release 发布检查，支持私有仓库和预发布版本
 - RSS / Atom / JSON Feed 拉取和关键词匹配
 - 网页文本变化检查，支持简单的 `#id`、`.class` 和标签选择器
 - Bark 推送
@@ -19,6 +20,7 @@ WatchBell 是一个自托管的监控和通知小工具。
 - 单用户登录，使用 HttpOnly 签名 cookie
 - React + Ant Design 管理界面
 - Docker 部署
+- 内置插件清单 API，前端从后端读取插件及默认配置
 
 ## 适合的部署方式
 
@@ -30,11 +32,10 @@ WatchBell 现在按单机自托管设计。
 
 ### Docker Compose
 
-先准备两个环境变量：
+复制环境变量示例并修改登录密码和会话密钥：
 
 ```bash
-export WATCHBELL_ADMIN_PASSWORD='换成你的登录密码'
-export WATCHBELL_SESSION_SECRET='换成至少 32 字节的随机字符串'
+cp .env.example .env
 ```
 
 启动：
@@ -178,6 +179,26 @@ WATCHBELL_AUTH_DISABLED=true go run ./cmd/watchbell
 
 TestFlight 检查目前基于公开页面里的文字判断状态。默认识别常见的“已满”和“可加入”文案；如果 Apple 页面文案变化，后续需要调整匹配规则。
 
+### GitHub Releases
+
+```json
+{
+  "repository": "owner/repository",
+  "token": "",
+  "apiUrl": "https://api.github.com",
+  "apiVersion": "2026-03-10",
+  "timeoutSeconds": 15,
+  "maxReleases": 20,
+  "includePrereleases": false,
+  "notifyExisting": false
+}
+```
+
+- 公开仓库不需要 `token`；私有仓库建议使用仅有仓库 Contents 读取权限的 fine-grained token。
+- 默认首次检查只建立基线，不发送历史版本通知；`notifyExisting=true` 时会通知当前最新版本。
+- 检查器使用 ETag，仓库没有变化时不会重复下载 Release 列表。
+- 事件类型是 `github.release`。创建一个条件为 `{}` 的规则即可对所有新 Release 发送通知。
+
 ### 网页变化
 
 ```json
@@ -303,6 +324,39 @@ ${webpage.oldHash}
 ${webpage.newHash}
 ${webpage.summary}
 ```
+
+GitHub Release：
+
+```text
+${github.repository}
+${github.release.tagName}
+${github.release.name}
+${github.release.body}
+${github.release.url}
+${github.release.prerelease}
+${github.release.publishedAt}
+${github.release.author}
+${github.release.assetCount}
+```
+
+## CI/CD 与镜像发布
+
+`.github/workflows/ci.yml` 负责测试、构建和镜像发布：
+
+- Pull Request：运行 Go 测试、`go vet`、前端生产构建和 `linux/amd64` Docker 构建，不推送镜像。
+- Push 到 `main`：测试通过后构建 `linux/amd64`、`linux/arm64` 镜像，并自动推送 `main`、`sha-*`、`latest` 标签到 `ghcr.io/<owner>/<repo>`。
+- Push `v1.2.3` tag：自动推送 `1.2.3`、`1.2`、`1`、`sha-*` 和 `latest` 标签；预发布 tag 不覆盖 `latest`。
+- `workflow_dispatch`：允许在 GitHub Actions 页面手动执行构建和发布。
+
+发布镜像包含 OCI 标签、提交号、构建时间和 GitHub artifact attestation。仓库的 Actions 设置需要允许 `GITHUB_TOKEN` 写入 Packages；首次发布后可在 Packages 页面调整镜像可见性。
+
+拉取已发布镜像后，可以这样覆盖 Compose 的本地构建镜像名：
+
+```bash
+WATCHBELL_IMAGE=ghcr.io/<owner>/<repo>:latest docker compose up -d --no-build
+```
+
+容器以 UID `10001` 的非 root 用户运行，并使用 `watchbell healthcheck` 执行健康检查。绑定宿主机数据目录时，需要保证该 UID 对目录有写权限。
 
 ## 数据目录
 

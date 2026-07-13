@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,6 +22,12 @@ import (
 	"github.com/watchbell/watchbell/internal/store"
 )
 
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
+)
+
 func main() {
 	if len(os.Args) == 3 && os.Args[1] == "hash-password" {
 		hash, err := auth.HashPassword(os.Args[2])
@@ -28,6 +36,17 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(hash)
+		return
+	}
+	if len(os.Args) == 2 && os.Args[1] == "version" {
+		fmt.Printf("watchbell %s (commit %s, built %s)\n", version, commit, buildDate)
+		return
+	}
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		if err := runHealthcheck(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -55,6 +74,7 @@ func main() {
 		checker.NewRSSChecker(),
 		checker.NewTestFlightChecker(),
 		checker.NewWebpageChecker(),
+		checker.NewGitHubReleaseChecker(),
 	)
 	notifiers := notifier.NewRegistry(
 		notifier.NewBarkNotifier(),
@@ -88,4 +108,22 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("shutdown http server", "error", err)
 	}
+}
+
+func runHealthcheck() error {
+	endpoint := strings.TrimSpace(os.Getenv("WATCHBELL_HEALTHCHECK_URL"))
+	if endpoint == "" {
+		endpoint = "http://127.0.0.1:8080/api/health"
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		return fmt.Errorf("healthcheck request: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("healthcheck failed: http %d", resp.StatusCode)
+	}
+	return nil
 }

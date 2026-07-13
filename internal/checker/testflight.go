@@ -38,6 +38,23 @@ func (c *TestFlightChecker) Type() string {
 	return model.MonitorTypeTestFlight
 }
 
+func (c *TestFlightChecker) Plugin() model.MonitorPlugin {
+	return model.MonitorPlugin{
+		ID: model.MonitorTypeTestFlight, Name: "TestFlight", Builtin: true,
+		Description:            "Notify when a public TestFlight beta has room for another tester.",
+		DefaultIntervalSeconds: 60,
+		DefaultConfig: map[string]any{
+			"url": "https://testflight.apple.com/join/example", "timeoutSeconds": 15,
+		},
+		ConfigFields: []model.PluginConfigField{
+			{Key: "url", Label: "Public invitation URL", Type: "url", Required: true},
+			{Key: "timeoutSeconds", Label: "Timeout seconds", Type: "number"},
+		},
+		Events:            []string{"testflight.available"},
+		TemplateVariables: []string{"testflight.url", "testflight.status", "testflight.message"},
+	}
+}
+
 func (c *TestFlightChecker) Check(ctx context.Context, monitor model.Monitor) (model.CheckResult, error) {
 	cfg, err := DecodeConfig(monitor, TestFlightConfig{
 		UserAgent:      "WatchBell/0.1",
@@ -64,6 +81,23 @@ func (c *TestFlightChecker) Check(ctx context.Context, monitor model.Monitor) (m
 	}
 	if cfg.TimeoutSeconds <= 0 {
 		cfg.TimeoutSeconds = 15
+	}
+	if len(cfg.AvailablePatterns) == 0 {
+		cfg.AvailablePatterns = []string{
+			"view in testflight",
+			"start testing",
+			"在 testflight 中查看",
+			"开始测试",
+		}
+	}
+	if len(cfg.FullPatterns) == 0 {
+		cfg.FullPatterns = []string{
+			"this beta is full",
+			"beta is full",
+			"此 beta 版本的测试员已满",
+			"测试员已满",
+			"not accepting any new testers",
+		}
 	}
 	state := DecodeState(monitor, testFlightState{})
 

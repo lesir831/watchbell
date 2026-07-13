@@ -88,10 +88,27 @@ INSERT OR IGNORE INTO notification_templates (
 Type: ${event.type}
 Time: ${event.time}
 
-${rss.title}${testflight.message}${webpage.summary}
+${rss.title}${testflight.message}${webpage.summary}${github.release.name} ${github.release.tagName}
 
-${rss.link}${testflight.url}${webpage.url}',
+${rss.link}${testflight.url}${webpage.url}${github.release.url}',
   strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
   strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 );
 
+UPDATE notification_templates
+SET body_template = 'Monitor: ${monitor.name}
+Type: ${event.type}
+Time: ${event.time}
+
+${rss.title}${testflight.message}${webpage.summary}${github.release.name} ${github.release.tagName}
+
+${rss.link}${testflight.url}${webpage.url}${github.release.url}',
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = 1
+  AND body_template = 'Monitor: ${monitor.name}
+Type: ${event.type}
+Time: ${event.time}
+
+${rss.title}${testflight.message}${webpage.summary}
+
+${rss.link}${testflight.url}${webpage.url}';

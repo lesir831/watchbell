@@ -42,6 +42,26 @@ func (c *WebpageChecker) Type() string {
 	return model.MonitorTypeWebpage
 }
 
+func (c *WebpageChecker) Plugin() model.MonitorPlugin {
+	return model.MonitorPlugin{
+		ID: model.MonitorTypeWebpage, Name: "Webpage", Builtin: true,
+		Description:            "Notify when selected text on a webpage changes.",
+		DefaultIntervalSeconds: 300,
+		DefaultConfig: map[string]any{
+			"url": "https://example.com", "selector": "", "timeoutSeconds": 15,
+			"ignorePatterns": []string{},
+		},
+		ConfigFields: []model.PluginConfigField{
+			{Key: "url", Label: "Page URL", Type: "url", Required: true},
+			{Key: "selector", Label: "Selector", Type: "string"},
+			{Key: "timeoutSeconds", Label: "Timeout seconds", Type: "number"},
+			{Key: "ignorePatterns", Label: "Ignore patterns", Type: "string-list"},
+		},
+		Events:            []string{"webpage.changed"},
+		TemplateVariables: []string{"webpage.url", "webpage.selector", "webpage.oldHash", "webpage.newHash", "webpage.summary"},
+	}
+}
+
 func (c *WebpageChecker) Check(ctx context.Context, monitor model.Monitor) (model.CheckResult, error) {
 	cfg, err := DecodeConfig(monitor, WebpageConfig{
 		UserAgent:      "WatchBell/0.1",

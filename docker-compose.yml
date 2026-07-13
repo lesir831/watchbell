@@ -1,6 +1,13 @@
 services:
   watchbell:
-    build: .
+    image: "${WATCHBELL_IMAGE:-watchbell:local}"
+    build:
+      context: .
+      args:
+        VERSION: "${WATCHBELL_VERSION:-dev}"
+        VCS_REF: "${WATCHBELL_VCS_REF:-local}"
+        BUILD_DATE: "${WATCHBELL_BUILD_DATE:-unknown}"
+        SOURCE_URL: "${WATCHBELL_SOURCE_URL:-https://github.com/watchbell/watchbell}"
     ports:
       - "8080:8080"
     environment:
@@ -14,6 +21,8 @@ services:
       WATCHBELL_SESSION_SECRET: "${WATCHBELL_SESSION_SECRET:?set WATCHBELL_SESSION_SECRET}"
     volumes:
       - watchbell-data:/data
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
 volumes:

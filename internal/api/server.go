@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -65,6 +66,7 @@ func (s *Server) Routes() http.Handler {
 
 func (s *Server) privateRoutes(r chi.Router) {
 	r.Get("/auth/me", s.authMe)
+	r.Get("/plugins", s.listPlugins)
 
 	r.Get("/monitors", s.listMonitors)
 	r.Post("/monitors", s.createMonitor)
@@ -91,6 +93,10 @@ func (s *Server) privateRoutes(r chi.Router) {
 
 	r.Get("/events", s.listEvents)
 	r.Get("/notification-logs", s.listNotificationLogs)
+}
+
+func (s *Server) listPlugins(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.scheduler.Plugins())
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -155,6 +161,9 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
+	if !s.validateMonitorInput(w, input) {
+		return
+	}
 	item, err := s.store.CreateMonitor(r.Context(), input)
 	respondCreated(w, item, err)
 }
@@ -168,8 +177,23 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
+	if !s.validateMonitorInput(w, input) {
+		return
+	}
 	item, err := s.store.UpdateMonitor(r.Context(), id, input)
 	respond(w, item, err)
+}
+
+func (s *Server) validateMonitorInput(w http.ResponseWriter, input model.MonitorInput) bool {
+	if strings.TrimSpace(input.Name) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "monitor name is required"})
+		return false
+	}
+	if !s.scheduler.HasPlugin(input.Type) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("unsupported monitor plugin %q", input.Type)})
+		return false
+	}
+	return true
 }
 
 func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
@@ -435,5 +459,13 @@ func sampleTemplateData() map[string]any {
 			"message": "testflight beta has available slots",
 		},
 		"webpage": map[string]any{"url": "https://example.com", "summary": "changed content"},
+		"github": map[string]any{
+			"owner": "example", "repo": "project", "repository": "example/project",
+			"release": map[string]any{
+				"id": 42, "tagName": "v1.2.3", "name": "Version 1.2.3",
+				"body": "Release notes", "url": "https://github.com/example/project/releases/tag/v1.2.3",
+				"prerelease": false, "publishedAt": "2026-07-02T00:00:00Z", "author": "example",
+			},
+		},
 	}
 }

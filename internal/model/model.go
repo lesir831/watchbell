@@ -6,13 +6,35 @@ import (
 )
 
 const (
-	MonitorTypeRSS        = "rss"
-	MonitorTypeTestFlight = "testflight"
-	MonitorTypeWebpage    = "webpage"
+	MonitorTypeRSS           = "rss"
+	MonitorTypeTestFlight    = "testflight"
+	MonitorTypeWebpage       = "webpage"
+	MonitorTypeGitHubRelease = "github_release"
 
 	ChannelTypeBark  = "bark"
 	ChannelTypeEmail = "email"
 )
+
+type PluginConfigField struct {
+	Key         string `json:"key"`
+	Label       string `json:"label"`
+	Type        string `json:"type"`
+	Required    bool   `json:"required,omitempty"`
+	Secret      bool   `json:"secret,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+type MonitorPlugin struct {
+	ID                     string              `json:"id"`
+	Name                   string              `json:"name"`
+	Description            string              `json:"description"`
+	Builtin                bool                `json:"builtin"`
+	DefaultIntervalSeconds int                 `json:"defaultIntervalSeconds"`
+	DefaultConfig          map[string]any      `json:"defaultConfig"`
+	ConfigFields           []PluginConfigField `json:"configFields"`
+	Events                 []string            `json:"events"`
+	TemplateVariables      []string            `json:"templateVariables"`
+}
 
 type Monitor struct {
 	ID              int64           `json:"id"`

@@ -5,6 +5,7 @@ import type {
   LoginInput,
   Monitor,
   MonitorInput,
+  MonitorPlugin,
   NotificationLog,
   NotificationTemplate,
   NotificationTemplateInput,
@@ -57,6 +58,7 @@ export const api = {
   me: () => request<CurrentUser>('/api/auth/me'),
   login: (body: LoginInput) => request<CurrentUser>('/api/auth/login', jsonInit('POST', body)),
   logout: () => request<{ status: string }>('/api/auth/logout', jsonInit('POST')),
+  listPlugins: () => request<MonitorPlugin[]>('/api/plugins'),
 
   listMonitors: () => request<Monitor[]>('/api/monitors'),
   createMonitor: (body: MonitorInput) => request<Monitor>('/api/monitors', jsonInit('POST', body)),

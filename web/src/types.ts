@@ -1,5 +1,26 @@
-export type MonitorType = 'rss' | 'testflight' | 'webpage';
+export type MonitorType = 'rss' | 'testflight' | 'webpage' | 'github_release';
 export type ChannelType = 'bark' | 'email';
+
+export interface PluginConfigField {
+  key: string;
+  label: string;
+  type: string;
+  required?: boolean;
+  secret?: boolean;
+  description?: string;
+}
+
+export interface MonitorPlugin {
+  id: MonitorType;
+  name: string;
+  description: string;
+  builtin: boolean;
+  defaultIntervalSeconds: number;
+  defaultConfig: Record<string, unknown>;
+  configFields: PluginConfigField[];
+  events: string[];
+  templateVariables: string[];
+}
 
 export interface AuthStatus {
   enabled: boolean;
