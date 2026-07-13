@@ -43,17 +43,13 @@ jobs:
       - run: npm ci
       - run: npm run build
 
-  container:
+  container-metadata:
     runs-on: ubuntu-latest
     needs: [backend, frontend]
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      build_date: ${{ steps.image.outputs.build_date }}
     steps:
-      - uses: actions/checkout@v6
-
       - name: Resolve image metadata
         id: image
         shell: bash
@@ -61,7 +57,28 @@ jobs:
           echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
           echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@v3
+  container-build:
+    name: Container (${{ matrix.platform }})
+    needs: [backend, frontend, container-metadata]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            cache_scope: container-amd64
+            artifact: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            cache_scope: container-arm64
+            artifact: arm64
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
@@ -76,7 +93,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ steps.image.outputs.name }}
+          images: ${{ needs.container-metadata.outputs.image }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -87,26 +104,120 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and optionally push image
-        id: push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ github.ref_name }}
             VCS_REF=${{ github.sha }}
-            BUILD_DATE=${{ steps.image.outputs.build_date }}
+            BUILD_DATE=${{ needs.container-metadata.outputs.build_date }}
             SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', needs.container-metadata.outputs.image) || '' }}
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
+
+      - name: Export image digest
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digests/${{ matrix.artifact }}.txt"
+
+      - name: Upload image digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digest-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/digests/${{ matrix.artifact }}.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  container-publish:
+    name: Publish multi-platform image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    needs: [container-metadata, container-build]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.container-metadata.outputs.image }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Download image digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: image-digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Create and push manifest
+        id: manifest
+        shell: bash
+        env:
+          IMAGE: ${{ needs.container-metadata.outputs.image }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          tags=()
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] && tags+=(--tag "$tag")
+          done <<< "$TAGS"
+
+          sources=()
+          for digest_file in "$RUNNER_TEMP"/digests/*.txt; do
+            digest=$(<"$digest_file")
+            [[ "$digest" == sha256:* ]] || {
+              echo "Invalid image digest in $digest_file" >&2
+              exit 1
+            }
+            sources+=("$IMAGE@$digest")
+          done
+          [[ "${#sources[@]}" -eq 2 ]] || {
+            echo "Expected two platform digests, found ${#sources[@]}" >&2
+            exit 1
+          }
+
+          docker buildx imagetools create \
+            "${tags[@]}" \
+            --metadata-file "$RUNNER_TEMP/manifest.json" \
+            "${sources[@]}"
+
+          digest=$(jq -r '."containerimage.descriptor".digest // ."containerimage.digest" // empty' "$RUNNER_TEMP/manifest.json")
+          [[ "$digest" == sha256:* ]] || {
+            echo "Manifest digest was not returned" >&2
+            exit 1
+          }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Attest published image
-        if: github.event_name != 'pull_request'
         uses: actions/attest@v4
         with:
-          subject-name: ${{ steps.image.outputs.name }}
-          subject-digest: ${{ steps.push.outputs.digest }}
+          subject-name: ${{ needs.container-metadata.outputs.image }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
