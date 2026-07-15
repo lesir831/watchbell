@@ -18,6 +18,43 @@ type Condition struct {
 	Value    string `json:"value"`
 }
 
+func Validate(raw json.RawMessage) error {
+	if len(raw) == 0 || string(raw) == "{}" {
+		return nil
+	}
+	var set ConditionSet
+	if err := json.Unmarshal(raw, &set); err != nil {
+		return fmt.Errorf("条件不是有效的 JSON：%w", err)
+	}
+	mode := strings.ToLower(strings.TrimSpace(set.Match))
+	if mode != "" && mode != "all" && mode != "any" {
+		return fmt.Errorf("条件关系只能是 all 或 any")
+	}
+	for index, condition := range set.Conditions {
+		if strings.TrimSpace(condition.Field) == "" {
+			return fmt.Errorf("第 %d 个条件缺少事件字段", index+1)
+		}
+		operator := strings.ToLower(strings.TrimSpace(condition.Operator))
+		if operator == "" {
+			operator = "contains"
+		}
+		switch operator {
+		case "contains", "not_contains", "equals":
+			if strings.TrimSpace(condition.Value) == "" {
+				return fmt.Errorf("第 %d 个条件缺少判断值", index+1)
+			}
+		case "regex":
+			if _, err := regexp.Compile(condition.Value); err != nil {
+				return fmt.Errorf("第 %d 个条件的正则表达式无效：%w", index+1, err)
+			}
+		case "exists":
+		default:
+			return fmt.Errorf("第 %d 个条件使用了不支持的操作符 %q", index+1, condition.Operator)
+		}
+	}
+	return nil
+}
+
 func Match(raw json.RawMessage, payload map[string]any) (bool, []string, error) {
 	if len(raw) == 0 || string(raw) == "{}" {
 		return true, nil, nil

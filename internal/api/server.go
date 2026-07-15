@@ -4,13 +4,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -40,10 +40,12 @@ func (s *Server) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
+	r.Use(s.accessLog)
 	r.Use(middleware.Recoverer)
 
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/health", s.health)
+		r.Get("/health/ready", s.readiness)
 		r.Get("/auth/status", s.authStatus)
 		r.Post("/auth/login", s.authLogin)
 		r.Post("/auth/logout", s.authLogout)
@@ -67,6 +69,9 @@ func (s *Server) Routes() http.Handler {
 func (s *Server) privateRoutes(r chi.Router) {
 	r.Get("/auth/me", s.authMe)
 	r.Get("/plugins", s.listPlugins)
+	r.Get("/dashboard", s.dashboard)
+	r.Get("/system/status", s.systemStatus)
+	r.Get("/diagnostics", s.diagnostics)
 
 	r.Get("/monitors", s.listMonitors)
 	r.Post("/monitors", s.createMonitor)
@@ -92,6 +97,11 @@ func (s *Server) privateRoutes(r chi.Router) {
 	r.Post("/templates/preview", s.previewTemplate)
 
 	r.Get("/events", s.listEvents)
+	r.Get("/check-runs", s.listCheckRuns)
+	r.Get("/rule-evaluations", s.listRuleEvaluations)
+	r.Get("/notification-attempts", s.listNotificationAttempts)
+	r.Post("/notification-attempts/{id}/retry", s.retryNotificationAttempt)
+	r.Get("/audit-logs", s.listAuditLogs)
 	r.Get("/notification-logs", s.listNotificationLogs)
 }
 
@@ -101,6 +111,21 @@ func (s *Server) listPlugins(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+func (s *Server) readiness(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.Ping(r.Context()); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready", "database": "unavailable"})
+		return
+	}
+	health := s.scheduler.Health()
+	status := http.StatusOK
+	ready := "ready"
+	if health.LastTickAt == nil || time.Since(*health.LastTickAt) > 2*time.Minute {
+		status = http.StatusServiceUnavailable
+		ready = "not_ready"
+	}
+	writeJSON(w, status, map[string]any{"status": ready, "database": "ok", "scheduler": health})
 }
 
 func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
@@ -153,7 +178,10 @@ func (s *Server) authMe(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listMonitors(w http.ResponseWriter, r *http.Request) {
 	items, err := s.store.ListMonitors(r.Context())
-	respond(w, items, err)
+	if err == nil {
+		items = s.sanitizeMonitors(items)
+	}
+	respond(w, r, items, err)
 }
 
 func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
@@ -161,11 +189,17 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
-	if !s.validateMonitorInput(w, input) {
+	if err := s.validateMonitorInput(input); err != nil {
+		writeError(w, r, err)
 		return
 	}
 	item, err := s.store.CreateMonitor(r.Context(), input)
-	respondCreated(w, item, err)
+	if err == nil {
+		id := item.ID
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "create", "monitor", &id, "创建监控 · "+item.Name, s.sanitizeMonitor(item))
+		item = s.sanitizeMonitor(item)
+	}
+	respondCreated(w, r, item, err)
 }
 
 func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
@@ -177,23 +211,24 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
-	if !s.validateMonitorInput(w, input) {
+	existing, err := s.store.GetMonitor(r.Context(), id)
+	if err != nil {
+		respond(w, r, model.Monitor{}, err)
+		return
+	}
+	if existing.Type == input.Type {
+		input.Config = mergeSecretConfig(existing.Config, input.Config, monitorSecretKeys(input.Type, s.scheduler.Plugins()))
+	}
+	if err := s.validateMonitorInput(input); err != nil {
+		writeError(w, r, err)
 		return
 	}
 	item, err := s.store.UpdateMonitor(r.Context(), id, input)
-	respond(w, item, err)
-}
-
-func (s *Server) validateMonitorInput(w http.ResponseWriter, input model.MonitorInput) bool {
-	if strings.TrimSpace(input.Name) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "monitor name is required"})
-		return false
+	if err == nil {
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "update", "monitor", &id, "修改监控 · "+item.Name, map[string]any{"before": s.sanitizeMonitor(existing), "after": s.sanitizeMonitor(item)})
+		item = s.sanitizeMonitor(item)
 	}
-	if !s.scheduler.HasPlugin(input.Type) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("unsupported monitor plugin %q", input.Type)})
-		return false
-	}
-	return true
+	respond(w, r, item, err)
 }
 
 func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
@@ -201,7 +236,12 @@ func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	respondNoContent(w, s.store.DeleteMonitor(r.Context(), id))
+	item, _ := s.store.GetMonitor(r.Context(), id)
+	err := s.store.DeleteMonitor(r.Context(), id)
+	if err == nil {
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "delete", "monitor", &id, "归档监控 · "+item.Name, map[string]any{"retainedHistory": true})
+	}
+	respondNoContent(w, r, err)
 }
 
 func (s *Server) checkMonitor(w http.ResponseWriter, r *http.Request) {
@@ -210,12 +250,15 @@ func (s *Server) checkMonitor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	err := s.scheduler.RunOnce(r.Context(), id)
-	respond(w, map[string]any{"status": "checked"}, err)
+	if err == nil {
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "check", "monitor", &id, "手动运行监控", map[string]any{})
+	}
+	respond(w, r, map[string]any{"status": "checked"}, err)
 }
 
 func (s *Server) listRules(w http.ResponseWriter, r *http.Request) {
 	items, err := s.store.ListRules(r.Context())
-	respond(w, items, err)
+	respond(w, r, items, err)
 }
 
 func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
@@ -223,8 +266,16 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
+	if err := s.validateRuleInput(r.Context(), input); err != nil {
+		writeError(w, r, err)
+		return
+	}
 	item, err := s.store.CreateRule(r.Context(), input)
-	respondCreated(w, item, err)
+	if err == nil {
+		id := item.ID
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "create", "rule", &id, "创建规则 · "+item.Name, item)
+	}
+	respondCreated(w, r, item, err)
 }
 
 func (s *Server) updateRule(w http.ResponseWriter, r *http.Request) {
@@ -236,8 +287,15 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
+	if err := s.validateRuleInput(r.Context(), input); err != nil {
+		writeError(w, r, err)
+		return
+	}
 	item, err := s.store.UpdateRule(r.Context(), id, input)
-	respond(w, item, err)
+	if err == nil {
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "update", "rule", &id, "修改规则 · "+item.Name, item)
+	}
+	respond(w, r, item, err)
 }
 
 func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
@@ -245,12 +303,20 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	respondNoContent(w, s.store.DeleteRule(r.Context(), id))
+	item, _ := s.store.GetRule(r.Context(), id)
+	err := s.store.DeleteRule(r.Context(), id)
+	if err == nil {
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "delete", "rule", &id, "归档规则 · "+item.Name, map[string]any{"retainedHistory": true})
+	}
+	respondNoContent(w, r, err)
 }
 
 func (s *Server) listNotifyChannels(w http.ResponseWriter, r *http.Request) {
 	items, err := s.store.ListNotifyChannels(r.Context())
-	respond(w, items, err)
+	if err == nil {
+		items = sanitizeChannels(items)
+	}
+	respond(w, r, items, err)
 }
 
 func (s *Server) createNotifyChannel(w http.ResponseWriter, r *http.Request) {
@@ -258,8 +324,17 @@ func (s *Server) createNotifyChannel(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
+	if err := validateChannelInput(input); err != nil {
+		writeError(w, r, err)
+		return
+	}
 	item, err := s.store.CreateNotifyChannel(r.Context(), input)
-	respondCreated(w, item, err)
+	if err == nil {
+		id := item.ID
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "create", "channel", &id, "创建渠道 · "+item.Name, sanitizeChannel(item))
+		item = sanitizeChannel(item)
+	}
+	respondCreated(w, r, item, err)
 }
 
 func (s *Server) updateNotifyChannel(w http.ResponseWriter, r *http.Request) {
@@ -271,8 +346,24 @@ func (s *Server) updateNotifyChannel(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
+	existing, err := s.store.GetNotifyChannel(r.Context(), id)
+	if err != nil {
+		respond(w, r, model.NotifyChannel{}, err)
+		return
+	}
+	if existing.Type == input.Type {
+		input.Config = mergeSecretConfig(existing.Config, input.Config, channelSecretKeys(input.Type))
+	}
+	if err := validateChannelInput(input); err != nil {
+		writeError(w, r, err)
+		return
+	}
 	item, err := s.store.UpdateNotifyChannel(r.Context(), id, input)
-	respond(w, item, err)
+	if err == nil {
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "update", "channel", &id, "修改渠道 · "+item.Name, map[string]any{"before": sanitizeChannel(existing), "after": sanitizeChannel(item)})
+		item = sanitizeChannel(item)
+	}
+	respond(w, r, item, err)
 }
 
 func (s *Server) deleteNotifyChannel(w http.ResponseWriter, r *http.Request) {
@@ -280,7 +371,12 @@ func (s *Server) deleteNotifyChannel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	respondNoContent(w, s.store.DeleteNotifyChannel(r.Context(), id))
+	item, _ := s.store.GetNotifyChannel(r.Context(), id)
+	err := s.store.DeleteNotifyChannel(r.Context(), id)
+	if err == nil {
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "delete", "channel", &id, "归档渠道 · "+item.Name, map[string]any{"retainedHistory": true})
+	}
+	respondNoContent(w, r, err)
 }
 
 func (s *Server) testNotifyChannel(w http.ResponseWriter, r *http.Request) {
@@ -288,13 +384,20 @@ func (s *Server) testNotifyChannel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	err := s.scheduler.TestChannel(r.Context(), id)
-	respond(w, map[string]any{"status": "sent"}, err)
+	attempt, err := s.scheduler.TestChannel(r.Context(), id)
+	if attempt.ID > 0 {
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "test", "channel", &id, "测试通知渠道", map[string]any{"attemptId": attempt.ID, "status": attempt.Status})
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, errorPayload(r, err, "channel_test_failed", map[string]string{}, map[string]any{"attempt": attempt}))
+		return
+	}
+	writeJSON(w, http.StatusOK, attempt)
 }
 
 func (s *Server) listNotificationTemplates(w http.ResponseWriter, r *http.Request) {
 	items, err := s.store.ListNotificationTemplates(r.Context())
-	respond(w, items, err)
+	respond(w, r, items, err)
 }
 
 func (s *Server) createNotificationTemplate(w http.ResponseWriter, r *http.Request) {
@@ -302,8 +405,16 @@ func (s *Server) createNotificationTemplate(w http.ResponseWriter, r *http.Reque
 	if !decode(w, r, &input) {
 		return
 	}
+	if err := validateTemplateInput(input); err != nil {
+		writeError(w, r, err)
+		return
+	}
 	item, err := s.store.CreateNotificationTemplate(r.Context(), input)
-	respondCreated(w, item, err)
+	if err == nil {
+		id := item.ID
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "create", "template", &id, "创建模板 · "+item.Name, item)
+	}
+	respondCreated(w, r, item, err)
 }
 
 func (s *Server) updateNotificationTemplate(w http.ResponseWriter, r *http.Request) {
@@ -315,8 +426,15 @@ func (s *Server) updateNotificationTemplate(w http.ResponseWriter, r *http.Reque
 	if !decode(w, r, &input) {
 		return
 	}
+	if err := validateTemplateInput(input); err != nil {
+		writeError(w, r, err)
+		return
+	}
 	item, err := s.store.UpdateNotificationTemplate(r.Context(), id, input)
-	respond(w, item, err)
+	if err == nil {
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "update", "template", &id, "修改模板 · "+item.Name, item)
+	}
+	respond(w, r, item, err)
 }
 
 func (s *Server) deleteNotificationTemplate(w http.ResponseWriter, r *http.Request) {
@@ -324,7 +442,12 @@ func (s *Server) deleteNotificationTemplate(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	respondNoContent(w, s.store.DeleteNotificationTemplate(r.Context(), id))
+	item, _ := s.store.GetNotificationTemplate(r.Context(), id)
+	err := s.store.DeleteNotificationTemplate(r.Context(), id)
+	if err == nil {
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "delete", "template", &id, "归档模板 · "+item.Name, map[string]any{"retainedHistory": true})
+	}
+	respondNoContent(w, r, err)
 }
 
 func (s *Server) previewTemplate(w http.ResponseWriter, r *http.Request) {
@@ -347,12 +470,91 @@ func (s *Server) previewTemplate(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {
 	items, err := s.store.ListEvents(r.Context(), queryLimit(r, 100))
-	respond(w, items, err)
+	respond(w, r, items, err)
 }
 
 func (s *Server) listNotificationLogs(w http.ResponseWriter, r *http.Request) {
 	items, err := s.store.ListNotificationLogs(r.Context(), queryLimit(r, 100))
-	respond(w, items, err)
+	respond(w, r, items, err)
+}
+
+func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+	summary, err := s.store.DashboardSummary(r.Context())
+	respond(w, r, summary, err)
+}
+
+func (s *Server) listCheckRuns(w http.ResponseWriter, r *http.Request) {
+	items, err := s.store.ListCheckRuns(r.Context(), queryLimit(r, 100))
+	respond(w, r, items, err)
+}
+
+func (s *Server) listRuleEvaluations(w http.ResponseWriter, r *http.Request) {
+	items, err := s.store.ListRuleEvaluations(r.Context(), queryLimit(r, 100))
+	respond(w, r, items, err)
+}
+
+func (s *Server) listNotificationAttempts(w http.ResponseWriter, r *http.Request) {
+	items, err := s.store.ListNotificationAttempts(r.Context(), queryLimit(r, 100))
+	respond(w, r, items, err)
+}
+
+func (s *Server) retryNotificationAttempt(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	attempt, err := s.scheduler.RetryAttempt(r.Context(), id)
+	if attempt.ID > 0 {
+		_ = s.store.CreateAuditLog(r.Context(), s.actor(r), "retry", "notification_attempt", &id, "重试失败通知", map[string]any{"newAttemptId": attempt.ID, "status": attempt.Status})
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, errorPayload(r, err, "notification_retry_failed", map[string]string{}, map[string]any{"attempt": attempt}))
+		return
+	}
+	writeJSON(w, http.StatusOK, attempt)
+}
+
+func (s *Server) listAuditLogs(w http.ResponseWriter, r *http.Request) {
+	items, err := s.store.ListAuditLogs(r.Context(), queryLimit(r, 100))
+	respond(w, r, items, err)
+}
+
+func (s *Server) systemStatus(w http.ResponseWriter, r *http.Request) {
+	database := "ok"
+	if err := s.store.Ping(r.Context()); err != nil {
+		database = "error"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"database":  database,
+		"scheduler": s.scheduler.Health(),
+		"time":      time.Now().UTC(),
+	})
+}
+
+func (s *Server) diagnostics(w http.ResponseWriter, r *http.Request) {
+	counts, err := s.store.DebugCounts(r.Context())
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	runs, _ := s.store.ListCheckRuns(r.Context(), 20)
+	attempts, _ := s.store.ListNotificationAttempts(r.Context(), 20)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"generatedAt":                time.Now().UTC(),
+		"scheduler":                  s.scheduler.Health(),
+		"counts":                     counts,
+		"recentCheckRuns":            runs,
+		"recentNotificationAttempts": attempts,
+	})
+}
+
+func (s *Server) actor(r *http.Request) string {
+	if s.auth != nil && s.auth.Enabled() {
+		if username, ok := s.auth.User(r); ok {
+			return username
+		}
+	}
+	return "local"
 }
 
 func (s *Server) serveSPA(w http.ResponseWriter, r *http.Request) {
@@ -377,25 +579,25 @@ func (s *Server) serveSPA(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNotFound, map[string]any{"error": "frontend is not built"})
 }
 
-func respond(w http.ResponseWriter, value any, err error) {
+func respond(w http.ResponseWriter, r *http.Request, value any, err error) {
 	if err != nil {
-		writeError(w, err)
+		writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, value)
 }
 
-func respondCreated(w http.ResponseWriter, value any, err error) {
+func respondCreated(w http.ResponseWriter, r *http.Request, value any, err error) {
 	if err != nil {
-		writeError(w, err)
+		writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, value)
 }
 
-func respondNoContent(w http.ResponseWriter, err error) {
+func respondNoContent(w http.ResponseWriter, r *http.Request, err error) {
 	if err != nil {
-		writeError(w, err)
+		writeError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -406,7 +608,7 @@ func decode(w http.ResponseWriter, r *http.Request, value any) bool {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(value); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, errorPayload(r, err, "invalid_json", map[string]string{}, nil))
 		return false
 	}
 	return true
@@ -415,7 +617,7 @@ func decode(w http.ResponseWriter, r *http.Request, value any) bool {
 func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil || id <= 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid id"})
+		writeJSON(w, http.StatusBadRequest, errorPayload(r, errors.New("invalid id"), "invalid_id", map[string]string{"id": "ID must be a positive integer."}, nil))
 		return 0, false
 	}
 	return id, true
@@ -433,12 +635,40 @@ func queryLimit(r *http.Request, fallback int) int {
 	return value
 }
 
-func writeError(w http.ResponseWriter, err error) {
+func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	status := http.StatusInternalServerError
+	code := "internal_error"
+	fields := map[string]string{}
+	var problem *problemError
+	if errors.As(err, &problem) {
+		status = problem.Status
+		code = problem.Code
+		fields = problem.Fields
+	}
 	if errors.Is(err, sql.ErrNoRows) || store.IsNotFound(err) {
 		status = http.StatusNotFound
+		code = "not_found"
 	}
-	writeJSON(w, status, map[string]any{"error": err.Error()})
+	if errors.Is(err, scheduler.ErrAlreadyRunning) {
+		status = http.StatusConflict
+		code = "already_running"
+	}
+	writeJSON(w, status, errorPayload(r, err, code, fields, nil))
+}
+
+func errorPayload(r *http.Request, err error, code string, fields map[string]string, extra map[string]any) map[string]any {
+	payload := map[string]any{
+		"error":     err.Error(),
+		"code":      code,
+		"requestId": middleware.GetReqID(r.Context()),
+	}
+	if len(fields) > 0 {
+		payload["fields"] = fields
+	}
+	for key, value := range extra {
+		payload[key] = value
+	}
+	return payload
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

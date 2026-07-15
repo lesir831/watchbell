@@ -37,19 +37,22 @@ type MonitorPlugin struct {
 }
 
 type Monitor struct {
-	ID              int64           `json:"id"`
-	Name            string          `json:"name"`
-	Type            string          `json:"type"`
-	Enabled         bool            `json:"enabled"`
-	IntervalSeconds int             `json:"intervalSeconds"`
-	Config          json.RawMessage `json:"config"`
-	State           json.RawMessage `json:"state,omitempty"`
-	LastCheckedAt   *time.Time      `json:"lastCheckedAt,omitempty"`
-	LastStatus      string          `json:"lastStatus,omitempty"`
-	LastMessage     string          `json:"lastMessage,omitempty"`
-	LastError       string          `json:"lastError,omitempty"`
-	CreatedAt       time.Time       `json:"createdAt"`
-	UpdatedAt       time.Time       `json:"updatedAt"`
+	ID                  int64           `json:"id"`
+	Name                string          `json:"name"`
+	Type                string          `json:"type"`
+	Enabled             bool            `json:"enabled"`
+	IntervalSeconds     int             `json:"intervalSeconds"`
+	Config              json.RawMessage `json:"config"`
+	State               json.RawMessage `json:"state,omitempty"`
+	LastCheckedAt       *time.Time      `json:"lastCheckedAt,omitempty"`
+	LastStatus          string          `json:"lastStatus,omitempty"`
+	LastMessage         string          `json:"lastMessage,omitempty"`
+	LastError           string          `json:"lastError,omitempty"`
+	ConsecutiveFailures int             `json:"consecutiveFailures"`
+	NextCheckAt         *time.Time      `json:"nextCheckAt,omitempty"`
+	ConfiguredSecrets   []string        `json:"configuredSecrets,omitempty"`
+	CreatedAt           time.Time       `json:"createdAt"`
+	UpdatedAt           time.Time       `json:"updatedAt"`
 }
 
 type MonitorInput struct {
@@ -85,13 +88,14 @@ type RuleInput struct {
 }
 
 type NotifyChannel struct {
-	ID        int64           `json:"id"`
-	Name      string          `json:"name"`
-	Type      string          `json:"type"`
-	Enabled   bool            `json:"enabled"`
-	Config    json.RawMessage `json:"config"`
-	CreatedAt time.Time       `json:"createdAt"`
-	UpdatedAt time.Time       `json:"updatedAt"`
+	ID                int64           `json:"id"`
+	Name              string          `json:"name"`
+	Type              string          `json:"type"`
+	Enabled           bool            `json:"enabled"`
+	Config            json.RawMessage `json:"config"`
+	ConfiguredSecrets []string        `json:"configuredSecrets,omitempty"`
+	CreatedAt         time.Time       `json:"createdAt"`
+	UpdatedAt         time.Time       `json:"updatedAt"`
 }
 
 type NotifyChannelInput struct {
@@ -119,6 +123,7 @@ type NotificationTemplateInput struct {
 type Event struct {
 	ID          int64           `json:"id"`
 	MonitorID   int64           `json:"monitorId"`
+	CheckRunID  *int64          `json:"checkRunId,omitempty"`
 	Type        string          `json:"type"`
 	Fingerprint string          `json:"fingerprint"`
 	Payload     json.RawMessage `json:"payload"`
@@ -146,4 +151,99 @@ type NotificationLog struct {
 	Error     string     `json:"error,omitempty"`
 	SentAt    *time.Time `json:"sentAt,omitempty"`
 	CreatedAt time.Time  `json:"createdAt"`
+}
+
+type CheckRun struct {
+	ID             int64           `json:"id"`
+	MonitorID      int64           `json:"monitorId"`
+	MonitorName    string          `json:"monitorName"`
+	MonitorType    string          `json:"monitorType"`
+	Trigger        string          `json:"trigger"`
+	ConfigSnapshot json.RawMessage `json:"configSnapshot"`
+	Status         string          `json:"status"`
+	Message        string          `json:"message,omitempty"`
+	Error          string          `json:"error,omitempty"`
+	EventCount     int             `json:"eventCount"`
+	DurationMS     int64           `json:"durationMs"`
+	StartedAt      time.Time       `json:"startedAt"`
+	FinishedAt     *time.Time      `json:"finishedAt,omitempty"`
+	CreatedAt      time.Time       `json:"createdAt"`
+}
+
+type RuleEvaluation struct {
+	ID        int64           `json:"id"`
+	EventID   int64           `json:"eventId"`
+	RuleID    *int64          `json:"ruleId,omitempty"`
+	RuleName  string          `json:"ruleName"`
+	Status    string          `json:"status"`
+	Reason    string          `json:"reason,omitempty"`
+	Matched   json.RawMessage `json:"matched"`
+	CreatedAt time.Time       `json:"createdAt"`
+}
+
+type NotificationAttempt struct {
+	ID               int64      `json:"id"`
+	EventID          *int64     `json:"eventId,omitempty"`
+	RuleEvaluationID *int64     `json:"ruleEvaluationId,omitempty"`
+	ChannelID        *int64     `json:"channelId,omitempty"`
+	RetryOfID        *int64     `json:"retryOfId,omitempty"`
+	ChannelName      string     `json:"channelName"`
+	ChannelType      string     `json:"channelType"`
+	Kind             string     `json:"kind"`
+	Status           string     `json:"status"`
+	Subject          string     `json:"subject"`
+	Body             string     `json:"body"`
+	Error            string     `json:"error,omitempty"`
+	AttemptNo        int        `json:"attemptNo"`
+	DurationMS       int64      `json:"durationMs"`
+	SentAt           *time.Time `json:"sentAt,omitempty"`
+	NextRetryAt      *time.Time `json:"nextRetryAt,omitempty"`
+	CreatedAt        time.Time  `json:"createdAt"`
+}
+
+type NotificationAttemptInput struct {
+	EventID          *int64
+	RuleEvaluationID *int64
+	ChannelID        *int64
+	RetryOfID        *int64
+	ChannelName      string
+	ChannelType      string
+	Kind             string
+	Status           string
+	Subject          string
+	Body             string
+	Error            string
+	AttemptNo        int
+	DurationMS       int64
+	SentAt           *time.Time
+	NextRetryAt      *time.Time
+}
+
+type AuditLog struct {
+	ID         int64           `json:"id"`
+	Actor      string          `json:"actor"`
+	Action     string          `json:"action"`
+	EntityType string          `json:"entityType"`
+	EntityID   *int64          `json:"entityId,omitempty"`
+	Summary    string          `json:"summary"`
+	Changes    json.RawMessage `json:"changes"`
+	CreatedAt  time.Time       `json:"createdAt"`
+}
+
+type SchedulerHealth struct {
+	StartedAt   time.Time  `json:"startedAt"`
+	LastTickAt  *time.Time `json:"lastTickAt,omitempty"`
+	WorkerCount int        `json:"workerCount"`
+	InFlight    int        `json:"inFlight"`
+}
+
+type DashboardSummary struct {
+	MonitorCount      int `json:"monitorCount"`
+	HealthyMonitors   int `json:"healthyMonitors"`
+	FailingMonitors   int `json:"failingMonitors"`
+	PendingMonitors   int `json:"pendingMonitors"`
+	RuleCount         int `json:"ruleCount"`
+	ChannelCount      int `json:"channelCount"`
+	EventsLast24Hours int `json:"eventsLast24Hours"`
+	FailedAttempts    int `json:"failedAttempts"`
 }

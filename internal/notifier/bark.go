@@ -79,7 +79,14 @@ func (n *BarkNotifier) Send(ctx context.Context, channel model.NotifyChannel, me
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("bark http %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		detail := strings.TrimSpace(string(respBody))
+		if strings.Contains(strings.ToLower(detail), "<html") {
+			detail = http.StatusText(resp.StatusCode)
+		}
+		if len(detail) > 512 {
+			detail = detail[:512] + "…"
+		}
+		return fmt.Errorf("bark http %d: %s", resp.StatusCode, detail)
 	}
 	return nil
 }

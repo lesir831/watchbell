@@ -48,6 +48,9 @@ export interface Monitor {
   lastStatus?: string;
   lastMessage?: string;
   lastError?: string;
+  consecutiveFailures: number;
+  nextCheckAt?: string;
+  configuredSecrets?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -90,6 +93,7 @@ export interface NotifyChannel {
   type: ChannelType;
   enabled: boolean;
   config: Record<string, unknown>;
+  configuredSecrets?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -119,6 +123,7 @@ export interface NotificationTemplateInput {
 export interface EventRecord {
   id: number;
   monitorId: number;
+  checkRunId?: number;
   type: string;
   fingerprint: string;
   payload: Record<string, unknown>;
@@ -133,4 +138,87 @@ export interface NotificationLog {
   error?: string;
   sentAt?: string;
   createdAt: string;
+}
+
+export interface CheckRun {
+  id: number;
+  monitorId: number;
+  monitorName: string;
+  monitorType: MonitorType;
+  trigger: 'manual' | 'scheduled';
+  configSnapshot: Record<string, unknown>;
+  status: string;
+  message?: string;
+  error?: string;
+  eventCount: number;
+  durationMs: number;
+  startedAt: string;
+  finishedAt?: string;
+  createdAt: string;
+}
+
+export interface RuleEvaluation {
+  id: number;
+  eventId: number;
+  ruleId?: number;
+  ruleName: string;
+  status: 'matched' | 'not_matched' | 'skipped' | 'error';
+  reason?: string;
+  matched: string[];
+  createdAt: string;
+}
+
+export interface NotificationAttempt {
+  id: number;
+  eventId?: number;
+  ruleEvaluationId?: number;
+  channelId?: number;
+  retryOfId?: number;
+  channelName: string;
+  channelType: ChannelType;
+  kind: 'delivery' | 'test';
+  status: 'sent' | 'failed';
+  subject: string;
+  body: string;
+  error?: string;
+  attemptNo: number;
+  durationMs: number;
+  sentAt?: string;
+  nextRetryAt?: string;
+  createdAt: string;
+}
+
+export interface AuditLog {
+  id: number;
+  actor: string;
+  action: string;
+  entityType: string;
+  entityId?: number;
+  summary: string;
+  changes: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface DashboardSummary {
+  monitorCount: number;
+  healthyMonitors: number;
+  failingMonitors: number;
+  pendingMonitors: number;
+  ruleCount: number;
+  channelCount: number;
+  eventsLast24Hours: number;
+  failedAttempts: number;
+}
+
+export interface SchedulerHealth {
+  startedAt: string;
+  lastTickAt?: string;
+  workerCount: number;
+  inFlight: number;
+}
+
+export interface SystemStatus {
+  database: string;
+  scheduler: SchedulerHealth;
+  time: string;
 }
