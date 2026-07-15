@@ -3,14 +3,21 @@ package api
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/watchbell/watchbell/internal/checker"
 	"github.com/watchbell/watchbell/internal/model"
+	"github.com/watchbell/watchbell/internal/notifier"
+	"github.com/watchbell/watchbell/internal/scheduler"
+	"github.com/watchbell/watchbell/internal/store"
 )
 
 func TestConfigBackupRoundTripRedactionAndMerge(t *testing.T) {
@@ -235,15 +242,39 @@ func TestConfigImportIsTransactionalOnLateMergeFailure(t *testing.T) {
 }
 
 func TestConfigExportRejectsLegacyDuplicateNaturalKeys(t *testing.T) {
-	server, db := newTestServer(t)
 	ctx := context.Background()
+	path := t.TempDir() + "/watchbell.db"
+	db, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	input := model.MonitorInput{Name: "Duplicate", Type: model.MonitorTypeRSS, Enabled: true, IntervalSeconds: 300, Config: json.RawMessage(`{"url":"https://example.com/feed.xml"}`)}
 	if _, err := db.CreateMonitor(ctx, input); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.CreateMonitor(ctx, input); err != nil {
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// Bypass current guarded writes to model a database produced by a release
+	// that allowed duplicate natural keys.
+	raw, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO monitors (name, type, enabled, interval_seconds, config_json, state_json, created_at, updated_at) VALUES ('Duplicate', 'rss', 1, 300, '{"url":"https://example.com/feed.xml"}', '{}', ?, ?)`, time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = store.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("legacy duplicate database failed to open: %v", err)
+	}
+	sched := scheduler.New(db, checker.NewRegistry(checker.NewRSSChecker()), notifier.NewRegistry(), scheduler.Options{})
+	server := httptest.NewServer(NewServer(db, sched, "", slog.New(slog.NewTextHandler(io.Discard, nil)), nil).Routes())
+	t.Cleanup(func() { server.Close(); _ = db.Close() })
 	response, err := http.Get(server.URL + "/api/config/export")
 	if err != nil {
 		t.Fatal(err)

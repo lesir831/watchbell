@@ -80,7 +80,7 @@ export default function ActivityPage() {
             { key: 'runs', label: `检查运行 ${runs.data?.total ?? ''}`, children: <RunsTable data={runs.data?.items ?? []} page={runs.data} loading={runs.isFetching} onPage={(page, size) => changePage('runs', page, size)} onDetail={(item) => setDetail({ title: `检查运行 #${item.id}`, data: item })} /> },
             { key: 'events', label: `事件 ${events.data?.total ?? ''}`, children: <EventsTable data={events.data?.items ?? []} page={events.data} loading={events.isFetching} monitorByID={monitorByID} onPage={(page, size) => changePage('events', page, size)} onDetail={(item) => setDetail({ title: `事件 #${item.id}`, data: item })} /> },
             { key: 'evaluations', label: `规则判断 ${evaluations.data?.total ?? ''}`, children: <EvaluationsTable data={evaluations.data?.items ?? []} page={evaluations.data} loading={evaluations.isFetching} onPage={(page, size) => changePage('evaluations', page, size)} onDetail={(item) => setDetail({ title: `规则判断 #${item.id}`, data: item })} /> },
-            { key: 'attempts', label: `通知尝试 ${attempts.data?.total ?? ''}`, children: <AttemptsTable data={attempts.data?.items ?? []} page={attempts.data} loading={attempts.isFetching} retrying={retryMutation.variables} monitorByID={monitorByID} onPage={(page, size) => changePage('attempts', page, size)} onRetry={(id) => retryMutation.mutate(id)} onDetail={(item) => setDetail({ title: `通知尝试 #${item.id}`, data: item })} /> },
+            { key: 'attempts', label: `通知尝试 ${attempts.data?.total ?? ''}`, children: <AttemptsTable data={attempts.data?.items ?? []} page={attempts.data} loading={attempts.isFetching} retrying={retryMutation.isPending ? retryMutation.variables : undefined} monitorByID={monitorByID} onPage={(page, size) => changePage('attempts', page, size)} onRetry={(id) => retryMutation.mutate(id)} onDetail={(item) => setDetail({ title: `通知尝试 #${item.id}`, data: item })} /> },
             { key: 'audit', label: `操作审计 ${audits.data?.total ?? ''}`, children: <AuditTable data={audits.data?.items ?? []} page={audits.data} loading={audits.isFetching} onPage={(page, size) => changePage('audit', page, size)} onDetail={(item) => setDetail({ title: `操作记录 #${item.id}`, data: item })} /> },
             { key: 'system', label: '系统诊断', children: <SystemPanel data={system.data} loading={system.isLoading} error={system.error as Error | null} onRefresh={() => system.refetch()} /> }
           ]}
@@ -179,16 +179,28 @@ function EvaluationsTable({ data, page, loading, onPage, onDetail }: { data: Rul
 }
 
 function AttemptsTable({ data, page, loading, retrying, monitorByID, onPage, onRetry, onDetail }: { data: NotificationAttempt[]; page?: PageMeta; loading: boolean; retrying?: number; monitorByID: Map<number, string>; onPage: (page: number, pageSize: number) => void; onRetry: (id: number) => void; onDetail: (item: NotificationAttempt) => void }) {
-  return <Table<NotificationAttempt> rowKey="id" loading={loading} dataSource={data} scroll={{ x: 1080 }} pagination={pagination(page, onPage)} columns={[
+  return <Table<NotificationAttempt> rowKey="id" loading={loading} dataSource={data} scroll={{ x: 1220 }} pagination={pagination(page, onPage)} columns={[
     { title: 'ID', dataIndex: 'id', width: 75, render: (id, item) => <Button type="link" onClick={() => onDetail(item)}>#{id}</Button> },
     { title: '监控', dataIndex: 'monitorId', width: 160, render: (id) => id ? monitorByID.get(id) ?? `已归档监控 #${id}` : '—' },
     { title: '关联', width: 130, render: (_, item) => attemptKindLabel(item) },
     { title: '渠道', dataIndex: 'channelName', width: 160 }, { title: '状态', dataIndex: 'status', width: 90, render: (value) => <StatusTag status={value} /> },
     { title: '尝试', dataIndex: 'attemptNo', width: 75, render: (value) => `第 ${value} 次` },
     { title: '错误', dataIndex: 'error', ellipsis: true, render: (value) => <Text type={value ? 'danger' : undefined}>{value || '—'}</Text> },
+    { title: '重试状态', width: 150, render: (_, item) => attemptRetryState(item) },
     { title: '耗时', dataIndex: 'durationMs', width: 85, render: formatDuration }, { title: '时间', dataIndex: 'createdAt', width: 140, render: relativeDate },
-    { title: '操作', width: 100, fixed: 'right', render: (_, item) => item.status === 'failed' ? <Button size="small" icon={<ReloadOutlined />} loading={retrying === item.id} onClick={() => onRetry(item.id)}>重试</Button> : null }
+    { title: '操作', width: 100, fixed: 'right', render: (_, item) => item.status === 'failed' && item.retriable && !item.resolved ? (
+      <Popconfirm title="手动重试这次通知？" description="将立即使用原通知内容和当前渠道配置再次发送。" okText="确认重试" cancelText="取消" onConfirm={() => onRetry(item.id)}>
+        <Button size="small" icon={<ReloadOutlined />} loading={retrying === item.id}>重试</Button>
+      </Popconfirm>
+    ) : null }
   ]} />;
+}
+
+function attemptRetryState(item: NotificationAttempt) {
+  if (item.resolved) return <Tag color="blue">已被后续尝试取代</Tag>;
+  if (item.nextRetryAt) return <span title={formatDate(item.nextRetryAt)}>计划 {relativeDate(item.nextRetryAt)}</span>;
+  if (item.status === 'failed' && item.retriable) return <Tag color="warning">可手动重试</Tag>;
+  return '—';
 }
 
 function attemptKindLabel(item: NotificationAttempt) {

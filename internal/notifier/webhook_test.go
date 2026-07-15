@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/watchbell/watchbell/internal/model"
 )
@@ -43,7 +45,7 @@ func TestWebhookNotifierRendersAndSendsRequest(t *testing.T) {
 			"Authorization": "Bearer ${event.token}",
 			"Content-Type":  "application/json",
 		},
-		BodyTemplate: `{"title":"${message.subject}","body":"${message.body}","link":"${rss.link}","monitor":"${monitor.name}"}`,
+		BodyTemplate: `{"title":${json:message.subject},"body":${json:message.body},"link":${json:rss.link},"monitor":${json:monitor.name}}`,
 	})
 	message := Message{
 		Subject: "New release",
@@ -74,6 +76,53 @@ func TestWebhookNotifierRendersAndSendsRequest(t *testing.T) {
 	wantBody := `{"title":"New release","body":"Version 2.0","link":"https://example.com/items/42","monitor":"Releases"}`
 	if request.body != wantBody {
 		t.Fatalf("body = %q, want %q", request.body, wantBody)
+	}
+}
+
+func TestWebhookNotifierEscapesJSONTemplateValuesAndRejectsPlainJSONVariables(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode webhook body: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if payload["body"] != "line one\n\"quoted\" \\ path" {
+			t.Errorf("body = %#v", payload["body"])
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	message := Message{Body: "line one\n\"quoted\" \\ path"}
+	safe := WebhookConfig{
+		URL: server.URL, AllowPrivate: true,
+		Headers:      map[string]string{"Content-Type": "application/problem+json"},
+		BodyTemplate: `{"body":${json:message.body}}`,
+	}
+	if err := NewWebhookNotifier().Send(context.Background(), model.NotifyChannel{Config: webhookConfigJSON(t, safe)}, message); err != nil {
+		t.Fatalf("safe Send() error = %v", err)
+	}
+
+	unsafe := safe
+	unsafe.Headers = map[string]string{"Content-Type": "application/json"}
+	unsafe.BodyTemplate = `{"body":"${message.body}"}`
+	err := NewWebhookNotifier().Send(context.Background(), model.NotifyChannel{Config: webhookConfigJSON(t, unsafe)}, message)
+	if err == nil || !strings.Contains(err.Error(), "must use ${json:path}") {
+		t.Fatalf("unsafe Send() error = %v", err)
+	}
+
+	// Syntax validation alone is insufficient: this value would add fields and
+	// still leave a valid JSON document after raw string interpolation.
+	message.Body = `","admin":true,"tail":"`
+	err = NewWebhookNotifier().Send(context.Background(), model.NotifyChannel{Config: webhookConfigJSON(t, unsafe)}, message)
+	if err == nil || !strings.Contains(err.Error(), "must use ${json:path}") {
+		t.Fatalf("semantic injection Send() error = %v", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("unsafe rendered JSON reached provider; requests = %d", got)
 	}
 }
 
@@ -197,6 +246,82 @@ func TestWebhookNotifierBlocksPrivateAddressesByDefault(t *testing.T) {
 	}, Message{})
 	if err == nil || !strings.Contains(err.Error(), "private or special-purpose") {
 		t.Fatalf("Send() error = %v, want private-address rejection", err)
+	}
+}
+
+func TestWebhookNotifierBlocksSpecialPurposeAddressRanges(t *testing.T) {
+	blocked := []string{
+		"192.0.0.1", "198.18.0.1", "224.0.0.1", "240.0.0.1",
+		"::192.0.2.1", "64:ff9b::c000:201", "64:ff9b:1::1", "100:0:0:1::1", "2001:db8::1", "3fff::1", "fec0::1",
+	}
+	for _, raw := range blocked {
+		t.Run(raw, func(t *testing.T) {
+			if !blockedWebhookIP(net.ParseIP(raw)) {
+				t.Fatalf("blockedWebhookIP(%s) = false", raw)
+			}
+			config := webhookConfigJSON(t, WebhookConfig{URL: "http://[" + raw + "]/hook"})
+			if net.ParseIP(raw).To4() != nil {
+				config = webhookConfigJSON(t, WebhookConfig{URL: "http://" + raw + "/hook"})
+			}
+			if err := ValidateWebhookConfig(config); err == nil || !strings.Contains(err.Error(), "special-purpose") {
+				t.Fatalf("ValidateWebhookConfig(%s) error = %v", raw, err)
+			}
+		})
+	}
+	for _, raw := range []string{"8.8.8.8", "2606:4700:4700::1111"} {
+		if blockedWebhookIP(net.ParseIP(raw)) {
+			t.Fatalf("blockedWebhookIP(%s) = true for public address", raw)
+		}
+	}
+}
+
+func TestWebhookNotifierBlocksSpecialPurposeDNSResolution(t *testing.T) {
+	for _, raw := range []string{"198.18.0.25", "::192.0.2.25", "100:0:0:1::25", "fec0::25"} {
+		t.Run(raw, func(t *testing.T) {
+			transport, err := webhookTransport(nil, false, func(context.Context, string) ([]net.IPAddr, error) {
+				return []net.IPAddr{{IP: net.ParseIP(raw)}}, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer transport.CloseIdleConnections()
+			connection, err := transport.DialContext(context.Background(), "tcp", "webhook.example.test:80")
+			if connection != nil {
+				connection.Close()
+			}
+			if err == nil || !strings.Contains(err.Error(), "private or special-purpose") {
+				t.Fatalf("DialContext() error = %v, want DNS address rejection", err)
+			}
+		})
+	}
+}
+
+func TestWebhookNotifierClosesOneShotTransportIdleConnections(t *testing.T) {
+	closed := make(chan struct{}, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed {
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	err := NewWebhookNotifier().Send(context.Background(), model.NotifyChannel{
+		Config: webhookConfigJSON(t, WebhookConfig{URL: server.URL, AllowPrivate: true}),
+	}, Message{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("one-shot webhook transport left its idle connection open")
 	}
 }
 

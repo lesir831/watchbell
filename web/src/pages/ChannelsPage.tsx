@@ -53,10 +53,10 @@ const channelSchemas: Record<ChannelType, { name: string; description: string; f
       { key: 'url', label: '请求地址', type: 'secret', secret: true, required: true, description: '支持 ${...} 模板变量；路径或查询中可能含 Token，因此不会回显' },
       { key: 'method', label: 'HTTP 方法', type: 'string', description: 'POST、PUT、PATCH、DELETE 或 GET' },
       { key: 'headers', label: '请求头', type: 'json', secret: true, description: 'JSON 对象；Authorization 等敏感值不会回显' },
-      { key: 'bodyTemplate', label: '请求正文模板', type: 'textarea', description: '支持 ${message.subject}、${message.body} 和事件变量' },
+      { key: 'bodyTemplate', label: '请求正文模板', type: 'textarea', description: '留空时由后端生成安全 JSON；自定义 JSON 时请用 ${json:message.subject}、${json:message.body} 对值进行 JSON 转义。' },
       { key: 'allowPrivate', label: '允许内网地址', type: 'boolean', description: '仅在连接你信任的内网/本机服务时开启；默认阻止 SSRF' }
     ],
-    defaults: { url: '', method: 'POST', headers: { 'Content-Type': 'application/json' }, bodyTemplate: '{\n  "title": "${message.subject}",\n  "body": "${message.body}",\n  "event": "${event.type}"\n}', allowPrivate: false }
+    defaults: { url: '', method: 'POST', headers: { 'Content-Type': 'application/json' }, bodyTemplate: '', allowPrivate: false }
   }
 };
 
@@ -138,12 +138,14 @@ function ChannelDrawer(props: { open: boolean; record: NotifyChannel | null; sav
   const setInitial = () => {
     const config = props.record?.config ?? channelSchemas.bark.defaults;
     setAdvanced(false);
-    form.setFieldsValue({ name: props.record?.name ?? '', type: props.record?.type ?? 'bark', enabled: props.record?.enabled ?? true, config, rawConfig: JSON.stringify(config, null, 2) });
+    form.resetFields();
+    form.setFieldsValue({ name: props.record?.name ?? '', type: props.record?.type ?? 'bark', enabled: props.record?.enabled ?? true });
+    form.setFieldValue('config', config);
+    form.setFieldValue('rawConfig', JSON.stringify(config, null, 2));
   };
   const submit = async (testAfter: boolean) => {
     const values = await form.validateFields();
-    const knownConfig = Object.fromEntries(schema.fields.map((field) => [field.key, values.config?.[field.key]]).filter(([, value]) => value !== undefined));
-    const config = advanced ? parseConfigJSON(values.rawConfig) : { ...(props.record?.config ?? {}), ...knownConfig };
+    const config = advanced ? parseConfigJSON(values.rawConfig) : (form.getFieldValue('config') ?? {});
     props.onSave({ name: values.name.trim(), type: values.type, enabled: values.enabled, config }, testAfter);
   };
   return (
@@ -152,14 +154,15 @@ function ChannelDrawer(props: { open: boolean; record: NotifyChannel | null; sav
       <Form form={form} layout="vertical" requiredMark="optional" onValuesChange={(changed) => {
         if (changed.type && !props.record) {
           const config = channelSchemas[changed.type as ChannelType].defaults;
-          form.setFieldsValue({ config, rawConfig: JSON.stringify(config, null, 2) });
+          form.setFieldValue('config', config);
+          form.setFieldValue('rawConfig', JSON.stringify(config, null, 2));
         }
       }}>
         <Alert className="form-intro" type="info" showIcon message={schema.name} description={schema.description} />
         <Form.Item name="name" label="名称" rules={[{ required: true, whitespace: true }]}><Input placeholder="例如：我的 iPhone" /></Form.Item>
         <Form.Item name="type" label="渠道类型" extra={props.record ? '已创建渠道的类型不可修改。' : undefined}><Select disabled={Boolean(props.record)} options={Object.entries(channelSchemas).map(([value, item]) => ({ label: item.name, value }))} /></Form.Item>
         <Form.Item name="enabled" label="启用渠道" valuePropName="checked"><Switch /></Form.Item>
-        <ConfigMode form={form} advanced={advanced} onChange={setAdvanced} baseConfig={props.record?.config} />
+        <ConfigMode form={form} advanced={advanced} onChange={setAdvanced} />
         {advanced ? <AdvancedConfigField /> : <ConfigFields fields={schema.fields} configuredSecrets={props.record?.configuredSecrets} />}
       </Form>
     </Drawer>

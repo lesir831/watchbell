@@ -24,6 +24,11 @@ type Store struct {
 	db *sql.DB
 }
 
+// ErrDuplicateNaturalKey is returned when a write would duplicate an active
+// configuration entity's documented natural key. Store writes enforce this
+// atomically; API-side lookups remain useful only for friendlier field errors.
+var ErrDuplicateNaturalKey = errors.New("duplicate active configuration natural key")
+
 func Open(ctx context.Context, path string) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -96,6 +101,18 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("migrate %s.%s: %w", column.table, column.name, err)
 		}
 	}
+	// notification_attempts.monitor_id was added after the original trace
+	// schema. Backfill it while the event/evaluation links are still available
+	// so later independent retention cannot make legacy attempts untraceable.
+	if _, err := s.db.ExecContext(ctx, `UPDATE notification_attempts
+		SET monitor_id = COALESCE(
+			(SELECT event.monitor_id FROM events event WHERE event.id = notification_attempts.event_id),
+			(SELECT event.monitor_id FROM rule_evaluations evaluation JOIN events event ON event.id = evaluation.event_id WHERE evaluation.id = notification_attempts.rule_evaluation_id)
+		)
+		WHERE monitor_id IS NULL
+		  AND (event_id IS NOT NULL OR rule_evaluation_id IS NOT NULL)`); err != nil {
+		return fmt.Errorf("backfill notification attempt monitor: %w", err)
+	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE notification_templates SET is_default = 1 WHERE id = 1 AND NOT EXISTS (SELECT 1 FROM notification_templates WHERE is_default = 1)`); err != nil {
 		return fmt.Errorf("mark default notification template: %w", err)
 	}
@@ -104,6 +121,19 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_notification_attempts_monitor_id ON notification_attempts(monitor_id, created_at DESC)`); err != nil {
 		return fmt.Errorf("index notification attempt monitor: %w", err)
+	}
+	for _, index := range []struct {
+		name  string
+		query string
+	}{
+		{"active monitor natural key", `CREATE INDEX IF NOT EXISTS idx_monitors_active_natural_key ON monitors(type, name) WHERE deleted_at IS NULL`},
+		{"active rule natural key", `CREATE INDEX IF NOT EXISTS idx_rules_active_natural_key ON rules(monitor_id, name) WHERE deleted_at IS NULL`},
+		{"active channel natural key", `CREATE INDEX IF NOT EXISTS idx_notify_channels_active_natural_key ON notify_channels(type, name) WHERE deleted_at IS NULL`},
+		{"active template natural key", `CREATE INDEX IF NOT EXISTS idx_notification_templates_active_natural_key ON notification_templates(name) WHERE deleted_at IS NULL`},
+	} {
+		if _, err := s.db.ExecContext(ctx, index.query); err != nil {
+			return fmt.Errorf("index %s: %w", index.name, err)
+		}
 	}
 	if err := s.repairActiveConfigReferences(ctx); err != nil {
 		return fmt.Errorf("repair active configuration references: %w", err)
@@ -192,10 +222,18 @@ func (s *Store) CreateMonitor(ctx context.Context, input model.MonitorInput) (mo
 	if err != nil {
 		return model.Monitor{}, err
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO monitors (name, type, enabled, interval_seconds, config_json, state_json, failure_alert_after, failure_notify_channel_ids_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '{}', ?, ?, ?, ?)`,
-		strings.TrimSpace(input.Name), input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), now, now)
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO monitors (name, type, enabled, interval_seconds, config_json, state_json, failure_alert_after, failure_notify_channel_ids_json, created_at, updated_at)
+		SELECT ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?
+		WHERE NOT EXISTS (SELECT 1 FROM monitors WHERE name = ? AND type = ? AND deleted_at IS NULL)`,
+		name, input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), now, now, name, input.Type)
 	if err != nil {
 		return model.Monitor{}, err
+	}
+	if duplicate, err := insertWasSkipped(res); err != nil {
+		return model.Monitor{}, err
+	} else if duplicate {
+		return model.Monitor{}, fmt.Errorf("%w: monitor (%s, %s)", ErrDuplicateNaturalKey, input.Type, name)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
@@ -218,11 +256,12 @@ func (s *Store) UpdateMonitor(ctx context.Context, id int64, input model.Monitor
 		return model.Monitor{}, err
 	}
 	resetState := existing.Type != input.Type || !jsonEquivalent(existing.Config, config)
-	query := `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = CASE WHEN ? = 0 THEN 0 ELSE failure_alert_active END, updated_at = ? WHERE id = ? AND deleted_at IS NULL`
-	args := []any{strings.TrimSpace(input.Name), input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), input.FailureAlertAfter, nowString(), id}
+	name := strings.TrimSpace(input.Name)
+	query := `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = CASE WHEN ? = 0 THEN 0 ELSE failure_alert_active END, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM monitors duplicate WHERE duplicate.name = ? AND duplicate.type = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`
+	args := []any{name, input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), input.FailureAlertAfter, nowString(), id, name, input.Type, id}
 	if resetState {
-		query = `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, state_json = '{}', last_checked_at = NULL, last_status = '', last_message = '', last_error = '', consecutive_failures = 0, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = 0, updated_at = ? WHERE id = ? AND deleted_at IS NULL`
-		args = []any{strings.TrimSpace(input.Name), input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), nowString(), id}
+		query = `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, state_json = '{}', last_checked_at = NULL, last_status = '', last_message = '', last_error = '', consecutive_failures = 0, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = 0, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM monitors duplicate WHERE duplicate.name = ? AND duplicate.type = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`
+		args = []any{name, input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), nowString(), id, name, input.Type, id}
 	}
 	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
@@ -230,7 +269,12 @@ func (s *Store) UpdateMonitor(ctx context.Context, id int64, input model.Monitor
 	}
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
-		return model.Monitor{}, sql.ErrNoRows
+		if exists, lookupErr := s.activeRecordExists(ctx, "monitors", id); lookupErr != nil {
+			return model.Monitor{}, lookupErr
+		} else if !exists {
+			return model.Monitor{}, sql.ErrNoRows
+		}
+		return model.Monitor{}, fmt.Errorf("%w: monitor (%s, %s)", ErrDuplicateNaturalKey, input.Type, name)
 	}
 	return s.GetMonitor(ctx, id)
 }
@@ -328,10 +372,18 @@ func (s *Store) CreateRule(ctx context.Context, input model.RuleInput) (model.Ru
 	if err != nil {
 		return model.Rule{}, err
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO rules (monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		input.MonitorID, strings.TrimSpace(input.Name), boolInt(input.Enabled), string(condition), string(channelIDs), input.TemplateID, input.CooldownSeconds, string(quietHours), now, now)
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO rules (monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, created_at, updated_at)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (SELECT 1 FROM rules WHERE monitor_id = ? AND name = ? AND deleted_at IS NULL)`,
+		input.MonitorID, name, boolInt(input.Enabled), string(condition), string(channelIDs), input.TemplateID, input.CooldownSeconds, string(quietHours), now, now, input.MonitorID, name)
 	if err != nil {
 		return model.Rule{}, err
+	}
+	if duplicate, err := insertWasSkipped(res); err != nil {
+		return model.Rule{}, err
+	} else if duplicate {
+		return model.Rule{}, fmt.Errorf("%w: rule (%d, %s)", ErrDuplicateNaturalKey, input.MonitorID, name)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
@@ -350,14 +402,20 @@ func (s *Store) UpdateRule(ctx context.Context, id int64, input model.RuleInput)
 	if err != nil {
 		return model.Rule{}, err
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE rules SET monitor_id = ?, name = ?, enabled = ?, condition_json = ?, notify_channel_ids_json = ?, template_id = ?, cooldown_seconds = ?, quiet_hours_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
-		input.MonitorID, strings.TrimSpace(input.Name), boolInt(input.Enabled), string(condition), string(channelIDs), input.TemplateID, input.CooldownSeconds, string(quietHours), nowString(), id)
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `UPDATE rules SET monitor_id = ?, name = ?, enabled = ?, condition_json = ?, notify_channel_ids_json = ?, template_id = ?, cooldown_seconds = ?, quiet_hours_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM rules duplicate WHERE duplicate.monitor_id = ? AND duplicate.name = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`,
+		input.MonitorID, name, boolInt(input.Enabled), string(condition), string(channelIDs), input.TemplateID, input.CooldownSeconds, string(quietHours), nowString(), id, input.MonitorID, name, id)
 	if err != nil {
 		return model.Rule{}, err
 	}
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
-		return model.Rule{}, sql.ErrNoRows
+		if exists, lookupErr := s.activeRecordExists(ctx, "rules", id); lookupErr != nil {
+			return model.Rule{}, lookupErr
+		} else if !exists {
+			return model.Rule{}, sql.ErrNoRows
+		}
+		return model.Rule{}, fmt.Errorf("%w: rule (%d, %s)", ErrDuplicateNaturalKey, input.MonitorID, name)
 	}
 	return s.GetRule(ctx, id)
 }
@@ -431,10 +489,18 @@ func (s *Store) GetNotifyChannel(ctx context.Context, id int64) (model.NotifyCha
 func (s *Store) CreateNotifyChannel(ctx context.Context, input model.NotifyChannelInput) (model.NotifyChannel, error) {
 	now := nowString()
 	config := normalizedJSON(input.Config, "{}")
-	res, err := s.db.ExecContext(ctx, `INSERT INTO notify_channels (name, type, enabled, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		strings.TrimSpace(input.Name), input.Type, boolInt(input.Enabled), string(config), now, now)
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO notify_channels (name, type, enabled, config_json, created_at, updated_at)
+		SELECT ?, ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (SELECT 1 FROM notify_channels WHERE name = ? AND type = ? AND deleted_at IS NULL)`,
+		name, input.Type, boolInt(input.Enabled), string(config), now, now, name, input.Type)
 	if err != nil {
 		return model.NotifyChannel{}, err
+	}
+	if duplicate, err := insertWasSkipped(res); err != nil {
+		return model.NotifyChannel{}, err
+	} else if duplicate {
+		return model.NotifyChannel{}, fmt.Errorf("%w: notification channel (%s, %s)", ErrDuplicateNaturalKey, input.Type, name)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
@@ -445,14 +511,20 @@ func (s *Store) CreateNotifyChannel(ctx context.Context, input model.NotifyChann
 
 func (s *Store) UpdateNotifyChannel(ctx context.Context, id int64, input model.NotifyChannelInput) (model.NotifyChannel, error) {
 	config := normalizedJSON(input.Config, "{}")
-	res, err := s.db.ExecContext(ctx, `UPDATE notify_channels SET name = ?, type = ?, enabled = ?, config_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
-		strings.TrimSpace(input.Name), input.Type, boolInt(input.Enabled), string(config), nowString(), id)
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `UPDATE notify_channels SET name = ?, type = ?, enabled = ?, config_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM notify_channels duplicate WHERE duplicate.name = ? AND duplicate.type = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`,
+		name, input.Type, boolInt(input.Enabled), string(config), nowString(), id, name, input.Type, id)
 	if err != nil {
 		return model.NotifyChannel{}, err
 	}
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
-		return model.NotifyChannel{}, sql.ErrNoRows
+		if exists, lookupErr := s.activeRecordExists(ctx, "notify_channels", id); lookupErr != nil {
+			return model.NotifyChannel{}, lookupErr
+		} else if !exists {
+			return model.NotifyChannel{}, sql.ErrNoRows
+		}
+		return model.NotifyChannel{}, fmt.Errorf("%w: notification channel (%s, %s)", ErrDuplicateNaturalKey, input.Type, name)
 	}
 	return s.GetNotifyChannel(ctx, id)
 }
@@ -589,10 +661,18 @@ func (s *Store) GetDefaultNotificationTemplate(ctx context.Context) (model.Notif
 
 func (s *Store) CreateNotificationTemplate(ctx context.Context, input model.NotificationTemplateInput) (model.NotificationTemplate, error) {
 	now := nowString()
-	res, err := s.db.ExecContext(ctx, `INSERT INTO notification_templates (name, subject_template, body_template, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
-		strings.TrimSpace(input.Name), input.SubjectTemplate, input.BodyTemplate, now, now)
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO notification_templates (name, subject_template, body_template, created_at, updated_at)
+		SELECT ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (SELECT 1 FROM notification_templates WHERE name = ? AND deleted_at IS NULL)`,
+		name, input.SubjectTemplate, input.BodyTemplate, now, now, name)
 	if err != nil {
 		return model.NotificationTemplate{}, err
+	}
+	if duplicate, err := insertWasSkipped(res); err != nil {
+		return model.NotificationTemplate{}, err
+	} else if duplicate {
+		return model.NotificationTemplate{}, fmt.Errorf("%w: notification template (%s)", ErrDuplicateNaturalKey, name)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
@@ -602,14 +682,20 @@ func (s *Store) CreateNotificationTemplate(ctx context.Context, input model.Noti
 }
 
 func (s *Store) UpdateNotificationTemplate(ctx context.Context, id int64, input model.NotificationTemplateInput) (model.NotificationTemplate, error) {
-	res, err := s.db.ExecContext(ctx, `UPDATE notification_templates SET name = ?, subject_template = ?, body_template = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
-		strings.TrimSpace(input.Name), input.SubjectTemplate, input.BodyTemplate, nowString(), id)
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `UPDATE notification_templates SET name = ?, subject_template = ?, body_template = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM notification_templates duplicate WHERE duplicate.name = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`,
+		name, input.SubjectTemplate, input.BodyTemplate, nowString(), id, name, id)
 	if err != nil {
 		return model.NotificationTemplate{}, err
 	}
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
-		return model.NotificationTemplate{}, sql.ErrNoRows
+		if exists, lookupErr := s.activeRecordExists(ctx, "notification_templates", id); lookupErr != nil {
+			return model.NotificationTemplate{}, lookupErr
+		} else if !exists {
+			return model.NotificationTemplate{}, sql.ErrNoRows
+		}
+		return model.NotificationTemplate{}, fmt.Errorf("%w: notification template (%s)", ErrDuplicateNaturalKey, name)
 	}
 	return s.GetNotificationTemplate(ctx, id)
 }
@@ -958,6 +1044,27 @@ func parseTimePtr(value sql.NullString) *time.Time {
 		return nil
 	}
 	return &parsed
+}
+
+func insertWasSkipped(result sql.Result) (bool, error) {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 0, nil
+}
+
+func (s *Store) activeRecordExists(ctx context.Context, table string, id int64) (bool, error) {
+	switch table {
+	case "monitors", "rules", "notify_channels", "notification_templates":
+	default:
+		return false, fmt.Errorf("unsupported active record table %q", table)
+	}
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %s WHERE id = ? AND deleted_at IS NULL)`, table), id).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 func IsNotFound(err error) bool {

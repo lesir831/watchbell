@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -146,5 +147,16 @@ func TestLogoutUsesSecureCookiePolicy(t *testing.T) {
 	cookies := response.Result().Cookies()
 	if len(cookies) != 1 || !cookies[0].Secure || cookies[0].MaxAge != -1 {
 		t.Fatalf("logout cookie = %#v", cookies)
+	}
+}
+
+func TestExplicitShortSessionSecretIsRejected(t *testing.T) {
+	_, err := NewManager(Config{
+		Enabled:       true,
+		PasswordHash:  testPasswordHash,
+		SessionSecret: "too-short",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatalf("NewManager() error = %v, want minimum session-secret length error", err)
 	}
 }

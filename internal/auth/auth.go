@@ -131,9 +131,8 @@ func NewManager(cfg Config, logger *slog.Logger) (*Manager, error) {
 			return nil, err
 		}
 		logger.Warn("WATCHBELL_SESSION_SECRET is not set; generated sessions will be invalid after restart")
-	}
-	if len(secret) < 32 {
-		logger.Warn("WATCHBELL_SESSION_SECRET should be at least 32 bytes")
+	} else if len(secret) < 32 {
+		return nil, fmt.Errorf("WATCHBELL_SESSION_SECRET must be at least 32 bytes when set")
 	}
 	return &Manager{
 		enabled:           true,
@@ -237,6 +236,16 @@ func (m *Manager) secureCookie(r *http.Request) bool {
 	if m != nil && m.cookieSecure != nil {
 		return *m.cookieSecure
 	}
+	if requestUsesDirectHTTPS(r) {
+		return true
+	}
+	return m != nil && m.trustProxyHeaders && requestUsesForwardedHTTPS(r)
+}
+
+// RequestUsesHTTPS reports the effective request scheme using the same trusted
+// proxy boundary as secure-cookie detection. API middleware uses this when
+// comparing a browser Origin header with the request origin.
+func (m *Manager) RequestUsesHTTPS(r *http.Request) bool {
 	if requestUsesDirectHTTPS(r) {
 		return true
 	}

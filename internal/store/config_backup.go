@@ -91,6 +91,22 @@ func (s *Store) importConfigMerge(ctx context.Context, backup model.ConfigBackup
 		if err != nil {
 			return report, importLookupError(fmt.Sprintf("backup.templates.%d", index), "通知模板", err)
 		}
+		// A default template is matched by its role rather than its name. Before
+		// renaming that target, reject a collision with an existing custom
+		// template; otherwise import would succeed but the next export would be
+		// ambiguous and unusable.
+		if item.IsDefault && found {
+			conflict, err := templateNameOwnedByAnotherActiveRow(ctx, tx, item.Name, id)
+			if err != nil {
+				return report, fmt.Errorf("check default template name %q: %w", item.Name, err)
+			}
+			if conflict {
+				return report, &ConfigImportError{
+					Field:   fmt.Sprintf("backup.templates.%d.name", index),
+					Message: fmt.Sprintf("默认通知模板 %q 与目标实例中的自定义模板同名；请先重命名其中一个模板。", item.Name),
+				}
+			}
+		}
 		if found {
 			_, err = tx.ExecContext(ctx, `UPDATE notification_templates SET name = ?, subject_template = ?, body_template = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
 				strings.TrimSpace(item.Name), item.SubjectTemplate, item.BodyTemplate, nowString(), id)
@@ -370,6 +386,15 @@ func findMergeRule(ctx context.Context, tx *sql.Tx, monitorID int64, name string
 		return 0, false, errAmbiguousMergeTarget
 	}
 	return id, count == 1, nil
+}
+
+func templateNameOwnedByAnotherActiveRow(ctx context.Context, tx *sql.Tx, name string, excludeID int64) (bool, error) {
+	var exists bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM notification_templates
+		WHERE name = ? AND id <> ? AND deleted_at IS NULL
+	)`, strings.TrimSpace(name), excludeID).Scan(&exists)
+	return exists, err
 }
 
 func preserveRedactedSecrets(currentRaw, incomingRaw json.RawMessage, keys []string) (json.RawMessage, error) {

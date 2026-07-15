@@ -168,6 +168,120 @@ func TestCleanupHistoryHonorsBatchSizeAndDisabledCategories(t *testing.T) {
 	}
 }
 
+func TestEventCleanupBackfillsLegacyAttemptMonitorBeforeDetach(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "watchbell.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	now := time.Now().UTC()
+	monitor, err := db.CreateMonitor(ctx, model.MonitorInput{Name: "Legacy trace", Type: "rss", Enabled: true, IntervalSeconds: 60, Config: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, _, err := db.CreateEvent(ctx, monitor.ID, model.EventData{Type: "rss.item", Fingerprint: "legacy-attempt", Payload: map[string]any{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkOutboxProcessed(ctx, event.ID); err != nil {
+		t.Fatal(err)
+	}
+	eventID := event.ID
+	attempt, err := db.CreateNotificationAttempt(ctx, model.NotificationAttemptInput{
+		EventID: &eventID, ChannelName: "Legacy channel", ChannelType: "webhook", Kind: "delivery", Status: "sent",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE events SET created_at = ? WHERE id = ?`, formatTime(now.Add(-48*time.Hour)), event.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.CleanupHistory(ctx, HistoryRetentionPolicy{EventAge: 24 * time.Hour}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.EventsDeleted != 1 || result.NotificationAttemptsDeleted != 0 {
+		t.Fatalf("cleanup result = %+v", result)
+	}
+	stored, err := db.GetNotificationAttempt(ctx, attempt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.MonitorID == nil || *stored.MonitorID != monitor.ID || stored.EventID != nil {
+		t.Fatalf("detached attempt lost monitor trace: %#v", stored)
+	}
+	page, err := db.ListNotificationAttemptsPage(ctx, NotificationAttemptFilter{MonitorID: monitor.ID})
+	if err != nil || page.Total != 1 || page.Items[0].ID != attempt.ID {
+		t.Fatalf("monitor filter lost detached attempt: %#v err=%v", page, err)
+	}
+}
+
+func TestCleanupHistoryRetainsActivelyClaimedManualRetry(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "watchbell.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	now := time.Now().UTC()
+	old := formatTime(now.Add(-48 * time.Hour))
+	monitor, err := db.CreateMonitor(ctx, model.MonitorInput{Name: "Claimed retry trace", Type: "rss", Enabled: true, IntervalSeconds: 60, Config: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, _, err := db.CreateEvent(ctx, monitor.ID, model.EventData{Type: "rss.item", Fingerprint: "claimed-retry", Payload: map[string]any{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkOutboxProcessed(ctx, event.ID); err != nil {
+		t.Fatal(err)
+	}
+	eventID := event.ID
+	attempt, err := db.CreateNotificationAttempt(ctx, model.NotificationAttemptInput{
+		EventID: &eventID, ChannelName: "Slow provider", ChannelType: "webhook", Kind: "delivery", Status: "failed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE events SET created_at = ? WHERE id = ?`, old, event.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE notification_attempts SET created_at = ? WHERE id = ?`, old, attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := db.ClaimNotificationAttemptNow(ctx, attempt.ID, now)
+	if err != nil || !claimed {
+		t.Fatalf("manual retry claim = %v err=%v", claimed, err)
+	}
+
+	result, err := db.CleanupHistory(ctx, UniformHistoryRetention(24*time.Hour, 100), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.EventsDeleted != 0 || result.NotificationAttemptsDeleted != 0 {
+		t.Fatalf("active retry was cleaned up: %+v", result)
+	}
+	if _, err := db.GetEvent(ctx, event.ID); err != nil {
+		t.Fatalf("active retry event was removed: %v", err)
+	}
+	if _, err := db.GetNotificationAttempt(ctx, attempt.ID); err != nil {
+		t.Fatalf("active retry source was removed: %v", err)
+	}
+
+	if err := db.StopNotificationRetry(ctx, attempt.ID, "test complete"); err != nil {
+		t.Fatal(err)
+	}
+	result, err = db.CleanupHistory(ctx, UniformHistoryRetention(24*time.Hour, 100), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.EventsDeleted != 1 || result.NotificationAttemptsDeleted != 1 {
+		t.Fatalf("finished retry history was not cleaned up: %+v", result)
+	}
+}
+
 func TestCleanupHistoryHandlesMixedRFC3339Precision(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "watchbell.db"))

@@ -174,6 +174,89 @@ func TestTraceChainAndRetry(t *testing.T) {
 	}
 }
 
+func TestRetryAttemptIsSingleWinnerAndRejectsSupersededSource(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	channel, err := db.CreateNotifyChannel(ctx, model.NotifyChannelInput{Name: "Retry channel", Type: "trace_channel", Enabled: true, Config: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channelID := channel.ID
+	next := time.Now().UTC().Add(time.Minute)
+	source, err := db.CreateNotificationAttempt(ctx, model.NotificationAttemptInput{
+		ChannelID: &channelID, ChannelName: channel.Name, ChannelType: channel.Type, Kind: "test", Status: "failed",
+		Subject: "retry once", Body: "body", AttemptNo: 1, NextRetryAt: &next,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sender := &traceNotifier{}
+	scheduler := New(db, checker.NewRegistry(), notifier.NewRegistry(sender), Options{})
+	const workers = 8
+	start := make(chan struct{})
+	results := make(chan error, workers)
+	var group sync.WaitGroup
+	for range workers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			_, err := scheduler.RetryAttempt(ctx, source.ID)
+			results <- err
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(results)
+
+	successes, conflicts := 0, 0
+	for err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrRetryConflict):
+			conflicts++
+		default:
+			t.Fatalf("RetryAttempt() unexpected error: %v", err)
+		}
+	}
+	if successes != 1 || conflicts != workers-1 || sender.sentCount() != 1 {
+		t.Fatalf("retry results: successes=%d conflicts=%d sends=%d", successes, conflicts, sender.sentCount())
+	}
+
+	source, err = db.GetNotificationAttempt(ctx, source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.Retriable || !source.Resolved {
+		t.Fatalf("source contract after retry: %#v", source)
+	}
+	if _, err := scheduler.RetryAttempt(ctx, source.ID); !errors.Is(err, ErrRetryConflict) {
+		t.Fatalf("superseded retry error = %v, want ErrRetryConflict", err)
+	}
+	attempts, err := db.ListNotificationAttempts(ctx, 10)
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("attempt chain = %#v err=%v", attempts, err)
+	}
+	var successor model.NotificationAttempt
+	for _, attempt := range attempts {
+		if attempt.RetryOfID != nil && *attempt.RetryOfID == source.ID {
+			successor = attempt
+		}
+	}
+	if successor.ID == 0 {
+		t.Fatalf("successor missing from chain: %#v", attempts)
+	}
+	if _, err := scheduler.RetryAttempt(ctx, successor.ID); !errors.Is(err, ErrRetryNotFailed) {
+		t.Fatalf("sent retry error = %v, want ErrRetryNotFailed", err)
+	}
+}
+
 func TestMatchedRuleIsTraceablySkippedDuringQuietHours(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")

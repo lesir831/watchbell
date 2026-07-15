@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { App as AntApp, Button, Card, Descriptions, Drawer, Form, Input, Modal, Popconfirm, Select, Space, Table, Tag, Typography } from 'antd';
 import { DeleteOutlined, EditOutlined, EyeOutlined, PlusOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -8,6 +8,9 @@ import type { NotificationTemplate, NotificationTemplateInput } from '../types';
 
 const { Paragraph, Text } = Typography;
 
+type PreviewRequest = Partial<NotificationTemplateInput> & { eventId?: number; requestId: number };
+type PreviewResult = { eventId?: number; subject: string; body: string };
+
 export default function TemplatesPage() {
   const queryClient = useQueryClient();
   const { message } = AntApp.useApp();
@@ -15,7 +18,9 @@ export default function TemplatesPage() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [previewing, setPreviewing] = useState<NotificationTemplate | null>(null);
   const [previewEventId, setPreviewEventId] = useState<number | undefined>();
-  const [preview, setPreview] = useState<{ subject: string; body: string } | null>(null);
+  const [preview, setPreview] = useState<PreviewResult | null>(null);
+  const previewEventIdRef = useRef<number | undefined>();
+  const previewRequestRef = useRef(0);
   const templates = useQuery({ queryKey: ['templates'], queryFn: api.listTemplates, refetchInterval: 30_000 });
   const plugins = useQuery({ queryKey: ['plugins'], queryFn: api.listPlugins });
   const events = useQuery({ queryKey: ['events'], queryFn: api.listEvents, refetchInterval: 30_000 });
@@ -30,7 +35,55 @@ export default function TemplatesPage() {
     onSuccess: async () => { await refresh(); message.success('模板已归档'); },
     onError: (error: Error) => message.error(error.message)
   });
-  const previewMutation = useMutation({ mutationFn: api.previewTemplate, onSuccess: setPreview, onError: (error: Error) => message.error(error.message) });
+  const previewMutation = useMutation({
+    mutationFn: async ({ requestId, eventId, ...template }: PreviewRequest) => ({
+      requestId,
+      eventId,
+      result: await api.previewTemplate({ ...template, eventId })
+    }),
+    onSuccess: ({ requestId, eventId, result }) => {
+      if (requestId === previewRequestRef.current && eventId === previewEventIdRef.current) {
+        setPreview({ eventId, ...result });
+      }
+    },
+    onError: (error: Error, variables) => {
+      if (variables.requestId === previewRequestRef.current && variables.eventId === previewEventIdRef.current) {
+        setPreview(null);
+        message.error(error.message);
+      }
+    }
+  });
+  const selectPreviewEvent = (eventId?: number) => {
+    previewRequestRef.current += 1;
+    previewEventIdRef.current = eventId;
+    setPreviewEventId(eventId);
+    setPreview(null);
+    previewMutation.reset();
+  };
+  const openPreview = (record: NotificationTemplate) => {
+    const eventId = events.data?.[0]?.id;
+    previewRequestRef.current += 1;
+    previewEventIdRef.current = eventId;
+    setPreviewing(record);
+    setPreviewEventId(eventId);
+    setPreview(null);
+    previewMutation.reset();
+  };
+  const closePreview = () => {
+    previewRequestRef.current += 1;
+    previewEventIdRef.current = undefined;
+    setPreviewing(null);
+    setPreviewEventId(undefined);
+    setPreview(null);
+    previewMutation.reset();
+  };
+  const generatePreview = () => {
+    if (!previewing) return;
+    const requestId = previewRequestRef.current + 1;
+    previewRequestRef.current = requestId;
+    setPreview(null);
+    previewMutation.mutate({ requestId, subjectTemplate: previewing.subjectTemplate, bodyTemplate: previewing.bodyTemplate, eventId: previewEventId });
+  };
   const openNew = () => { setEditing(null); setDrawerOpen(true); };
   return (
     <Space direction="vertical" size={16} className="full-width">
@@ -41,14 +94,14 @@ export default function TemplatesPage() {
           { title: '名称', dataIndex: 'name', width: 180, render: (value, record) => <Space>{value}{record.isDefault && <Tag color="blue">默认</Tag>}</Space> },
           { title: '标题模板', dataIndex: 'subjectTemplate', ellipsis: true },
           { title: '操作', width: 280, render: (_, record) => <Space wrap>
-            <Button icon={<EyeOutlined />} onClick={() => { setPreviewing(record); setPreviewEventId(events.data?.[0]?.id); setPreview(null); }}>预览</Button>
+            <Button icon={<EyeOutlined />} onClick={() => openPreview(record)}>预览</Button>
             <Button icon={<EditOutlined />} onClick={() => { setEditing(record); setDrawerOpen(true); }}>编辑</Button>
             <Popconfirm title="归档这个模板？" description="使用它的规则会改用系统默认模板。" disabled={record.isDefault} onConfirm={() => deleteMutation.mutate(record.id)}><Button danger disabled={record.isDefault} icon={<DeleteOutlined />} aria-label={`归档 ${record.name}`} /></Popconfirm>
           </Space> }
         ]} />
       )}
       <TemplateDrawer open={drawerOpen} record={editing} variables={variables} saving={saveMutation.isPending} error={saveMutation.error as Error | null} onClose={() => { setDrawerOpen(false); saveMutation.reset(); }} onSave={(input) => saveMutation.mutate({ id: editing?.id, input })} />
-      <Modal open={previewing !== null} title="通知预览" footer={null} onCancel={() => { setPreviewing(null); setPreview(null); }}>
+      <Modal open={previewing !== null} title="通知预览" footer={null} onCancel={closePreview}>
         <Space direction="vertical" size={16} className="full-width">
           <div>
             <Text strong>预览数据</Text>
@@ -58,11 +111,11 @@ export default function TemplatesPage() {
               value={previewEventId}
               placeholder="不选择时使用内置样例"
               options={(events.data ?? []).map((event) => ({ label: `事件 #${event.id} · ${event.type}`, value: event.id }))}
-              onChange={setPreviewEventId}
+              onChange={selectPreviewEvent}
             />
           </div>
-          <Button type="primary" loading={previewMutation.isPending} onClick={() => previewing && previewMutation.mutate({ subjectTemplate: previewing.subjectTemplate, bodyTemplate: previewing.bodyTemplate, eventId: previewEventId })}>生成预览</Button>
-          {preview && <Descriptions column={1} bordered size="small"><Descriptions.Item label="标题">{preview.subject}</Descriptions.Item><Descriptions.Item label="正文"><pre className="message-preview">{preview.body}</pre></Descriptions.Item></Descriptions>}
+          <Button type="primary" loading={previewMutation.isPending} onClick={generatePreview}>生成预览</Button>
+          {preview && preview.eventId === previewEventId && <Descriptions column={1} bordered size="small"><Descriptions.Item label="标题">{preview.subject}</Descriptions.Item><Descriptions.Item label="正文"><pre className="message-preview">{preview.body}</pre></Descriptions.Item></Descriptions>}
         </Space>
       </Modal>
     </Space>

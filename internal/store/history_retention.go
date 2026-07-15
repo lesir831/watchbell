@@ -48,7 +48,8 @@ func (result HistoryCleanupResult) TotalDeleted() int64 {
 
 // CleanupHistory removes at most one batch from each enabled history category.
 // It is safe to call repeatedly. Active check runs, pending outbox entries and
-// scheduled notification retries are retained even when older than the cutoff.
+// scheduled or actively claimed notification retries are retained even when
+// older than the cutoff.
 func (s *Store) CleanupHistory(ctx context.Context, policy HistoryRetentionPolicy, now time.Time) (HistoryCleanupResult, error) {
 	batchSize := policy.BatchSize
 	if batchSize <= 0 {
@@ -70,8 +71,9 @@ func (s *Store) CleanupHistory(ctx context.Context, policy HistoryRetentionPolic
 	defer tx.Rollback()
 
 	var result HistoryCleanupResult
+	activeClaimCutoff := formatTime(now.Add(-notificationRetryLease))
 	if policy.EventAge > 0 {
-		if err := cleanupExpiredEvents(ctx, tx, formatTime(now.Add(-policy.EventAge)), batchSize, &result); err != nil {
+		if err := cleanupExpiredEvents(ctx, tx, formatTime(now.Add(-policy.EventAge)), activeClaimCutoff, batchSize, &result); err != nil {
 			return HistoryCleanupResult{}, fmt.Errorf("cleanup events: %w", err)
 		}
 	}
@@ -83,7 +85,7 @@ func (s *Store) CleanupHistory(ctx context.Context, policy HistoryRetentionPolic
 		result.CheckRunsDeleted = count
 	}
 	if policy.NotificationAttemptAge > 0 {
-		count, err := cleanupExpiredNotificationAttempts(ctx, tx, formatTime(now.Add(-policy.NotificationAttemptAge)), batchSize)
+		count, err := cleanupExpiredNotificationAttempts(ctx, tx, formatTime(now.Add(-policy.NotificationAttemptAge)), activeClaimCutoff, batchSize)
 		if err != nil {
 			return HistoryCleanupResult{}, fmt.Errorf("cleanup notification attempts: %w", err)
 		}
@@ -114,30 +116,48 @@ const expiredEventIDs = `SELECT e.id
 	    FROM notification_attempts pending
 	    LEFT JOIN rule_evaluations pending_evaluation ON pending_evaluation.id = pending.rule_evaluation_id
 	    WHERE (pending.event_id = e.id OR pending_evaluation.event_id = e.id)
-	      AND pending.next_retry_at IS NOT NULL
+	      AND (
+	        pending.next_retry_at IS NOT NULL
+	        OR (pending.retry_claimed_at IS NOT NULL AND julianday(pending.retry_claimed_at) > julianday(?))
+	      )
 	  )
 	ORDER BY e.id
 	LIMIT ?`
 
-func cleanupExpiredEvents(ctx context.Context, tx *sql.Tx, cutoff string, batchSize int, result *HistoryCleanupResult) error {
+func cleanupExpiredEvents(ctx context.Context, tx *sql.Tx, cutoff, activeClaimCutoff string, batchSize int, result *HistoryCleanupResult) error {
 	var evaluationCount int64
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM rule_evaluations WHERE event_id IN (`+expiredEventIDs+`)`, cutoff, batchSize).Scan(&evaluationCount); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM rule_evaluations WHERE event_id IN (`+expiredEventIDs+`)`, cutoff, activeClaimCutoff, batchSize).Scan(&evaluationCount); err != nil {
 		return err
 	}
 
 	// Attempts have their own retention window and already contain immutable
 	// channel/message/data snapshots. Detach them from an expiring event instead
 	// of silently shortening their configured retention period.
+	// Legacy attempts may predate the denormalized monitor_id column, so copy the
+	// association before deleting the only rows from which it can be recovered.
 	_, err := tx.ExecContext(ctx, `UPDATE notification_attempts
-		SET event_id = NULL, rule_evaluation_id = NULL
+		SET monitor_id = COALESCE(
+			monitor_id,
+			(SELECT event.monitor_id FROM events event WHERE event.id = notification_attempts.event_id),
+			(SELECT event.monitor_id FROM rule_evaluations evaluation JOIN events event ON event.id = evaluation.event_id WHERE evaluation.id = notification_attempts.rule_evaluation_id)
+		)
 		WHERE event_id IN (`+expiredEventIDs+`)
 		   OR rule_evaluation_id IN (SELECT id FROM rule_evaluations WHERE event_id IN (`+expiredEventIDs+`))`,
-		cutoff, batchSize, cutoff, batchSize)
+		cutoff, activeClaimCutoff, batchSize, cutoff, activeClaimCutoff, batchSize)
 	if err != nil {
 		return err
 	}
 
-	eventResult, err := tx.ExecContext(ctx, `DELETE FROM events WHERE id IN (`+expiredEventIDs+`)`, cutoff, batchSize)
+	_, err = tx.ExecContext(ctx, `UPDATE notification_attempts
+		SET event_id = NULL, rule_evaluation_id = NULL
+		WHERE event_id IN (`+expiredEventIDs+`)
+		   OR rule_evaluation_id IN (SELECT id FROM rule_evaluations WHERE event_id IN (`+expiredEventIDs+`))`,
+		cutoff, activeClaimCutoff, batchSize, cutoff, activeClaimCutoff, batchSize)
+	if err != nil {
+		return err
+	}
+
+	eventResult, err := tx.ExecContext(ctx, `DELETE FROM events WHERE id IN (`+expiredEventIDs+`)`, cutoff, activeClaimCutoff, batchSize)
 	if err != nil {
 		return err
 	}
@@ -147,14 +167,16 @@ func cleanupExpiredEvents(ctx context.Context, tx *sql.Tx, cutoff string, batchS
 	return nil
 }
 
-func cleanupExpiredNotificationAttempts(ctx context.Context, tx *sql.Tx, cutoff string, batchSize int) (int64, error) {
+func cleanupExpiredNotificationAttempts(ctx context.Context, tx *sql.Tx, cutoff, activeClaimCutoff string, batchSize int) (int64, error) {
 	candidates := `SELECT id FROM notification_attempts
-		WHERE julianday(created_at) < julianday(?) AND next_retry_at IS NULL
+		WHERE julianday(created_at) < julianday(?)
+		  AND next_retry_at IS NULL
+		  AND (retry_claimed_at IS NULL OR julianday(retry_claimed_at) <= julianday(?))
 		ORDER BY id LIMIT ?`
-	if _, err := tx.ExecContext(ctx, `UPDATE notification_attempts SET retry_of_id = NULL WHERE retry_of_id IN (`+candidates+`)`, cutoff, batchSize); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE notification_attempts SET retry_of_id = NULL WHERE retry_of_id IN (`+candidates+`)`, cutoff, activeClaimCutoff, batchSize); err != nil {
 		return 0, err
 	}
-	result, err := tx.ExecContext(ctx, `DELETE FROM notification_attempts WHERE id IN (`+candidates+`)`, cutoff, batchSize)
+	result, err := tx.ExecContext(ctx, `DELETE FROM notification_attempts WHERE id IN (`+candidates+`)`, cutoff, activeClaimCutoff, batchSize)
 	if err != nil {
 		return 0, err
 	}

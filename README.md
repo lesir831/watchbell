@@ -197,7 +197,7 @@ WATCHBELL_AUTH_DISABLED=true go run ./cmd/watchbell
 | `WATCHBELL_ADMIN_USERNAME` | `admin` | 登录用户名 |
 | `WATCHBELL_ADMIN_PASSWORD` | 空 | 登录密码，启动时读取 |
 | `WATCHBELL_ADMIN_PASSWORD_HASH` | 空 | 用 `hash-password` 生成的密码 hash |
-| `WATCHBELL_SESSION_SECRET` | 空 | cookie 签名密钥，建议至少 32 字节 |
+| `WATCHBELL_SESSION_SECRET` | 空 | cookie 签名密钥；显式配置时必须至少 32 字节 |
 | `WATCHBELL_SESSION_TTL` | `168h` | 登录有效期 |
 | `WATCHBELL_SESSION_COOKIE` | `watchbell_session` | cookie 名称 |
 | `WATCHBELL_COOKIE_SECURE` | 自动判断 | 显式控制 cookie 的 `Secure` 属性；生产环境建议设为 `true` |
@@ -358,12 +358,12 @@ TestFlight 有空位时本身就会产生事件。如果只想有事件就通知
     "Authorization": "Bearer YOUR_TOKEN",
     "Content-Type": "application/json"
   },
-  "bodyTemplate": "{\"title\":\"${message.subject}\",\"body\":\"${message.body}\",\"link\":\"${rss.link}\"}",
+  "bodyTemplate": "{\"title\":${json:message.subject},\"body\":${json:message.body},\"link\":${json:rss.link}}",
   "allowPrivate": false
 }
 ```
 
-URL、请求头和请求体都支持事件变量。此渠道可用来连接 ntfy、Telegram、Discord、飞书、钉钉、企业微信或自己的 HTTP 服务。Webhook URL 和 Headers 都按密钥脱敏，因为很多服务会把 Token 直接放在 URL 中。Webhook 不跟随重定向，会拒绝 `Host`、`Content-Length` 等不安全请求头，并默认阻止回环、内网、link-local 和云 metadata 地址。只有当目标是你控制的内部服务时才应开启 `allowPrivate`。
+URL、请求头和请求体都支持事件变量。JSON 请求体应使用 `${json:path}` 插入完整 JSON 值，它会正确转义换行、引号和反斜杠；普通 `${path}` 仍适用于 URL、请求头和纯文本正文。`bodyTemplate` 留空时，WatchBell 会生成包含 `subject`、`body` 和 `data` 的安全默认 JSON。此渠道可用来连接 ntfy、Telegram、Discord、飞书、钉钉、企业微信或自己的 HTTP 服务。Webhook URL 和 Headers 都按密钥脱敏，因为很多服务会把 Token 直接放在 URL 中。Webhook 不跟随重定向，会拒绝 `Host`、`Content-Length` 等不安全请求头，并默认阻止回环、内网、link-local、特殊用途和云 metadata 地址。只有当目标是你控制的内部服务时才应开启 `allowPrivate`。
 
 渠道密钥、SMTP 密码和 GitHub token 只保存在后端。编辑时留空表示保留现有值；列表 API 只返回“已配置”标识，不返回明文。
 

@@ -204,6 +204,7 @@ function MonitorDrawer(props: {
     const initialPlugin = props.plugins.find((item) => item.id === props.record?.type) ?? props.plugins[0];
     const config = props.record?.config ?? initialPlugin?.defaultConfig ?? {};
     setAdvanced(false);
+    form.resetFields();
     form.setFieldsValue({
       name: props.record?.name ?? '',
       type: initialPlugin?.id,
@@ -211,16 +212,14 @@ function MonitorDrawer(props: {
       intervalSeconds: props.record?.intervalSeconds ?? initialPlugin?.defaultIntervalSeconds ?? 300,
       failureAlertsEnabled: (props.record?.failureAlertAfter ?? 0) > 0,
       failureAlertAfter: props.record?.failureAlertAfter || 3,
-      failureNotifyChannelIds: props.record?.failureNotifyChannelIds ?? [],
-      config,
-      rawConfig: JSON.stringify(config, null, 2)
+      failureNotifyChannelIds: props.record?.failureNotifyChannelIds ?? []
     });
+    form.setFieldValue('config', config);
+    form.setFieldValue('rawConfig', JSON.stringify(config, null, 2));
   };
   const submit = async (checkAfter: boolean) => {
     const values = await form.validateFields();
-    const activePlugin = props.plugins.find((item) => item.id === values.type);
-    const knownConfig = Object.fromEntries((activePlugin?.configFields ?? []).map((field) => [field.key, values.config?.[field.key]]).filter(([, value]) => value !== undefined));
-    const config = advanced ? parseConfigJSON(values.rawConfig) : { ...(props.record?.config ?? {}), ...knownConfig };
+    const config = advanced ? parseConfigJSON(values.rawConfig) : (form.getFieldValue('config') ?? {});
     props.onSave({
       name: values.name.trim(), type: values.type, enabled: values.enabled, intervalSeconds: values.intervalSeconds, config,
       failureAlertAfter: values.failureAlertsEnabled ? values.failureAlertAfter : 0,
@@ -235,7 +234,9 @@ function MonitorDrawer(props: {
       <Form form={form} layout="vertical" requiredMark="optional" onValuesChange={(changed) => {
         if (changed.type && !props.record) {
           const next = props.plugins.find((item) => item.id === changed.type);
-          form.setFieldsValue({ intervalSeconds: next?.defaultIntervalSeconds, config: next?.defaultConfig, rawConfig: JSON.stringify(next?.defaultConfig ?? {}, null, 2) });
+          form.setFieldValue('intervalSeconds', next?.defaultIntervalSeconds);
+          form.setFieldValue('config', next?.defaultConfig ?? {});
+          form.setFieldValue('rawConfig', JSON.stringify(next?.defaultConfig ?? {}, null, 2));
         }
       }}>
         {plugin?.description && <Alert className="form-intro" type="info" showIcon message={plugin.name} description={plugin.description} />}
@@ -260,7 +261,7 @@ function MonitorDrawer(props: {
             <Col xs={24} sm={16}><Form.Item name="failureNotifyChannelIds" label="通知渠道" rules={[{ required: true, type: 'array', min: 1, message: '请至少选择一个已启用通知渠道' }]}><Select mode="multiple" placeholder="选择故障与恢复通知渠道" options={props.channels.map((item) => ({ label: `${item.name}${item.enabled ? '' : '（已停用）'}`, value: item.id, disabled: !item.enabled }))} /></Form.Item></Col>
           </Row>}
         </Card>
-        <ConfigMode form={form} advanced={advanced} onChange={setAdvanced} baseConfig={props.record?.config} />
+        <ConfigMode form={form} advanced={advanced} onChange={setAdvanced} />
         {advanced ? <AdvancedConfigField /> : plugin && <ConfigFields fields={plugin.configFields} configuredSecrets={props.record?.configuredSecrets} />}
       </Form>
     </Drawer>

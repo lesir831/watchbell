@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -48,7 +47,7 @@ func (s *Server) exportConfig(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) importConfig(w http.ResponseWriter, r *http.Request) {
 	var request model.ConfigImportRequest
-	if !decodeConfigImport(w, r, &request) {
+	if !decode(w, r, &request) {
 		return
 	}
 	if request.Mode == "" {
@@ -174,24 +173,6 @@ func configExportIncludesSecrets(r *http.Request) (bool, error) {
 		return false, errors.New("includeSecrets 查询参数无效")
 	}
 	return strconv.ParseBool(values[0])
-}
-
-func decodeConfigImport(w http.ResponseWriter, r *http.Request, value any) bool {
-	defer r.Body.Close()
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(value); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorPayload(r, err, "invalid_json", map[string]string{}, nil))
-		return false
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		if err == nil {
-			err = errors.New("请求体只能包含一个 JSON 对象")
-		}
-		writeJSON(w, http.StatusBadRequest, errorPayload(r, err, "invalid_json", map[string]string{}, nil))
-		return false
-	}
-	return true
 }
 
 func (s *Server) validateConfigImport(ctx context.Context, request model.ConfigImportRequest) error {

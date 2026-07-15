@@ -22,7 +22,7 @@ export default function DashboardPage({ onNavigate }: { onNavigate: (page: strin
   const healthyRate = enabled.length === 0 ? 0 : Math.round(((data?.healthyMonitors ?? 0) / enabled.length) * 100);
   const unhealthy = enabled.filter((item) => ['error', 'warning'].includes(item.lastStatus ?? ''));
   const latestRuns = (runs.data ?? []).slice(0, 6);
-  const failedAttempts = (attempts.data ?? []).filter((item) => item.status === 'failed').slice(0, 4);
+  const failedAttempts = (attempts.data ?? []).filter((item) => item.status === 'failed' && !item.resolved).slice(0, 4);
   const setupIncomplete = !data?.channelCount || !data?.monitorCount || !data?.ruleCount;
 
   return (

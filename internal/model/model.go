@@ -216,7 +216,11 @@ type NotificationAttempt struct {
 	DurationMS       int64           `json:"durationMs"`
 	SentAt           *time.Time      `json:"sentAt,omitempty"`
 	NextRetryAt      *time.Time      `json:"nextRetryAt,omitempty"`
-	CreatedAt        time.Time       `json:"createdAt"`
+	// Retriable is true only for a failed leaf in the retry chain. Resolved is
+	// true once a successor attempt has superseded this row.
+	Retriable bool      `json:"retriable"`
+	Resolved  bool      `json:"resolved"`
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 type NotificationAttemptInput struct {

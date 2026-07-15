@@ -213,6 +213,8 @@ export interface NotificationAttempt {
   durationMs: number;
   sentAt?: string;
   nextRetryAt?: string;
+  retriable: boolean;
+  resolved: boolean;
   createdAt: string;
 }
 

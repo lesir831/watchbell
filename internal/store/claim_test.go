@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -100,5 +102,112 @@ func TestNotificationRetryClaimExpiresAndCanBeReleased(t *testing.T) {
 	due, _ = db.ListDueNotificationAttempts(ctx, 10, next)
 	if len(due) != 1 {
 		t.Fatalf("released retry not due: %#v", due)
+	}
+}
+
+func TestNotificationRetryChainExposesLeafContractAndRejectsSecondSuccessor(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	now := time.Now().UTC()
+	next := now.Add(-time.Minute)
+	source, err := db.CreateNotificationAttempt(ctx, model.NotificationAttemptInput{
+		ChannelName: "Provider", ChannelType: model.ChannelTypeWebhook, Kind: "delivery", Status: "failed", NextRetryAt: &next,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !source.Retriable || source.Resolved {
+		t.Fatalf("failed leaf contract = retriable:%v resolved:%v", source.Retriable, source.Resolved)
+	}
+	if due, err := db.ListDueNotificationAttempts(ctx, 10, now); err != nil || len(due) != 1 || due[0].ID != source.ID {
+		t.Fatalf("failed leaf was not due for automatic retry: %#v err=%v", due, err)
+	}
+	child, err := db.CreateNotificationAttempt(ctx, model.NotificationAttemptInput{
+		RetryOfID: &source.ID, ChannelName: "Provider", ChannelType: model.ChannelTypeWebhook, Kind: "delivery", Status: "sent", AttemptNo: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.Retriable || child.Resolved {
+		t.Fatalf("sent leaf contract = retriable:%v resolved:%v", child.Retriable, child.Resolved)
+	}
+	source, err = db.GetNotificationAttempt(ctx, source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.Retriable || !source.Resolved || source.NextRetryAt != nil {
+		t.Fatalf("superseded failure contract = retriable:%v resolved:%v", source.Retriable, source.Resolved)
+	}
+	if claimed, err := db.ClaimNotificationAttemptNow(ctx, source.ID, time.Now().UTC()); err != nil || claimed {
+		t.Fatalf("superseded source claim = %v err=%v", claimed, err)
+	}
+	if due, err := db.ListDueNotificationAttempts(ctx, 10, now); err != nil || len(due) != 0 {
+		t.Fatalf("superseded source remained due: %#v err=%v", due, err)
+	}
+	_, err = db.CreateNotificationAttempt(ctx, model.NotificationAttemptInput{
+		RetryOfID: &source.ID, ChannelName: "Provider", ChannelType: model.ChannelTypeWebhook, Kind: "delivery", Status: "sent", AttemptNo: 2,
+	})
+	if !errors.Is(err, ErrNotificationRetryConflict) {
+		t.Fatalf("second successor error = %v, want ErrNotificationRetryConflict", err)
+	}
+}
+
+func TestNotificationRetrySuccessorAndSourceFinalizationAreAtomic(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	now := time.Now().UTC()
+	next := now.Add(time.Minute)
+	source, err := db.CreateNotificationAttempt(ctx, model.NotificationAttemptInput{
+		ChannelName: "Provider", ChannelType: model.ChannelTypeWebhook, Kind: "delivery", Status: "failed", NextRetryAt: &next,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := db.ClaimNotificationAttemptNow(ctx, source.ID, now); err != nil || !claimed {
+		t.Fatalf("claim source = %v err=%v", claimed, err)
+	}
+	trigger := fmt.Sprintf(`CREATE TRIGGER fail_retry_finalize
+		BEFORE UPDATE OF next_retry_at, retry_claimed_at ON notification_attempts
+		WHEN OLD.id = %d
+		BEGIN SELECT RAISE(ABORT, 'forced retry finalize failure'); END`, source.ID)
+	if _, err := db.db.ExecContext(ctx, trigger); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.CreateNotificationAttempt(ctx, model.NotificationAttemptInput{
+		RetryOfID: &source.ID, ChannelName: "Provider", ChannelType: model.ChannelTypeWebhook, Kind: "delivery", Status: "sent", AttemptNo: 2,
+	})
+	if err == nil {
+		t.Fatal("retry successor unexpectedly committed when source finalization failed")
+	}
+	attempts, err := db.ListNotificationAttempts(ctx, 10)
+	if err != nil || len(attempts) != 1 || attempts[0].ID != source.ID {
+		t.Fatalf("failed transaction left a successor: %#v err=%v", attempts, err)
+	}
+	if _, err := db.db.ExecContext(ctx, `DROP TRIGGER fail_retry_finalize`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateNotificationAttempt(ctx, model.NotificationAttemptInput{
+		RetryOfID: &source.ID, ChannelName: "Provider", ChannelType: model.ChannelTypeWebhook, Kind: "delivery", Status: "sent", AttemptNo: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	source, err = db.GetNotificationAttempt(ctx, source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stillClaimed bool
+	if err := db.db.QueryRowContext(ctx, `SELECT retry_claimed_at IS NOT NULL FROM notification_attempts WHERE id = ?`, source.ID).Scan(&stillClaimed); err != nil {
+		t.Fatal(err)
+	}
+	if source.NextRetryAt != nil || stillClaimed || source.Retriable || !source.Resolved {
+		t.Fatalf("committed retry did not atomically finalize source: %#v claimed=%v", source, stillClaimed)
 	}
 }

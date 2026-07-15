@@ -6,13 +6,12 @@ export function ConfigMode(props: {
   form: FormInstance;
   advanced: boolean;
   onChange: (advanced: boolean) => void;
-  baseConfig?: Record<string, unknown>;
 }) {
   const changeMode = async (value: string | number) => {
     const nextAdvanced = value === 'json';
     if (nextAdvanced) {
       const current = props.form.getFieldValue('config') ?? {};
-      props.form.setFieldValue('rawConfig', JSON.stringify({ ...(props.baseConfig ?? {}), ...current }, null, 2));
+      props.form.setFieldValue('rawConfig', JSON.stringify(current, null, 2));
       props.onChange(true);
       return;
     }

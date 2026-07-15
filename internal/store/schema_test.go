@@ -168,3 +168,44 @@ func TestSQLiteConnectionPragmasApplyAcrossPool(t *testing.T) {
 		}
 	}
 }
+
+func TestNotificationAttemptMonitorBackfillsOnMigration(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "watchbell.db")
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	monitor, err := db.CreateMonitor(ctx, model.MonitorInput{Name: "Migration trace", Type: "rss", Enabled: true, IntervalSeconds: 60, Config: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, _, err := db.CreateEvent(ctx, monitor.ID, model.EventData{Type: "rss.item", Fingerprint: "migration-trace", Payload: map[string]any{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID := event.ID
+	attempt, err := db.CreateNotificationAttempt(ctx, model.NotificationAttemptInput{EventID: &eventID, ChannelName: "Legacy", ChannelType: "webhook", Status: "sent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE notification_attempts SET monitor_id = NULL WHERE id = ?`, attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	attempt, err = db.GetNotificationAttempt(ctx, attempt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.MonitorID == nil || *attempt.MonitorID != monitor.ID {
+		t.Fatalf("migration did not backfill monitor: %#v", attempt)
+	}
+}

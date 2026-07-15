@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -53,6 +55,9 @@ func (s *Server) Routes() http.Handler {
 	r.Use(middleware.Recoverer)
 
 	r.Route("/api", func(r chi.Router) {
+		if s.auth != nil && s.auth.Enabled() {
+			r.Use(s.protectBrowserMutation)
+		}
 		r.Get("/health", s.health)
 		r.Get("/health/ready", s.readiness)
 		r.Get("/auth/status", s.authStatus)
@@ -459,7 +464,16 @@ func (s *Server) testNotifyChannel(w http.ResponseWriter, r *http.Request) {
 		s.recordAudit(r.Context(), s.actor(r), "test", "channel", &id, "测试通知渠道", map[string]any{"attemptId": attempt.ID, "status": attempt.Status})
 	}
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, errorPayload(r, err, "channel_test_failed", map[string]string{}, map[string]any{"attempt": attempt}))
+		status := http.StatusInternalServerError
+		code := "internal_error"
+		if store.IsNotFound(err) || errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+			code = "channel_not_found"
+		} else if attempt.ID > 0 {
+			status = http.StatusBadGateway
+			code = "channel_test_failed"
+		}
+		writeJSON(w, status, errorPayload(r, err, code, map[string]string{}, map[string]any{"attempt": attempt}))
 		return
 	}
 	writeJSON(w, http.StatusOK, attempt)
@@ -671,7 +685,26 @@ func (s *Server) retryNotificationAttempt(w http.ResponseWriter, r *http.Request
 		s.recordAudit(r.Context(), s.actor(r), "retry", "notification_attempt", &id, "重试失败通知", map[string]any{"newAttemptId": attempt.ID, "status": attempt.Status})
 	}
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, errorPayload(r, err, "notification_retry_failed", map[string]string{}, map[string]any{"attempt": attempt}))
+		status := http.StatusInternalServerError
+		code := "internal_error"
+		switch {
+		case store.IsNotFound(err), errors.Is(err, sql.ErrNoRows):
+			status = http.StatusNotFound
+			code = "notification_attempt_not_found"
+		case errors.Is(err, scheduler.ErrRetryNotFailed):
+			status = http.StatusUnprocessableEntity
+			code = "notification_retry_not_failed"
+		case errors.Is(err, scheduler.ErrRetryConflict):
+			status = http.StatusConflict
+			code = "notification_retry_conflict"
+		case errors.Is(err, scheduler.ErrRetryTargetUnavailable):
+			status = http.StatusConflict
+			code = "notification_retry_target_unavailable"
+		case attempt.ID > 0:
+			status = http.StatusBadGateway
+			code = "notification_retry_failed"
+		}
+		writeJSON(w, status, errorPayload(r, err, code, map[string]string{}, map[string]any{"attempt": attempt}))
 		return
 	}
 	writeJSON(w, http.StatusOK, attempt)
@@ -834,9 +867,24 @@ func respondNoContent(w http.ResponseWriter, r *http.Request, err error) {
 
 func decode(w http.ResponseWriter, r *http.Request, value any) bool {
 	defer r.Body.Close()
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeJSON(w, http.StatusUnsupportedMediaType, errorPayload(r,
+			errors.New("Content-Type must be application/json"),
+			"unsupported_media_type", map[string]string{}, nil,
+		))
+		return false
+	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(value); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorPayload(r, err, "invalid_json", map[string]string{}, nil))
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("request body must contain exactly one JSON value")
+		}
 		writeJSON(w, http.StatusBadRequest, errorPayload(r, err, "invalid_json", map[string]string{}, nil))
 		return false
 	}
@@ -881,6 +929,10 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, scheduler.ErrAlreadyRunning) {
 		status = http.StatusConflict
 		code = "already_running"
+	}
+	if errors.Is(err, store.ErrDuplicateNaturalKey) {
+		status = http.StatusConflict
+		code = "duplicate_natural_key"
 	}
 	writeJSON(w, status, errorPayload(r, err, code, fields, nil))
 }

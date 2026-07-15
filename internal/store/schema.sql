@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS notification_attempts (
 
 CREATE INDEX IF NOT EXISTS idx_notification_attempts_created_at ON notification_attempts(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_notification_attempts_retry ON notification_attempts(status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_notification_attempts_retry_of_id ON notification_attempts(retry_of_id);
 CREATE INDEX IF NOT EXISTS idx_notification_attempts_event_id ON notification_attempts(event_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_notification_attempts_channel_id ON notification_attempts(channel_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_notification_attempts_status_created_at ON notification_attempts(status, created_at DESC);

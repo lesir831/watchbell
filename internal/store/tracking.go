@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -14,9 +15,19 @@ import (
 const maxOutboxAttempts = 10
 const notificationRetryLease = 5 * time.Minute
 
+// ErrNotificationRetryConflict means the source attempt has already been
+// claimed or superseded by a successor. It is safe for callers to map this to
+// HTTP 409 because retrying the same request would duplicate an in-flight or
+// completed delivery.
+var ErrNotificationRetryConflict = errors.New("notification retry conflicts with an existing retry")
+
 type OutboxItem struct {
 	EventID  int64
 	Attempts int
+}
+
+type notificationAttemptExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
 func (s *Store) Ping(ctx context.Context) error {
@@ -99,15 +110,54 @@ func (s *Store) CreateNotificationAttempt(ctx context.Context, input model.Notif
 	if strings.TrimSpace(input.Kind) == "" {
 		input.Kind = "delivery"
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO notification_attempts (monitor_id, event_id, rule_evaluation_id, channel_id, retry_of_id, channel_name, channel_type, kind, status, subject, body, data_json, error, attempt_no, duration_ms, sent_at, next_retry_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	// A retry source may have at most one direct successor. A retry insert also
+	// clears the source schedule and lease in the same transaction, so a crash
+	// cannot leave a superseded source eligible for delivery again.
+	var executor notificationAttemptExecer = s.db
+	var tx *sql.Tx
+	var err error
+	if input.RetryOfID != nil {
+		tx, err = s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return model.NotificationAttempt{}, err
+		}
+		defer tx.Rollback()
+		executor = tx
+	}
+	res, err := executor.ExecContext(ctx, `INSERT INTO notification_attempts (monitor_id, event_id, rule_evaluation_id, channel_id, retry_of_id, channel_name, channel_type, kind, status, subject, body, data_json, error, attempt_no, duration_ms, sent_at, next_retry_at, created_at)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE ? IS NULL OR NOT EXISTS (SELECT 1 FROM notification_attempts successor WHERE successor.retry_of_id = ?)`,
 		nullableInt64(input.MonitorID), nullableInt64(input.EventID), nullableInt64(input.RuleEvaluationID), nullableInt64(input.ChannelID), nullableInt64(input.RetryOfID), input.ChannelName, input.ChannelType,
-		input.Kind, input.Status, input.Subject, input.Body, string(normalizedJSON(input.Data, "{}")), input.Error, input.AttemptNo, input.DurationMS, formatTimePtr(input.SentAt), formatTimePtr(input.NextRetryAt), nowString())
+		input.Kind, input.Status, input.Subject, input.Body, string(normalizedJSON(input.Data, "{}")), input.Error, input.AttemptNo, input.DurationMS, formatTimePtr(input.SentAt), formatTimePtr(input.NextRetryAt), nowString(), nullableInt64(input.RetryOfID), nullableInt64(input.RetryOfID))
 	if err != nil {
 		return model.NotificationAttempt{}, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return model.NotificationAttempt{}, err
+	}
+	if affected == 0 {
+		return model.NotificationAttempt{}, ErrNotificationRetryConflict
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
 		return model.NotificationAttempt{}, err
+	}
+	if tx != nil {
+		result, err := tx.ExecContext(ctx, `UPDATE notification_attempts SET next_retry_at = NULL, retry_claimed_at = NULL WHERE id = ?`, *input.RetryOfID)
+		if err != nil {
+			return model.NotificationAttempt{}, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return model.NotificationAttempt{}, err
+		}
+		if affected != 1 {
+			return model.NotificationAttempt{}, fmt.Errorf("%w: retry source %d no longer exists", ErrNotificationRetryConflict, *input.RetryOfID)
+		}
+		if err := tx.Commit(); err != nil {
+			return model.NotificationAttempt{}, err
+		}
 	}
 	return s.GetNotificationAttempt(ctx, id)
 }
@@ -125,7 +175,7 @@ func (s *Store) ListNotificationAttempts(ctx context.Context, limit int) ([]mode
 func (s *Store) ListDueNotificationAttempts(ctx context.Context, limit int, now time.Time) ([]model.NotificationAttempt, error) {
 	limit = normalizeLimit(limit)
 	stale := now.UTC().Add(-notificationRetryLease)
-	rows, err := s.db.QueryContext(ctx, notificationAttemptSelect+` WHERE status = 'failed' AND next_retry_at IS NOT NULL AND next_retry_at <= ? AND (retry_claimed_at IS NULL OR retry_claimed_at <= ?) ORDER BY id ASC LIMIT ?`, formatTime(now), formatTime(stale), limit)
+	rows, err := s.db.QueryContext(ctx, notificationAttemptSelect+` WHERE status = 'failed' AND next_retry_at IS NOT NULL AND next_retry_at <= ? AND (retry_claimed_at IS NULL OR retry_claimed_at <= ?) AND NOT EXISTS (SELECT 1 FROM notification_attempts successor WHERE successor.retry_of_id = notification_attempts.id) ORDER BY id ASC LIMIT ?`, formatTime(now), formatTime(stale), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +202,7 @@ func (s *Store) ClaimNotificationAttemptNow(ctx context.Context, id int64, now t
 func (s *Store) claimNotificationAttempt(ctx context.Context, id int64, now time.Time, requireDue bool) (bool, error) {
 	now = now.UTC()
 	stale := now.Add(-notificationRetryLease)
-	query := `UPDATE notification_attempts SET retry_claimed_at = ? WHERE id = ? AND status = 'failed' AND (retry_claimed_at IS NULL OR retry_claimed_at <= ?)`
+	query := `UPDATE notification_attempts SET retry_claimed_at = ? WHERE id = ? AND status = 'failed' AND (retry_claimed_at IS NULL OR retry_claimed_at <= ?) AND NOT EXISTS (SELECT 1 FROM notification_attempts successor WHERE successor.retry_of_id = notification_attempts.id)`
 	args := []any{formatTime(now), id, formatTime(stale)}
 	if requireDue {
 		query += ` AND next_retry_at IS NOT NULL AND next_retry_at <= ?`
@@ -325,14 +375,18 @@ func scanRuleEvaluation(row scanner) (model.RuleEvaluation, error) {
 	return item, nil
 }
 
-const notificationAttemptSelect = `SELECT id, monitor_id, event_id, rule_evaluation_id, channel_id, retry_of_id, channel_name, channel_type, kind, status, subject, body, data_json, error, attempt_no, duration_ms, sent_at, next_retry_at, created_at FROM notification_attempts`
+const notificationAttemptSelect = `SELECT id, monitor_id, event_id, rule_evaluation_id, channel_id, retry_of_id, channel_name, channel_type, kind, status, subject, body, data_json, error, attempt_no, duration_ms, sent_at, next_retry_at,
+	CASE WHEN status = 'failed' AND NOT EXISTS (SELECT 1 FROM notification_attempts successor WHERE successor.retry_of_id = notification_attempts.id) THEN 1 ELSE 0 END,
+	CASE WHEN EXISTS (SELECT 1 FROM notification_attempts successor WHERE successor.retry_of_id = notification_attempts.id) THEN 1 ELSE 0 END,
+	created_at FROM notification_attempts`
 
 func scanNotificationAttempt(row scanner) (model.NotificationAttempt, error) {
 	var item model.NotificationAttempt
 	var monitorID, eventID, evaluationID, channelID, retryOfID sql.NullInt64
 	var sentAt, nextRetryAt sql.NullString
+	var retriable, resolved int
 	var data, createdAt string
-	err := row.Scan(&item.ID, &monitorID, &eventID, &evaluationID, &channelID, &retryOfID, &item.ChannelName, &item.ChannelType, &item.Kind, &item.Status, &item.Subject, &item.Body, &data, &item.Error, &item.AttemptNo, &item.DurationMS, &sentAt, &nextRetryAt, &createdAt)
+	err := row.Scan(&item.ID, &monitorID, &eventID, &evaluationID, &channelID, &retryOfID, &item.ChannelName, &item.ChannelType, &item.Kind, &item.Status, &item.Subject, &item.Body, &data, &item.Error, &item.AttemptNo, &item.DurationMS, &sentAt, &nextRetryAt, &retriable, &resolved, &createdAt)
 	if err != nil {
 		return item, err
 	}
@@ -344,6 +398,8 @@ func scanNotificationAttempt(row scanner) (model.NotificationAttempt, error) {
 	item.Data = json.RawMessage(defaultJSON(data, "{}"))
 	item.SentAt = parseTimePtr(sentAt)
 	item.NextRetryAt = parseTimePtr(nextRetryAt)
+	item.Retriable = retriable == 1
+	item.Resolved = resolved == 1
 	item.CreatedAt = parseTime(createdAt)
 	return item, nil
 }

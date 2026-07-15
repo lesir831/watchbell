@@ -20,7 +20,15 @@ import (
 const maxDeliveryAttempts = 3
 
 var ErrAlreadyRunning = errors.New("monitor is already running")
-var ErrRetryTargetUnavailable = errors.New("notification retry target is unavailable")
+var (
+	// ErrRetryNotFailed is returned when the requested row is not a failed
+	// attempt. API callers can expose it as an unprocessable retry request.
+	ErrRetryNotFailed = errors.New("only failed notification attempts can be retried")
+	// ErrRetryConflict means another worker owns the retry or the source already
+	// has a successor. Retrying it again would duplicate delivery.
+	ErrRetryConflict          = errors.New("notification attempt is already being retried or has been superseded")
+	ErrRetryTargetUnavailable = errors.New("notification retry target is unavailable")
+)
 
 type Options struct {
 	Tick        time.Duration
@@ -152,14 +160,14 @@ func (s *Scheduler) RetryAttempt(ctx context.Context, attemptID int64) (model.No
 		return model.NotificationAttempt{}, err
 	}
 	if attempt.Status != "failed" {
-		return model.NotificationAttempt{}, fmt.Errorf("only failed attempts can be retried")
+		return model.NotificationAttempt{}, ErrRetryNotFailed
 	}
 	claimed, err := s.store.ClaimNotificationAttemptNow(ctx, attempt.ID, s.nowUTC())
 	if err != nil {
 		return model.NotificationAttempt{}, err
 	}
 	if !claimed {
-		return model.NotificationAttempt{}, fmt.Errorf("notification attempt is already being retried")
+		return model.NotificationAttempt{}, ErrRetryConflict
 	}
 	return s.runClaimedNotificationRetry(ctx, attempt)
 }
@@ -553,7 +561,12 @@ func (s *Scheduler) retryAttempt(ctx context.Context, source model.NotificationA
 func (s *Scheduler) runClaimedNotificationRetry(ctx context.Context, source model.NotificationAttempt) (model.NotificationAttempt, error) {
 	attempt, retryErr := s.retryAttempt(ctx, source)
 	if attempt.ID > 0 {
-		return attempt, errors.Join(retryErr, s.store.CancelNotificationRetry(ctx, source.ID))
+		// CreateNotificationAttempt atomically committed the successor and source
+		// finalization, so retryErr now describes only the provider outcome.
+		return attempt, retryErr
+	}
+	if errors.Is(retryErr, store.ErrNotificationRetryConflict) {
+		return attempt, errors.Join(ErrRetryConflict, s.store.CancelNotificationRetry(ctx, source.ID))
 	}
 	if errors.Is(retryErr, ErrRetryTargetUnavailable) {
 		stopErr := s.store.StopNotificationRetry(ctx, source.ID, "retry stopped: "+retryErr.Error())

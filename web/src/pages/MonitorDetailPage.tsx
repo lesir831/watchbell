@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { Alert, App as AntApp, Button, Card, Col, Descriptions, Row, Space, Statistic, Table, Tabs, Tag, Typography } from 'antd';
 import { ArrowLeftOutlined, PlayCircleOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -6,16 +7,21 @@ import { formatDate, formatDuration, formatInterval, jsonText, PageError, relati
 import type { CheckRun, EventRecord, NotificationAttempt, Rule } from '../types';
 
 const { Text, Title } = Typography;
+type PageState = { page: number; pageSize: number };
+type PageMeta = PageState & { total: number };
 
 export default function MonitorDetailPage({ monitorId, onNavigate }: { monitorId: number; onNavigate: (page: string) => void }) {
   const { message } = AntApp.useApp();
   const queryClient = useQueryClient();
+  const [runsPaging, setRunsPaging] = useState<PageState>({ page: 1, pageSize: 10 });
+  const [eventsPaging, setEventsPaging] = useState<PageState>({ page: 1, pageSize: 10 });
+  const [attemptsPaging, setAttemptsPaging] = useState<PageState>({ page: 1, pageSize: 10 });
   const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors, refetchInterval: 20_000 });
   const rules = useQuery({ queryKey: ['rules'], queryFn: api.listRules, refetchInterval: 30_000 });
   const channels = useQuery({ queryKey: ['channels'], queryFn: api.listChannels, refetchInterval: 30_000 });
-  const runs = useQuery({ queryKey: ['checkRuns', 'monitorDetail', monitorId], queryFn: () => api.listCheckRunsPage({ page: 1, pageSize: 100, monitorId }), refetchInterval: 15_000 });
-  const events = useQuery({ queryKey: ['events', 'monitorDetail', monitorId], queryFn: () => api.listEventsPage({ page: 1, pageSize: 100, monitorId }), refetchInterval: 15_000 });
-  const attempts = useQuery({ queryKey: ['notificationAttempts', 'monitorDetail', monitorId], queryFn: () => api.listNotificationAttemptsPage({ page: 1, pageSize: 100, monitorId }), refetchInterval: 15_000 });
+  const runs = useQuery({ queryKey: ['checkRuns', 'monitorDetail', monitorId, runsPaging], queryFn: () => api.listCheckRunsPage({ ...runsPaging, monitorId }), refetchInterval: 15_000, placeholderData: (previous, query) => query?.queryKey[2] === monitorId ? previous : undefined });
+  const events = useQuery({ queryKey: ['events', 'monitorDetail', monitorId, eventsPaging], queryFn: () => api.listEventsPage({ ...eventsPaging, monitorId }), refetchInterval: 15_000, placeholderData: (previous, query) => query?.queryKey[2] === monitorId ? previous : undefined });
+  const attempts = useQuery({ queryKey: ['notificationAttempts', 'monitorDetail', monitorId, attemptsPaging], queryFn: () => api.listNotificationAttemptsPage({ ...attemptsPaging, monitorId }), refetchInterval: 15_000, placeholderData: (previous, query) => query?.queryKey[2] === monitorId ? previous : undefined });
   const failedAttempts = useQuery({ queryKey: ['notificationAttempts', 'monitorDetail', monitorId, 'failedCount'], queryFn: () => api.listNotificationAttemptsPage({ page: 1, pageSize: 1, monitorId, status: 'failed' }), refetchInterval: 15_000 });
   const monitor = monitors.data?.find((item) => item.id === monitorId);
   const monitorRules = (rules.data ?? []).filter((item) => item.monitorId === monitorId);
@@ -68,10 +74,10 @@ export default function MonitorDetailPage({ monitorId, onNavigate }: { monitorId
         </Row>
         <Card>
           <Tabs items={[
-            { key: 'runs', label: `检查 ${runs.data?.total ?? 0}`, children: <Runs data={monitorRuns} /> },
-            { key: 'events', label: `事件 ${events.data?.total ?? 0}`, children: <Events data={monitorEvents} /> },
+            { key: 'runs', label: `检查 ${runs.data?.total ?? 0}`, children: <Runs data={monitorRuns} page={{ ...runsPaging, total: runs.data?.total ?? 0 }} loading={runs.isFetching} onPage={(page, pageSize) => setRunsPaging({ page, pageSize })} /> },
+            { key: 'events', label: `事件 ${events.data?.total ?? 0}`, children: <Events data={monitorEvents} page={{ ...eventsPaging, total: events.data?.total ?? 0 }} loading={events.isFetching} onPage={(page, pageSize) => setEventsPaging({ page, pageSize })} /> },
             { key: 'rules', label: `规则 ${monitorRules.length}`, children: <Rules data={monitorRules} channelByID={channelByID} /> },
-            { key: 'attempts', label: `通知 ${attempts.data?.total ?? 0}`, children: <Attempts data={monitorAttempts} /> },
+            { key: 'attempts', label: `通知 ${attempts.data?.total ?? 0}`, children: <Attempts data={monitorAttempts} page={{ ...attemptsPaging, total: attempts.data?.total ?? 0 }} loading={attempts.isFetching} onPage={(page, pageSize) => setAttemptsPaging({ page, pageSize })} /> },
             { key: 'config', label: '配置', children: <pre className="detail-json">{jsonText(monitor.config)}</pre> }
           ]} />
         </Card>
@@ -80,16 +86,28 @@ export default function MonitorDetailPage({ monitorId, onNavigate }: { monitorId
   );
 }
 
-function Runs({ data }: { data: CheckRun[] }) {
-  return <Table rowKey="id" dataSource={data} pagination={{ pageSize: 10 }} scroll={{ x: 700 }} columns={[
+function detailPagination(page: PageMeta | undefined, onPage: (page: number, pageSize: number) => void) {
+  return {
+    current: page?.page ?? 1,
+    pageSize: page?.pageSize ?? 10,
+    total: page?.total ?? 0,
+    showSizeChanger: true,
+    pageSizeOptions: [10, 20, 50, 100],
+    showTotal: (total: number) => `共 ${total} 条`,
+    onChange: (nextPage: number, nextPageSize: number) => onPage(nextPageSize === page?.pageSize ? nextPage : 1, nextPageSize)
+  };
+}
+
+function Runs({ data, page, loading, onPage }: { data: CheckRun[]; page?: PageMeta; loading: boolean; onPage: (page: number, pageSize: number) => void }) {
+  return <Table<CheckRun> rowKey="id" loading={loading} dataSource={data} pagination={detailPagination(page, onPage)} scroll={{ x: 700 }} columns={[
     { title: 'ID', dataIndex: 'id', render: (id) => `#${id}` }, { title: '触发', dataIndex: 'trigger', render: (value) => <StatusTag status={value} /> },
     { title: '结果', dataIndex: 'status', render: (value) => <StatusTag status={value} /> }, { title: '消息 / 错误', render: (_, item) => item.error || item.message || '—' },
     { title: '事件', dataIndex: 'eventCount' }, { title: '耗时', dataIndex: 'durationMs', render: formatDuration }, { title: '时间', dataIndex: 'startedAt', render: relativeDate }
   ]} />;
 }
 
-function Events({ data }: { data: EventRecord[] }) {
-  return <Table rowKey="id" dataSource={data} pagination={{ pageSize: 10 }} scroll={{ x: 650 }} columns={[
+function Events({ data, page, loading, onPage }: { data: EventRecord[]; page?: PageMeta; loading: boolean; onPage: (page: number, pageSize: number) => void }) {
+  return <Table<EventRecord> rowKey="id" loading={loading} dataSource={data} pagination={detailPagination(page, onPage)} scroll={{ x: 650 }} columns={[
     { title: 'ID', dataIndex: 'id', render: (id) => `#${id}` }, { title: '检查', dataIndex: 'checkRunId', render: (id) => id ? `#${id}` : '—' },
     { title: '类型', dataIndex: 'type', render: (value) => <Tag>{value}</Tag> }, { title: '事件数据', dataIndex: 'payload', ellipsis: true, render: jsonText }, { title: '时间', dataIndex: 'createdAt', render: relativeDate }
   ]} />;
@@ -102,9 +120,11 @@ function Rules({ data, channelByID = new Map<number, string>() }: { data: Rule[]
   ]} />;
 }
 
-function Attempts({ data }: { data: NotificationAttempt[] }) {
-  return <Table rowKey="id" dataSource={data} pagination={{ pageSize: 10 }} scroll={{ x: 700 }} columns={[
+function Attempts({ data, page, loading, onPage }: { data: NotificationAttempt[]; page?: PageMeta; loading: boolean; onPage: (page: number, pageSize: number) => void }) {
+  return <Table<NotificationAttempt> rowKey="id" loading={loading} dataSource={data} pagination={detailPagination(page, onPage)} scroll={{ x: 780 }} columns={[
     { title: 'ID', dataIndex: 'id', render: (id) => `#${id}` }, { title: '渠道', dataIndex: 'channelName' }, { title: '状态', dataIndex: 'status', render: (value) => <StatusTag status={value} /> },
-    { title: '次数', dataIndex: 'attemptNo' }, { title: '错误', dataIndex: 'error', ellipsis: true }, { title: '时间', dataIndex: 'createdAt', render: relativeDate }
+    { title: '次数', dataIndex: 'attemptNo' }, { title: '错误', dataIndex: 'error', ellipsis: true },
+    { title: '重试', render: (_, item) => item.resolved ? <Tag color="blue">已被后续尝试取代</Tag> : item.nextRetryAt ? `计划 ${relativeDate(item.nextRetryAt)}` : '—' },
+    { title: '时间', dataIndex: 'createdAt', render: relativeDate }
   ]} />;
 }

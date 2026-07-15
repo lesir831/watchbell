@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -48,7 +50,8 @@ var forbiddenWebhookHeaders = map[string]struct{}{
 }
 
 type WebhookNotifier struct {
-	client *http.Client
+	client       *http.Client
+	lookupIPAddr func(context.Context, string) ([]net.IPAddr, error)
 }
 
 type WebhookConfig struct {
@@ -67,7 +70,10 @@ func ValidateWebhookConfig(raw json.RawMessage) error {
 }
 
 func NewWebhookNotifier() *WebhookNotifier {
-	return &WebhookNotifier{client: &http.Client{Timeout: 15 * time.Second}}
+	return &WebhookNotifier{
+		client:       &http.Client{Timeout: 15 * time.Second},
+		lookupIPAddr: net.DefaultResolver.LookupIPAddr,
+	}
 }
 
 func (n *WebhookNotifier) Type() string {
@@ -112,6 +118,9 @@ func (n *WebhookNotifier) Send(ctx context.Context, channel model.NotifyChannel,
 	if req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	}
+	if err := validateRenderedWebhookBody(cfg.BodyTemplate, body, req.Header.Get("Content-Type")); err != nil {
+		return err
+	}
 
 	client := n.client
 	if client == nil {
@@ -127,11 +136,16 @@ func (n *WebhookNotifier) Send(ctx context.Context, channel model.NotifyChannel,
 	requestClient.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	transport, err := webhookTransport(requestClient.Transport, cfg.AllowPrivate)
+	lookupIPAddr := n.lookupIPAddr
+	if lookupIPAddr == nil {
+		lookupIPAddr = net.DefaultResolver.LookupIPAddr
+	}
+	transport, err := webhookTransport(requestClient.Transport, cfg.AllowPrivate, lookupIPAddr)
 	if err != nil {
 		return err
 	}
 	requestClient.Transport = transport
+	defer transport.CloseIdleConnections()
 
 	resp, err := requestClient.Do(req)
 	if err != nil {
@@ -205,7 +219,10 @@ func renderWebhookBody(bodyTemplate string, message Message, data map[string]any
 		}
 		return string(body), nil
 	}
-	body := templatex.Render(bodyTemplate, data)
+	body, err := templatex.RenderJSONTemplate(bodyTemplate, data)
+	if err != nil {
+		return "", fmt.Errorf("render webhook body: %w", err)
+	}
 	if len(body) > maxWebhookBodyBytes {
 		return "", fmt.Errorf("webhook body exceeds %d bytes", maxWebhookBodyBytes)
 	}
@@ -250,7 +267,7 @@ func validateWebhookURL(raw string, allowPrivate bool) error {
 	return nil
 }
 
-func webhookTransport(base http.RoundTripper, allowPrivate bool) (*http.Transport, error) {
+func webhookTransport(base http.RoundTripper, allowPrivate bool, lookupIPAddr func(context.Context, string) ([]net.IPAddr, error)) (*http.Transport, error) {
 	var transport *http.Transport
 	if base == nil {
 		transport = http.DefaultTransport.(*http.Transport).Clone()
@@ -270,7 +287,7 @@ func webhookTransport(base http.RoundTripper, allowPrivate bool) (*http.Transpor
 		if err != nil {
 			return nil, fmt.Errorf("parse webhook address: %w", err)
 		}
-		addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		addresses, err := lookupIPAddr(ctx, host)
 		if err != nil {
 			return nil, fmt.Errorf("resolve webhook host: lookup failed")
 		}
@@ -296,12 +313,75 @@ func webhookTransport(base http.RoundTripper, allowPrivate bool) (*http.Transpor
 }
 
 func blockedWebhookIP(ip net.IP) bool {
-	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || !ip.IsGlobalUnicast() {
+	address, ok := netip.AddrFromSlice(ip)
+	if !ok {
 		return true
 	}
-	// RFC 6598 carrier-grade NAT space is not classified as private by net.IP.
-	cgnat := &net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
-	return cgnat.Contains(ip)
+	address = address.Unmap()
+	for _, prefix := range blockedWebhookPrefixes {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+// blockedWebhookPrefixes covers the IANA IPv4 and IPv6 special-purpose
+// registries, including globally-unicast ranges that are not ordinary public
+// destinations. This is intentionally stricter than net.IP.IsGlobalUnicast.
+var blockedWebhookPrefixes = []netip.Prefix{
+	// IPv4 special-purpose ranges.
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.31.196.0/24"),
+	netip.MustParsePrefix("192.52.193.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("192.175.48.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	// IPv6 special-purpose, translation, documentation, and local ranges.
+	netip.MustParsePrefix("::/96"), // Deprecated IPv4-compatible addresses.
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("100:0:0:1::/64"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("2620:4f:8000::/48"),
+	netip.MustParsePrefix("3fff::/20"),
+	netip.MustParsePrefix("5f00::/16"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("fec0::/10"),
+	netip.MustParsePrefix("ff00::/8"),
+}
+
+func validateRenderedWebhookBody(bodyTemplate, body, contentType string) error {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return fmt.Errorf("webhook Content-Type is invalid")
+	}
+	if mediaType == "application/json" || strings.HasSuffix(mediaType, "+json") {
+		if bodyTemplate != "" && templatex.HasPlainVariables(bodyTemplate) {
+			return fmt.Errorf("JSON webhook body variables must use ${json:path}; raw ${path} interpolation can change the JSON structure")
+		}
+		if !json.Valid([]byte(body)) {
+			return fmt.Errorf("rendered webhook body is not valid JSON; use ${json:path} for JSON values")
+		}
+	}
+	return nil
 }
 
 func validateWebhookHeader(key, value string) error {
