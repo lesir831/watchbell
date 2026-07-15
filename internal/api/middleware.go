@@ -16,6 +16,10 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 		}
 		wrapped := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		next.ServeHTTP(wrapped, r)
+		remoteIP := middleware.GetClientIP(r.Context())
+		if remoteIP == "" {
+			remoteIP = r.RemoteAddr
+		}
 		s.logger.Info("http request",
 			"request_id", requestID,
 			"method", r.Method,
@@ -23,7 +27,7 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 			"status", wrapped.Status(),
 			"bytes", wrapped.BytesWritten(),
 			"duration_ms", time.Since(started).Milliseconds(),
-			"remote_ip", r.RemoteAddr,
+			"remote_ip", remoteIP,
 		)
 	})
 }

@@ -1,5 +1,5 @@
 export type MonitorType = 'rss' | 'testflight' | 'webpage' | 'github_release';
-export type ChannelType = 'bark' | 'email';
+export type ChannelType = 'bark' | 'email' | 'webhook';
 
 export interface PluginConfigField {
   key: string;
@@ -49,6 +49,9 @@ export interface Monitor {
   lastMessage?: string;
   lastError?: string;
   consecutiveFailures: number;
+  failureAlertAfter: number;
+  failureNotifyChannelIds: number[];
+  failureAlertActive: boolean;
   nextCheckAt?: string;
   configuredSecrets?: string[];
   createdAt: string;
@@ -61,6 +64,8 @@ export interface MonitorInput {
   enabled: boolean;
   intervalSeconds: number;
   config: Record<string, unknown>;
+  failureAlertAfter: number;
+  failureNotifyChannelIds: number[];
 }
 
 export interface Rule {
@@ -72,6 +77,7 @@ export interface Rule {
   notifyChannelIds: number[];
   templateId?: number;
   cooldownSeconds: number;
+  quietHours: QuietHours;
   lastFiredAt?: string;
   createdAt: string;
   updatedAt: string;
@@ -85,6 +91,26 @@ export interface RuleInput {
   notifyChannelIds: number[];
   templateId?: number | null;
   cooldownSeconds: number;
+  quietHours: QuietHours;
+}
+
+export interface QuietHours {
+  enabled: boolean;
+  start?: string;
+  end?: string;
+  timezone?: string;
+}
+
+export interface RuleTestResponse {
+  tested: number;
+  matched: number;
+  results: Array<{
+    eventId: number;
+    eventType: string;
+    matched: string[];
+    payload: Record<string, unknown>;
+    createdAt: string;
+  }>;
 }
 
 export interface NotifyChannel {
@@ -110,6 +136,7 @@ export interface NotificationTemplate {
   name: string;
   subjectTemplate: string;
   bodyTemplate: string;
+  isDefault: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -170,13 +197,14 @@ export interface RuleEvaluation {
 
 export interface NotificationAttempt {
   id: number;
+  monitorId?: number;
   eventId?: number;
   ruleEvaluationId?: number;
   channelId?: number;
   retryOfId?: number;
   channelName: string;
   channelType: ChannelType;
-  kind: 'delivery' | 'test';
+  kind: 'delivery' | 'test' | 'monitor_failure' | 'monitor_recovery';
   status: 'sent' | 'failed';
   subject: string;
   body: string;
@@ -185,7 +213,21 @@ export interface NotificationAttempt {
   durationMs: number;
   sentAt?: string;
   nextRetryAt?: string;
+  retriable: boolean;
+  resolved: boolean;
   createdAt: string;
+}
+
+export interface DeadLetter {
+  eventId: number;
+  monitorId: number;
+  monitorName: string;
+  eventType: string;
+  fingerprint: string;
+  attempts: number;
+  lastError: string;
+  eventCreatedAt: string;
+  updatedAt: string;
 }
 
 export interface AuditLog {
@@ -197,6 +239,55 @@ export interface AuditLog {
   summary: string;
   changes: Record<string, unknown>;
   createdAt: string;
+}
+
+export interface HistoryPage<T> {
+  items: T[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+}
+
+export interface HistoryQuery {
+  page: number;
+  pageSize: number;
+  from?: string;
+  to?: string;
+  monitorId?: number;
+  checkRunId?: number;
+  eventId?: number;
+  ruleId?: number;
+  channelId?: number;
+  entityId?: number;
+  status?: string;
+  trigger?: string;
+  monitorType?: string;
+  type?: string;
+  kind?: string;
+  channelType?: string;
+  actor?: string;
+  action?: string;
+  entityType?: string;
+}
+
+export interface ConfigBackup {
+  version: number;
+  exportedAt: string;
+  includesSecrets: boolean;
+  monitors: Array<Record<string, unknown>>;
+  rules: Array<Record<string, unknown>>;
+  channels: Array<Record<string, unknown>>;
+  templates: Array<Record<string, unknown>>;
+}
+
+export interface ConfigImportReport {
+  version: number;
+  mode: 'merge';
+  created: { monitors: number; rules: number; channels: number; templates: number };
+  updated: { monitors: number; rules: number; channels: number; templates: number };
+  idMap: Record<string, Record<string, number>>;
+  warnings: string[];
 }
 
 export interface DashboardSummary {
@@ -220,5 +311,6 @@ export interface SchedulerHealth {
 export interface SystemStatus {
   database: string;
   scheduler: SchedulerHealth;
+  outbox: { pending: number; processing: number; processed: number; dead_letter: number };
   time: string;
 }

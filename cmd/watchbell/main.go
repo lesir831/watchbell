@@ -17,6 +17,7 @@ import (
 	"github.com/watchbell/watchbell/internal/auth"
 	"github.com/watchbell/watchbell/internal/checker"
 	"github.com/watchbell/watchbell/internal/config"
+	"github.com/watchbell/watchbell/internal/maintenance"
 	"github.com/watchbell/watchbell/internal/notifier"
 	"github.com/watchbell/watchbell/internal/scheduler"
 	"github.com/watchbell/watchbell/internal/store"
@@ -79,6 +80,7 @@ func main() {
 	notifiers := notifier.NewRegistry(
 		notifier.NewBarkNotifier(),
 		notifier.NewEmailNotifier(),
+		notifier.NewWebhookNotifier(),
 	)
 
 	sched := scheduler.New(db, checkers, notifiers, scheduler.Options{
@@ -88,10 +90,26 @@ func main() {
 	})
 	go sched.Start(ctx)
 
+	retention := config.RetentionFromEnv()
+	historyWorker := maintenance.NewHistoryWorker(db, maintenance.HistoryOptions{
+		Policy: store.HistoryRetentionPolicy{
+			EventAge:               retention.EventAge,
+			CheckRunAge:            retention.CheckRunAge,
+			NotificationAttemptAge: retention.NotificationAttemptAge,
+			AuditLogAge:            retention.AuditLogAge,
+			BatchSize:              retention.BatchSize,
+		},
+		Interval: retention.CleanupInterval,
+		Logger:   logger,
+	})
+	go historyWorker.Run(ctx)
+
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           api.NewServer(db, sched, cfg.WebDir, logger, authManager).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {

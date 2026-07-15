@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS monitors (
   last_message TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT '',
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  failure_alert_after INTEGER NOT NULL DEFAULT 0,
+  failure_notify_channel_ids_json TEXT NOT NULL DEFAULT '[]',
+  failure_alert_active INTEGER NOT NULL DEFAULT 0,
   deleted_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -29,6 +32,7 @@ CREATE TABLE IF NOT EXISTS rules (
   notify_channel_ids_json TEXT NOT NULL DEFAULT '[]',
   template_id INTEGER REFERENCES notification_templates(id) ON DELETE SET NULL,
   cooldown_seconds INTEGER NOT NULL DEFAULT 0,
+  quiet_hours_json TEXT NOT NULL DEFAULT '{}',
   last_fired_at TEXT,
   deleted_at TEXT,
   created_at TEXT NOT NULL,
@@ -53,6 +57,7 @@ CREATE TABLE IF NOT EXISTS notification_templates (
   name TEXT NOT NULL,
   subject_template TEXT NOT NULL,
   body_template TEXT NOT NULL,
+  is_default INTEGER NOT NULL DEFAULT 0,
   deleted_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -70,6 +75,8 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_monitor_id ON events(monitor_id);
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
+CREATE INDEX IF NOT EXISTS idx_events_monitor_created_at ON events(monitor_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_type_created_at ON events(type, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS notification_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,6 +109,8 @@ CREATE TABLE IF NOT EXISTS check_runs (
 
 CREATE INDEX IF NOT EXISTS idx_check_runs_monitor_id ON check_runs(monitor_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_check_runs_created_at ON check_runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_check_runs_status_created_at ON check_runs(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_check_runs_trigger_created_at ON check_runs(trigger, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS event_check_runs (
   event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
@@ -121,9 +130,12 @@ CREATE TABLE IF NOT EXISTS rule_evaluations (
 
 CREATE INDEX IF NOT EXISTS idx_rule_evaluations_event_id ON rule_evaluations(event_id, id);
 CREATE INDEX IF NOT EXISTS idx_rule_evaluations_created_at ON rule_evaluations(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rule_evaluations_rule_id ON rule_evaluations(rule_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rule_evaluations_status_created_at ON rule_evaluations(status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS notification_attempts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  monitor_id INTEGER REFERENCES monitors(id),
   event_id INTEGER REFERENCES events(id),
   rule_evaluation_id INTEGER REFERENCES rule_evaluations(id),
   channel_id INTEGER REFERENCES notify_channels(id),
@@ -134,16 +146,22 @@ CREATE TABLE IF NOT EXISTS notification_attempts (
   status TEXT NOT NULL,
   subject TEXT NOT NULL DEFAULT '',
   body TEXT NOT NULL DEFAULT '',
+  data_json TEXT NOT NULL DEFAULT '{}',
   error TEXT NOT NULL DEFAULT '',
   attempt_no INTEGER NOT NULL DEFAULT 1,
   duration_ms INTEGER NOT NULL DEFAULT 0,
   sent_at TEXT,
   next_retry_at TEXT,
+  retry_claimed_at TEXT,
   created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_notification_attempts_created_at ON notification_attempts(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_notification_attempts_retry ON notification_attempts(status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_notification_attempts_retry_of_id ON notification_attempts(retry_of_id);
+CREATE INDEX IF NOT EXISTS idx_notification_attempts_event_id ON notification_attempts(event_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_attempts_channel_id ON notification_attempts(channel_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_attempts_status_created_at ON notification_attempts(status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS event_outbox (
   event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
@@ -169,6 +187,8 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_action_created_at ON audit_logs(action, created_at DESC);
 
 INSERT OR IGNORE INTO notification_templates (
   id, name, subject_template, body_template, created_at, updated_at

@@ -24,13 +24,18 @@ type Store struct {
 	db *sql.DB
 }
 
+// ErrDuplicateNaturalKey is returned when a write would duplicate an active
+// configuration entity's documented natural key. Store writes enforce this
+// atomically; API-side lookups remain useful only for friendlier field errors.
+var ErrDuplicateNaturalKey = errors.New("duplicate active configuration natural key")
+
 func Open(ctx context.Context, path string) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, err
 		}
 	}
-	db, err := sql.Open("sqlite3", path)
+	db, err := sql.Open("sqlite3", sqliteConnectionDSN(path))
 	if err != nil {
 		return nil, err
 	}
@@ -52,6 +57,17 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	return store, nil
 }
 
+func sqliteConnectionDSN(path string) string {
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	// foreign_keys and busy_timeout are connection-local SQLite settings.
+	// Supplying them through the driver DSN applies them to every pooled
+	// connection, rather than only whichever connection executes PRAGMA first.
+	return path + separator + "_busy_timeout=5000&_foreign_keys=on&_journal_mode=WAL"
+}
+
 func (s *Store) migrate(ctx context.Context) error {
 	columns := []struct {
 		table      string
@@ -59,10 +75,18 @@ func (s *Store) migrate(ctx context.Context) error {
 		definition string
 	}{
 		{"monitors", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0"},
+		{"monitors", "failure_alert_after", "INTEGER NOT NULL DEFAULT 0"},
+		{"monitors", "failure_notify_channel_ids_json", "TEXT NOT NULL DEFAULT '[]'"},
+		{"monitors", "failure_alert_active", "INTEGER NOT NULL DEFAULT 0"},
 		{"monitors", "deleted_at", "TEXT"},
+		{"rules", "quiet_hours_json", "TEXT NOT NULL DEFAULT '{}'"},
 		{"rules", "deleted_at", "TEXT"},
 		{"notify_channels", "deleted_at", "TEXT"},
+		{"notification_templates", "is_default", "INTEGER NOT NULL DEFAULT 0"},
 		{"notification_templates", "deleted_at", "TEXT"},
+		{"notification_attempts", "monitor_id", "INTEGER REFERENCES monitors(id)"},
+		{"notification_attempts", "data_json", "TEXT NOT NULL DEFAULT '{}'"},
+		{"notification_attempts", "retry_claimed_at", "TEXT"},
 	}
 	for _, column := range columns {
 		exists, err := s.columnExists(ctx, column.table, column.name)
@@ -76,6 +100,43 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, query); err != nil {
 			return fmt.Errorf("migrate %s.%s: %w", column.table, column.name, err)
 		}
+	}
+	// notification_attempts.monitor_id was added after the original trace
+	// schema. Backfill it while the event/evaluation links are still available
+	// so later independent retention cannot make legacy attempts untraceable.
+	if _, err := s.db.ExecContext(ctx, `UPDATE notification_attempts
+		SET monitor_id = COALESCE(
+			(SELECT event.monitor_id FROM events event WHERE event.id = notification_attempts.event_id),
+			(SELECT event.monitor_id FROM rule_evaluations evaluation JOIN events event ON event.id = evaluation.event_id WHERE evaluation.id = notification_attempts.rule_evaluation_id)
+		)
+		WHERE monitor_id IS NULL
+		  AND (event_id IS NOT NULL OR rule_evaluation_id IS NOT NULL)`); err != nil {
+		return fmt.Errorf("backfill notification attempt monitor: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE notification_templates SET is_default = 1 WHERE id = 1 AND NOT EXISTS (SELECT 1 FROM notification_templates WHERE is_default = 1)`); err != nil {
+		return fmt.Errorf("mark default notification template: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_templates_default ON notification_templates(is_default) WHERE is_default = 1 AND deleted_at IS NULL`); err != nil {
+		return fmt.Errorf("index default notification template: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_notification_attempts_monitor_id ON notification_attempts(monitor_id, created_at DESC)`); err != nil {
+		return fmt.Errorf("index notification attempt monitor: %w", err)
+	}
+	for _, index := range []struct {
+		name  string
+		query string
+	}{
+		{"active monitor natural key", `CREATE INDEX IF NOT EXISTS idx_monitors_active_natural_key ON monitors(type, name) WHERE deleted_at IS NULL`},
+		{"active rule natural key", `CREATE INDEX IF NOT EXISTS idx_rules_active_natural_key ON rules(monitor_id, name) WHERE deleted_at IS NULL`},
+		{"active channel natural key", `CREATE INDEX IF NOT EXISTS idx_notify_channels_active_natural_key ON notify_channels(type, name) WHERE deleted_at IS NULL`},
+		{"active template natural key", `CREATE INDEX IF NOT EXISTS idx_notification_templates_active_natural_key ON notification_templates(name) WHERE deleted_at IS NULL`},
+	} {
+		if _, err := s.db.ExecContext(ctx, index.query); err != nil {
+			return fmt.Errorf("index %s: %w", index.name, err)
+		}
+	}
+	if err := s.repairActiveConfigReferences(ctx); err != nil {
+		return fmt.Errorf("repair active configuration references: %w", err)
 	}
 	return nil
 }
@@ -106,7 +167,7 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) ListMonitors(ctx context.Context) ([]model.Monitor, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, created_at, updated_at FROM monitors WHERE deleted_at IS NULL ORDER BY id DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE deleted_at IS NULL ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +184,7 @@ func (s *Store) ListMonitors(ctx context.Context) ([]model.Monitor, error) {
 }
 
 func (s *Store) ListEnabledMonitors(ctx context.Context) ([]model.Monitor, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, created_at, updated_at FROM monitors WHERE enabled = 1 AND deleted_at IS NULL ORDER BY id ASC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE enabled = 1 AND deleted_at IS NULL ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +201,14 @@ func (s *Store) ListEnabledMonitors(ctx context.Context) ([]model.Monitor, error
 }
 
 func (s *Store) GetMonitor(ctx context.Context, id int64) (model.Monitor, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, created_at, updated_at FROM monitors WHERE id = ? AND deleted_at IS NULL`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE id = ? AND deleted_at IS NULL`, id)
+	return scanMonitor(row)
+}
+
+// GetMonitorIncludingArchived is used when rendering immutable history whose
+// originating monitor may have been archived after the event was created.
+func (s *Store) GetMonitorIncludingArchived(ctx context.Context, id int64) (model.Monitor, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE id = ?`, id)
 	return scanMonitor(row)
 }
 
@@ -150,10 +218,22 @@ func (s *Store) CreateMonitor(ctx context.Context, input model.MonitorInput) (mo
 		input.IntervalSeconds = 300
 	}
 	config := normalizedJSON(input.Config, "{}")
-	res, err := s.db.ExecContext(ctx, `INSERT INTO monitors (name, type, enabled, interval_seconds, config_json, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '{}', ?, ?)`,
-		strings.TrimSpace(input.Name), input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), now, now)
+	channelIDs, err := json.Marshal(normalizedIDs(input.FailureNotifyChannelIDs))
 	if err != nil {
 		return model.Monitor{}, err
+	}
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO monitors (name, type, enabled, interval_seconds, config_json, state_json, failure_alert_after, failure_notify_channel_ids_json, created_at, updated_at)
+		SELECT ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?
+		WHERE NOT EXISTS (SELECT 1 FROM monitors WHERE name = ? AND type = ? AND deleted_at IS NULL)`,
+		name, input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), now, now, name, input.Type)
+	if err != nil {
+		return model.Monitor{}, err
+	}
+	if duplicate, err := insertWasSkipped(res); err != nil {
+		return model.Monitor{}, err
+	} else if duplicate {
+		return model.Monitor{}, fmt.Errorf("%w: monitor (%s, %s)", ErrDuplicateNaturalKey, input.Type, name)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
@@ -167,15 +247,21 @@ func (s *Store) UpdateMonitor(ctx context.Context, id int64, input model.Monitor
 		input.IntervalSeconds = 300
 	}
 	config := normalizedJSON(input.Config, "{}")
+	channelIDs, err := json.Marshal(normalizedIDs(input.FailureNotifyChannelIDs))
+	if err != nil {
+		return model.Monitor{}, err
+	}
 	existing, err := s.GetMonitor(ctx, id)
 	if err != nil {
 		return model.Monitor{}, err
 	}
 	resetState := existing.Type != input.Type || !jsonEquivalent(existing.Config, config)
-	query := `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`
-	args := []any{strings.TrimSpace(input.Name), input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), nowString(), id}
+	name := strings.TrimSpace(input.Name)
+	query := `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = CASE WHEN ? = 0 THEN 0 ELSE failure_alert_active END, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM monitors duplicate WHERE duplicate.name = ? AND duplicate.type = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`
+	args := []any{name, input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), input.FailureAlertAfter, nowString(), id, name, input.Type, id}
 	if resetState {
-		query = `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, state_json = '{}', last_checked_at = NULL, last_status = '', last_message = '', last_error = '', consecutive_failures = 0, updated_at = ? WHERE id = ? AND deleted_at IS NULL`
+		query = `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, state_json = '{}', last_checked_at = NULL, last_status = '', last_message = '', last_error = '', consecutive_failures = 0, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = 0, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM monitors duplicate WHERE duplicate.name = ? AND duplicate.type = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`
+		args = []any{name, input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), nowString(), id, name, input.Type, id}
 	}
 	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
@@ -183,7 +269,12 @@ func (s *Store) UpdateMonitor(ctx context.Context, id int64, input model.Monitor
 	}
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
-		return model.Monitor{}, sql.ErrNoRows
+		if exists, lookupErr := s.activeRecordExists(ctx, "monitors", id); lookupErr != nil {
+			return model.Monitor{}, lookupErr
+		} else if !exists {
+			return model.Monitor{}, sql.ErrNoRows
+		}
+		return model.Monitor{}, fmt.Errorf("%w: monitor (%s, %s)", ErrDuplicateNaturalKey, input.Type, name)
 	}
 	return s.GetMonitor(ctx, id)
 }
@@ -215,7 +306,13 @@ func (s *Store) UpdateMonitorDispatchWarning(ctx context.Context, id int64, warn
 }
 
 func (s *Store) DeleteMonitor(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE monitors SET enabled = 0, deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, nowString(), nowString(), id)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := nowString()
+	res, err := tx.ExecContext(ctx, `UPDATE monitors SET enabled = 0, deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, now, now, id)
 	if err != nil {
 		return err
 	}
@@ -223,11 +320,26 @@ func (s *Store) DeleteMonitor(ctx context.Context, id int64) error {
 	if affected == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+	// Rules cannot be meaningfully restored without their monitor. Archive the
+	// active configuration rows while preserving all rule evaluation history.
+	if _, err := tx.ExecContext(ctx, `UPDATE rules SET enabled = 0, deleted_at = ?, updated_at = ? WHERE monitor_id = ? AND deleted_at IS NULL`, now, now, id); err != nil {
+		return err
+	}
+	// Events already discovered remain part of history, but no notification
+	// should be dispatched after the owning monitor and its rules are archived.
+	if _, err := tx.ExecContext(ctx, `UPDATE event_outbox SET status = 'processed', last_error = 'monitor archived before dispatch', updated_at = ? WHERE event_id IN (SELECT id FROM events WHERE monitor_id = ?) AND status IN ('pending', 'processing')`, now, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE notification_attempts SET next_retry_at = NULL, retry_claimed_at = NULL,
+		error = CASE WHEN error = '' THEN 'retry stopped: monitor archived' ELSE error || '; retry stopped: monitor archived' END
+		WHERE monitor_id = ? AND status = 'failed' AND next_retry_at IS NOT NULL`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ListRules(ctx context.Context) ([]model.Rule, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, last_fired_at, created_at, updated_at FROM rules WHERE deleted_at IS NULL ORDER BY id DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, last_fired_at, created_at, updated_at FROM rules WHERE deleted_at IS NULL ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +348,7 @@ func (s *Store) ListRules(ctx context.Context) ([]model.Rule, error) {
 }
 
 func (s *Store) ListRulesForMonitor(ctx context.Context, monitorID int64) ([]model.Rule, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, last_fired_at, created_at, updated_at FROM rules WHERE monitor_id = ? AND enabled = 1 AND deleted_at IS NULL ORDER BY id ASC`, monitorID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, last_fired_at, created_at, updated_at FROM rules WHERE monitor_id = ? AND enabled = 1 AND deleted_at IS NULL ORDER BY id ASC`, monitorID)
 	if err != nil {
 		return nil, err
 	}
@@ -245,7 +357,7 @@ func (s *Store) ListRulesForMonitor(ctx context.Context, monitorID int64) ([]mod
 }
 
 func (s *Store) GetRule(ctx context.Context, id int64) (model.Rule, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, last_fired_at, created_at, updated_at FROM rules WHERE id = ? AND deleted_at IS NULL`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, last_fired_at, created_at, updated_at FROM rules WHERE id = ? AND deleted_at IS NULL`, id)
 	return scanRule(row)
 }
 
@@ -256,10 +368,22 @@ func (s *Store) CreateRule(ctx context.Context, input model.RuleInput) (model.Ru
 	if err != nil {
 		return model.Rule{}, err
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO rules (monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		input.MonitorID, strings.TrimSpace(input.Name), boolInt(input.Enabled), string(condition), string(channelIDs), input.TemplateID, input.CooldownSeconds, now, now)
+	quietHours, err := json.Marshal(input.QuietHours)
 	if err != nil {
 		return model.Rule{}, err
+	}
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO rules (monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, created_at, updated_at)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (SELECT 1 FROM rules WHERE monitor_id = ? AND name = ? AND deleted_at IS NULL)`,
+		input.MonitorID, name, boolInt(input.Enabled), string(condition), string(channelIDs), input.TemplateID, input.CooldownSeconds, string(quietHours), now, now, input.MonitorID, name)
+	if err != nil {
+		return model.Rule{}, err
+	}
+	if duplicate, err := insertWasSkipped(res); err != nil {
+		return model.Rule{}, err
+	} else if duplicate {
+		return model.Rule{}, fmt.Errorf("%w: rule (%d, %s)", ErrDuplicateNaturalKey, input.MonitorID, name)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
@@ -274,20 +398,30 @@ func (s *Store) UpdateRule(ctx context.Context, id int64, input model.RuleInput)
 	if err != nil {
 		return model.Rule{}, err
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE rules SET monitor_id = ?, name = ?, enabled = ?, condition_json = ?, notify_channel_ids_json = ?, template_id = ?, cooldown_seconds = ?, updated_at = ? WHERE id = ?`,
-		input.MonitorID, strings.TrimSpace(input.Name), boolInt(input.Enabled), string(condition), string(channelIDs), input.TemplateID, input.CooldownSeconds, nowString(), id)
+	quietHours, err := json.Marshal(input.QuietHours)
+	if err != nil {
+		return model.Rule{}, err
+	}
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `UPDATE rules SET monitor_id = ?, name = ?, enabled = ?, condition_json = ?, notify_channel_ids_json = ?, template_id = ?, cooldown_seconds = ?, quiet_hours_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM rules duplicate WHERE duplicate.monitor_id = ? AND duplicate.name = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`,
+		input.MonitorID, name, boolInt(input.Enabled), string(condition), string(channelIDs), input.TemplateID, input.CooldownSeconds, string(quietHours), nowString(), id, input.MonitorID, name, id)
 	if err != nil {
 		return model.Rule{}, err
 	}
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
-		return model.Rule{}, sql.ErrNoRows
+		if exists, lookupErr := s.activeRecordExists(ctx, "rules", id); lookupErr != nil {
+			return model.Rule{}, lookupErr
+		} else if !exists {
+			return model.Rule{}, sql.ErrNoRows
+		}
+		return model.Rule{}, fmt.Errorf("%w: rule (%d, %s)", ErrDuplicateNaturalKey, input.MonitorID, name)
 	}
 	return s.GetRule(ctx, id)
 }
 
 func (s *Store) UpdateRuleFiredAt(ctx context.Context, id int64, firedAt time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE rules SET last_fired_at = ?, updated_at = ? WHERE id = ?`, formatTime(firedAt), nowString(), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE rules SET last_fired_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, formatTime(firedAt), nowString(), id)
 	return err
 }
 
@@ -355,10 +489,18 @@ func (s *Store) GetNotifyChannel(ctx context.Context, id int64) (model.NotifyCha
 func (s *Store) CreateNotifyChannel(ctx context.Context, input model.NotifyChannelInput) (model.NotifyChannel, error) {
 	now := nowString()
 	config := normalizedJSON(input.Config, "{}")
-	res, err := s.db.ExecContext(ctx, `INSERT INTO notify_channels (name, type, enabled, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		strings.TrimSpace(input.Name), input.Type, boolInt(input.Enabled), string(config), now, now)
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO notify_channels (name, type, enabled, config_json, created_at, updated_at)
+		SELECT ?, ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (SELECT 1 FROM notify_channels WHERE name = ? AND type = ? AND deleted_at IS NULL)`,
+		name, input.Type, boolInt(input.Enabled), string(config), now, now, name, input.Type)
 	if err != nil {
 		return model.NotifyChannel{}, err
+	}
+	if duplicate, err := insertWasSkipped(res); err != nil {
+		return model.NotifyChannel{}, err
+	} else if duplicate {
+		return model.NotifyChannel{}, fmt.Errorf("%w: notification channel (%s, %s)", ErrDuplicateNaturalKey, input.Type, name)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
@@ -369,20 +511,32 @@ func (s *Store) CreateNotifyChannel(ctx context.Context, input model.NotifyChann
 
 func (s *Store) UpdateNotifyChannel(ctx context.Context, id int64, input model.NotifyChannelInput) (model.NotifyChannel, error) {
 	config := normalizedJSON(input.Config, "{}")
-	res, err := s.db.ExecContext(ctx, `UPDATE notify_channels SET name = ?, type = ?, enabled = ?, config_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
-		strings.TrimSpace(input.Name), input.Type, boolInt(input.Enabled), string(config), nowString(), id)
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `UPDATE notify_channels SET name = ?, type = ?, enabled = ?, config_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM notify_channels duplicate WHERE duplicate.name = ? AND duplicate.type = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`,
+		name, input.Type, boolInt(input.Enabled), string(config), nowString(), id, name, input.Type, id)
 	if err != nil {
 		return model.NotifyChannel{}, err
 	}
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
-		return model.NotifyChannel{}, sql.ErrNoRows
+		if exists, lookupErr := s.activeRecordExists(ctx, "notify_channels", id); lookupErr != nil {
+			return model.NotifyChannel{}, lookupErr
+		} else if !exists {
+			return model.NotifyChannel{}, sql.ErrNoRows
+		}
+		return model.NotifyChannel{}, fmt.Errorf("%w: notification channel (%s, %s)", ErrDuplicateNaturalKey, input.Type, name)
 	}
 	return s.GetNotifyChannel(ctx, id)
 }
 
 func (s *Store) DeleteNotifyChannel(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE notify_channels SET enabled = 0, deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, nowString(), nowString(), id)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := nowString()
+	res, err := tx.ExecContext(ctx, `UPDATE notify_channels SET enabled = 0, deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, now, now, id)
 	if err != nil {
 		return err
 	}
@@ -390,11 +544,96 @@ func (s *Store) DeleteNotifyChannel(ctx context.Context, id int64) error {
 	if affected == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+
+	type jsonReference struct {
+		id  int64
+		raw string
+	}
+	ruleRows, err := tx.QueryContext(ctx, `SELECT id, notify_channel_ids_json FROM rules WHERE deleted_at IS NULL`)
+	if err != nil {
+		return err
+	}
+	ruleReferences := make([]jsonReference, 0)
+	for ruleRows.Next() {
+		var item jsonReference
+		if err := ruleRows.Scan(&item.id, &item.raw); err != nil {
+			ruleRows.Close()
+			return err
+		}
+		ruleReferences = append(ruleReferences, item)
+	}
+	if err := ruleRows.Err(); err != nil {
+		ruleRows.Close()
+		return err
+	}
+	ruleRows.Close()
+	for _, reference := range ruleReferences {
+		ids, changed, err := removeJSONID(reference.raw, id)
+		if err != nil {
+			return fmt.Errorf("remove channel from rule %d: %w", reference.id, err)
+		}
+		if !changed {
+			continue
+		}
+		if len(ids) == 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE rules SET enabled = 0, deleted_at = ?, notify_channel_ids_json = '[]', updated_at = ? WHERE id = ? AND deleted_at IS NULL`, now, now, reference.id); err != nil {
+				return err
+			}
+			continue
+		}
+		encoded, _ := json.Marshal(ids)
+		if _, err := tx.ExecContext(ctx, `UPDATE rules SET notify_channel_ids_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, string(encoded), now, reference.id); err != nil {
+			return err
+		}
+	}
+
+	monitorRows, err := tx.QueryContext(ctx, `SELECT id, failure_notify_channel_ids_json FROM monitors WHERE deleted_at IS NULL`)
+	if err != nil {
+		return err
+	}
+	monitorReferences := make([]jsonReference, 0)
+	for monitorRows.Next() {
+		var item jsonReference
+		if err := monitorRows.Scan(&item.id, &item.raw); err != nil {
+			monitorRows.Close()
+			return err
+		}
+		monitorReferences = append(monitorReferences, item)
+	}
+	if err := monitorRows.Err(); err != nil {
+		monitorRows.Close()
+		return err
+	}
+	monitorRows.Close()
+	for _, reference := range monitorReferences {
+		ids, changed, err := removeJSONID(reference.raw, id)
+		if err != nil {
+			return fmt.Errorf("remove failure channel from monitor %d: %w", reference.id, err)
+		}
+		if !changed {
+			continue
+		}
+		encoded, _ := json.Marshal(ids)
+		if len(ids) == 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE monitors SET failure_alert_after = 0, failure_notify_channel_ids_json = ?, failure_alert_active = 0, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, string(encoded), now, reference.id); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE monitors SET failure_notify_channel_ids_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, string(encoded), now, reference.id); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE notification_attempts SET next_retry_at = NULL, retry_claimed_at = NULL,
+		error = CASE WHEN error = '' THEN 'retry stopped: channel archived' ELSE error || '; retry stopped: channel archived' END
+		WHERE channel_id = ? AND status = 'failed' AND next_retry_at IS NOT NULL`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ListNotificationTemplates(ctx context.Context) ([]model.NotificationTemplate, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, subject_template, body_template, created_at, updated_at FROM notification_templates WHERE deleted_at IS NULL ORDER BY id DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, subject_template, body_template, is_default, created_at, updated_at FROM notification_templates WHERE deleted_at IS NULL ORDER BY is_default DESC, id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -411,16 +650,29 @@ func (s *Store) ListNotificationTemplates(ctx context.Context) ([]model.Notifica
 }
 
 func (s *Store) GetNotificationTemplate(ctx context.Context, id int64) (model.NotificationTemplate, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, subject_template, body_template, created_at, updated_at FROM notification_templates WHERE id = ? AND deleted_at IS NULL`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, subject_template, body_template, is_default, created_at, updated_at FROM notification_templates WHERE id = ? AND deleted_at IS NULL`, id)
+	return scanNotificationTemplate(row)
+}
+
+func (s *Store) GetDefaultNotificationTemplate(ctx context.Context) (model.NotificationTemplate, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, subject_template, body_template, is_default, created_at, updated_at FROM notification_templates WHERE is_default = 1 AND deleted_at IS NULL LIMIT 1`)
 	return scanNotificationTemplate(row)
 }
 
 func (s *Store) CreateNotificationTemplate(ctx context.Context, input model.NotificationTemplateInput) (model.NotificationTemplate, error) {
 	now := nowString()
-	res, err := s.db.ExecContext(ctx, `INSERT INTO notification_templates (name, subject_template, body_template, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
-		strings.TrimSpace(input.Name), input.SubjectTemplate, input.BodyTemplate, now, now)
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO notification_templates (name, subject_template, body_template, created_at, updated_at)
+		SELECT ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (SELECT 1 FROM notification_templates WHERE name = ? AND deleted_at IS NULL)`,
+		name, input.SubjectTemplate, input.BodyTemplate, now, now, name)
 	if err != nil {
 		return model.NotificationTemplate{}, err
+	}
+	if duplicate, err := insertWasSkipped(res); err != nil {
+		return model.NotificationTemplate{}, err
+	} else if duplicate {
+		return model.NotificationTemplate{}, fmt.Errorf("%w: notification template (%s)", ErrDuplicateNaturalKey, name)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
@@ -430,20 +682,32 @@ func (s *Store) CreateNotificationTemplate(ctx context.Context, input model.Noti
 }
 
 func (s *Store) UpdateNotificationTemplate(ctx context.Context, id int64, input model.NotificationTemplateInput) (model.NotificationTemplate, error) {
-	res, err := s.db.ExecContext(ctx, `UPDATE notification_templates SET name = ?, subject_template = ?, body_template = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
-		strings.TrimSpace(input.Name), input.SubjectTemplate, input.BodyTemplate, nowString(), id)
+	name := strings.TrimSpace(input.Name)
+	res, err := s.db.ExecContext(ctx, `UPDATE notification_templates SET name = ?, subject_template = ?, body_template = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM notification_templates duplicate WHERE duplicate.name = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`,
+		name, input.SubjectTemplate, input.BodyTemplate, nowString(), id, name, id)
 	if err != nil {
 		return model.NotificationTemplate{}, err
 	}
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
-		return model.NotificationTemplate{}, sql.ErrNoRows
+		if exists, lookupErr := s.activeRecordExists(ctx, "notification_templates", id); lookupErr != nil {
+			return model.NotificationTemplate{}, lookupErr
+		} else if !exists {
+			return model.NotificationTemplate{}, sql.ErrNoRows
+		}
+		return model.NotificationTemplate{}, fmt.Errorf("%w: notification template (%s)", ErrDuplicateNaturalKey, name)
 	}
 	return s.GetNotificationTemplate(ctx, id)
 }
 
 func (s *Store) DeleteNotificationTemplate(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE notification_templates SET deleted_at = ?, updated_at = ? WHERE id = ? AND id <> 1 AND deleted_at IS NULL`, nowString(), nowString(), id)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := nowString()
+	res, err := tx.ExecContext(ctx, `UPDATE notification_templates SET deleted_at = ?, updated_at = ? WHERE id = ? AND is_default = 0 AND deleted_at IS NULL`, now, now, id)
 	if err != nil {
 		return err
 	}
@@ -451,7 +715,12 @@ func (s *Store) DeleteNotificationTemplate(ctx context.Context, id int64) error 
 	if affected == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+	// A nil template means "use the default template" and keeps every active
+	// rule valid after a custom template is archived.
+	if _, err := tx.ExecContext(ctx, `UPDATE rules SET template_id = NULL, updated_at = ? WHERE template_id = ? AND deleted_at IS NULL`, now, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CreateEvent(ctx context.Context, monitorID int64, event model.EventData) (model.Event, bool, error) {
@@ -512,23 +781,8 @@ func (s *Store) getEventByFingerprint(ctx context.Context, monitorID int64, fing
 }
 
 func (s *Store) ListEvents(ctx context.Context, limit int) ([]model.Event, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 100
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT e.id, e.monitor_id, l.check_run_id, e.type, e.fingerprint, e.payload_json, e.created_at FROM events e LEFT JOIN event_check_runs l ON l.event_id = e.id ORDER BY e.id DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := make([]model.Event, 0)
-	for rows.Next() {
-		item, err := scanEvent(rows)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	return items, rows.Err()
+	page, err := s.ListEventsPage(ctx, EventFilter{PageRequest: PageRequest{Page: 1, PageSize: normalizeLimit(limit)}})
+	return page.Items, err
 }
 
 func (s *Store) CreateNotificationLog(ctx context.Context, eventID, channelID int64, status string, sendErr error) error {
@@ -571,21 +825,52 @@ type scanner interface {
 
 func scanMonitor(row scanner) (model.Monitor, error) {
 	var item model.Monitor
-	var enabled int
-	var config, state string
+	var enabled, failureAlertActive int
+	var config, state, failureChannelIDs string
 	var lastChecked sql.NullString
 	var createdAt, updatedAt string
-	err := row.Scan(&item.ID, &item.Name, &item.Type, &enabled, &item.IntervalSeconds, &config, &state, &lastChecked, &item.LastStatus, &item.LastMessage, &item.LastError, &item.ConsecutiveFailures, &createdAt, &updatedAt)
+	err := row.Scan(&item.ID, &item.Name, &item.Type, &enabled, &item.IntervalSeconds, &config, &state, &lastChecked, &item.LastStatus, &item.LastMessage, &item.LastError, &item.ConsecutiveFailures, &item.FailureAlertAfter, &failureChannelIDs, &failureAlertActive, &createdAt, &updatedAt)
 	if err != nil {
 		return model.Monitor{}, err
 	}
 	item.Enabled = enabled == 1
+	item.FailureAlertActive = failureAlertActive == 1
 	item.Config = json.RawMessage(defaultJSON(config, "{}"))
 	item.State = json.RawMessage(defaultJSON(state, "{}"))
+	if err := json.Unmarshal([]byte(defaultJSON(failureChannelIDs, "[]")), &item.FailureNotifyChannelIDs); err != nil {
+		return model.Monitor{}, err
+	}
+	if item.FailureNotifyChannelIDs == nil {
+		item.FailureNotifyChannelIDs = []int64{}
+	}
 	item.LastCheckedAt = parseTimePtr(lastChecked)
 	item.CreatedAt = parseTime(createdAt)
 	item.UpdatedAt = parseTime(updatedAt)
 	return item, nil
+}
+
+func normalizedIDs(ids []int64) []int64 {
+	if ids == nil {
+		return []int64{}
+	}
+	return ids
+}
+
+func removeJSONID(raw string, remove int64) ([]int64, bool, error) {
+	var ids []int64
+	if err := json.Unmarshal([]byte(defaultJSON(raw, "[]")), &ids); err != nil {
+		return nil, false, err
+	}
+	filtered := make([]int64, 0, len(ids))
+	changed := false
+	for _, id := range ids {
+		if id == remove {
+			changed = true
+			continue
+		}
+		filtered = append(filtered, id)
+	}
+	return filtered, changed, nil
 }
 
 func scanRules(rows *sql.Rows) ([]model.Rule, error) {
@@ -603,11 +888,11 @@ func scanRules(rows *sql.Rows) ([]model.Rule, error) {
 func scanRule(row scanner) (model.Rule, error) {
 	var item model.Rule
 	var enabled int
-	var condition, channelIDs string
+	var condition, channelIDs, quietHours string
 	var templateID sql.NullInt64
 	var lastFired sql.NullString
 	var createdAt, updatedAt string
-	err := row.Scan(&item.ID, &item.MonitorID, &item.Name, &enabled, &condition, &channelIDs, &templateID, &item.CooldownSeconds, &lastFired, &createdAt, &updatedAt)
+	err := row.Scan(&item.ID, &item.MonitorID, &item.Name, &enabled, &condition, &channelIDs, &templateID, &item.CooldownSeconds, &quietHours, &lastFired, &createdAt, &updatedAt)
 	if err != nil {
 		return model.Rule{}, err
 	}
@@ -617,6 +902,9 @@ func scanRule(row scanner) (model.Rule, error) {
 		item.TemplateID = &templateID.Int64
 	}
 	if err := json.Unmarshal([]byte(defaultJSON(channelIDs, "[]")), &item.NotifyChannelIDs); err != nil {
+		return model.Rule{}, err
+	}
+	if err := json.Unmarshal([]byte(defaultJSON(quietHours, "{}")), &item.QuietHours); err != nil {
 		return model.Rule{}, err
 	}
 	item.LastFiredAt = parseTimePtr(lastFired)
@@ -643,11 +931,13 @@ func scanNotifyChannel(row scanner) (model.NotifyChannel, error) {
 
 func scanNotificationTemplate(row scanner) (model.NotificationTemplate, error) {
 	var item model.NotificationTemplate
+	var isDefault int
 	var createdAt, updatedAt string
-	err := row.Scan(&item.ID, &item.Name, &item.SubjectTemplate, &item.BodyTemplate, &createdAt, &updatedAt)
+	err := row.Scan(&item.ID, &item.Name, &item.SubjectTemplate, &item.BodyTemplate, &isDefault, &createdAt, &updatedAt)
 	if err != nil {
 		return model.NotificationTemplate{}, err
 	}
+	item.IsDefault = isDefault == 1
 	item.CreatedAt = parseTime(createdAt)
 	item.UpdatedAt = parseTime(updatedAt)
 	return item, nil
@@ -754,6 +1044,27 @@ func parseTimePtr(value sql.NullString) *time.Time {
 		return nil
 	}
 	return &parsed
+}
+
+func insertWasSkipped(result sql.Result) (bool, error) {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 0, nil
+}
+
+func (s *Store) activeRecordExists(ctx context.Context, table string, id int64) (bool, error) {
+	switch table {
+	case "monitors", "rules", "notify_channels", "notification_templates":
+	default:
+		return false, fmt.Errorf("unsupported active record table %q", table)
+	}
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %s WHERE id = ? AND deleted_at IS NULL)`, table), id).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 func IsNotFound(err error) bool {
