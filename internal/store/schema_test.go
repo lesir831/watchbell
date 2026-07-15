@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,45 @@ import (
 
 	"github.com/watchbell/watchbell/internal/model"
 )
+
+func TestDefaultTemplateFlagMigratesLegacyDatabase(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.Exec(`CREATE TABLE notification_templates (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		subject_template TEXT NOT NULL,
+		body_template TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);
+	INSERT INTO notification_templates (id, name, subject_template, body_template, created_at, updated_at)
+	VALUES (1, 'Legacy default', 'subject', 'body', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');`)
+	if err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	template, err := db.GetDefaultNotificationTemplate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if template.ID != 1 || !template.IsDefault {
+		t.Fatalf("legacy default was not migrated: %#v", template)
+	}
+}
 
 func TestDefaultTemplateIncludesGitHubReleaseAndMigratesOldDefault(t *testing.T) {
 	ctx := context.Background()
@@ -24,6 +64,9 @@ func TestDefaultTemplateIncludesGitHubReleaseAndMigratesOldDefault(t *testing.T)
 	}
 	if !strings.Contains(template.BodyTemplate, "${github.release.tagName}") {
 		t.Fatalf("default template does not include GitHub release variables: %q", template.BodyTemplate)
+	}
+	if !template.IsDefault {
+		t.Fatal("seeded template is not marked as the default")
 	}
 
 	oldDefault := `Monitor: ${monitor.name}
@@ -83,5 +126,45 @@ func TestMonitorUpdateOnlyResetsStateWhenConfigMeaningChanges(t *testing.T) {
 	changed, _ := store.GetMonitor(ctx, monitor.ID)
 	if changed.LastCheckedAt != nil || changed.LastStatus != "" {
 		t.Fatal("meaningful config changes must reset checker state")
+	}
+}
+
+func TestSQLiteConnectionPragmasApplyAcrossPool(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "watchbell.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	connections := make([]*sql.Conn, 0, 4)
+	for range 4 {
+		connection, err := store.db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		connections = append(connections, connection)
+	}
+	defer func() {
+		for _, connection := range connections {
+			_ = connection.Close()
+		}
+	}()
+
+	for index, connection := range connections {
+		var foreignKeys, busyTimeout int
+		var journalMode string
+		if err := connection.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+			t.Fatal(err)
+		}
+		if err := connection.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+			t.Fatal(err)
+		}
+		if err := connection.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+			t.Fatal(err)
+		}
+		if foreignKeys != 1 || busyTimeout != 5000 || !strings.EqualFold(journalMode, "wal") {
+			t.Fatalf("connection %d pragmas = foreign_keys:%d busy_timeout:%d journal_mode:%q", index, foreignKeys, busyTimeout, journalMode)
+		}
 	}
 }

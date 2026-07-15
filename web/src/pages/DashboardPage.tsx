@@ -2,20 +2,22 @@ import { Alert, Button, Card, Col, List, Progress, Row, Skeleton, Space, Statist
 import { CheckCircleOutlined, ExclamationCircleOutlined, NotificationOutlined, PlusOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api';
-import { formatDuration, relativeDate, StatusTag } from '../components/Common';
+import { formatDuration, PageError, relativeDate, StatusTag } from '../components/Common';
 import type { CheckRun, Monitor, NotificationAttempt } from '../types';
 
 const { Text, Title } = Typography;
 
 export default function DashboardPage({ onNavigate }: { onNavigate: (page: string) => void }) {
-  const summary = useQuery({ queryKey: ['dashboard'], queryFn: api.dashboard });
-  const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors });
-  const runs = useQuery({ queryKey: ['checkRuns'], queryFn: api.listCheckRuns });
-  const attempts = useQuery({ queryKey: ['notificationAttempts'], queryFn: api.listNotificationAttempts });
+  const summary = useQuery({ queryKey: ['dashboard'], queryFn: api.dashboard, refetchInterval: 20_000 });
+  const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors, refetchInterval: 20_000 });
+  const runs = useQuery({ queryKey: ['checkRuns'], queryFn: api.listCheckRuns, refetchInterval: 20_000 });
+  const attempts = useQuery({ queryKey: ['notificationAttempts'], queryFn: api.listNotificationAttempts, refetchInterval: 20_000 });
   const system = useQuery({ queryKey: ['systemStatus'], queryFn: api.systemStatus, refetchInterval: 30_000 });
 
-  if (summary.isLoading) return <Skeleton active />;
+  if (summary.isLoading || monitors.isLoading) return <Skeleton active />;
+  if (summary.isError) return <PageError error={summary.error as Error} onRetry={() => summary.refetch()} />;
   const data = summary.data;
+  const loadingError = monitors.error || runs.error || attempts.error || system.error;
   const enabled = (monitors.data ?? []).filter((item) => item.enabled);
   const healthyRate = enabled.length === 0 ? 0 : Math.round(((data?.healthyMonitors ?? 0) / enabled.length) * 100);
   const unhealthy = enabled.filter((item) => ['error', 'warning'].includes(item.lastStatus ?? ''));
@@ -25,7 +27,8 @@ export default function DashboardPage({ onNavigate }: { onNavigate: (page: strin
 
   return (
     <Space direction="vertical" size={20} className="full-width">
-      {system.data?.database !== 'ok' && <Alert type="error" showIcon message="数据库不可用" description="请打开活动与诊断页面查看系统状态。" />}
+      <PageError error={loadingError as Error | null} onRetry={() => { monitors.refetch(); runs.refetch(); attempts.refetch(); system.refetch(); }} />
+      {system.data && system.data.database !== 'ok' && <Alert type="error" showIcon message="数据库不可用" description="请打开活动与诊断页面查看系统状态。" />}
       {setupIncomplete && (
         <Card className="onboarding-card" bordered={false}>
           <div className="onboarding-copy">

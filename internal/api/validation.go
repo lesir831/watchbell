@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/mail"
 	"net/url"
 	"strings"
 
 	"github.com/watchbell/watchbell/internal/model"
+	"github.com/watchbell/watchbell/internal/notifier"
 	"github.com/watchbell/watchbell/internal/rule"
 )
 
@@ -27,7 +29,25 @@ func validationProblem(message string, fields map[string]string) error {
 	return &problemError{Status: 422, Code: "validation_failed", Message: message, Fields: fields}
 }
 
-func (s *Server) validateMonitorInput(input model.MonitorInput) error {
+func (s *Server) validateMonitorInput(ctx context.Context, input model.MonitorInput) error {
+	return s.validateMonitorInputWithChannelLookup(ctx, input, true)
+}
+
+func (s *Server) validateMonitorNaturalKey(ctx context.Context, input model.MonitorInput, excludeID int64) error {
+	items, err := s.store.ListMonitors(ctx)
+	if err != nil {
+		return err
+	}
+	name := strings.TrimSpace(input.Name)
+	for _, item := range items {
+		if item.ID != excludeID && item.Type == input.Type && strings.TrimSpace(item.Name) == name {
+			return validationProblem("监控名称与类型不能重复。", map[string]string{"name": "已存在同名、同类型的监控。"})
+		}
+	}
+	return nil
+}
+
+func (s *Server) validateMonitorInputWithChannelLookup(ctx context.Context, input model.MonitorInput, lookupChannels bool) error {
 	fields := map[string]string{}
 	if strings.TrimSpace(input.Name) == "" {
 		fields["name"] = "请输入名称。"
@@ -37,6 +57,30 @@ func (s *Server) validateMonitorInput(input model.MonitorInput) error {
 	}
 	if input.IntervalSeconds < 30 || input.IntervalSeconds > 2_592_000 {
 		fields["intervalSeconds"] = "检查间隔必须在 30 秒到 30 天之间。"
+	}
+	if input.FailureAlertAfter < 0 || input.FailureAlertAfter > 100 {
+		fields["failureAlertAfter"] = "故障告警阈值必须在 1 到 100 次之间，或设为 0 关闭。"
+	}
+	if input.FailureAlertAfter > 0 && len(input.FailureNotifyChannelIDs) == 0 {
+		fields["failureNotifyChannelIds"] = "启用故障告警时，请至少选择一个通知渠道。"
+	}
+	seenChannels := map[int64]struct{}{}
+	for index, id := range input.FailureNotifyChannelIDs {
+		field := fmt.Sprintf("failureNotifyChannelIds.%d", index)
+		if id <= 0 {
+			fields[field] = "通知渠道 ID 必须为正整数。"
+			continue
+		}
+		if _, duplicate := seenChannels[id]; duplicate {
+			fields[field] = "通知渠道不能重复。"
+			continue
+		}
+		seenChannels[id] = struct{}{}
+		if lookupChannels {
+			if _, err := s.store.GetNotifyChannel(ctx, id); err != nil {
+				fields[field] = fmt.Sprintf("通知渠道 %d 不存在。", id)
+			}
+		}
 	}
 	config, err := decodeJSONObject(input.Config)
 	if err != nil {
@@ -49,7 +93,9 @@ func (s *Server) validateMonitorInput(input model.MonitorInput) error {
 			for _, field := range plugin.ConfigFields {
 				if field.Required && isEmptyConfigValue(config[field.Key]) {
 					fields["config."+field.Key] = "请填写" + field.Label + "。"
+					continue
 				}
+				validatePluginConfigFieldType(config, field, fields)
 			}
 		}
 		validateMonitorConfig(input.Type, config, fields)
@@ -58,6 +104,41 @@ func (s *Server) validateMonitorInput(input model.MonitorInput) error {
 		return validationProblem("请修正监控配置中的问题。", fields)
 	}
 	return nil
+}
+
+func validatePluginConfigFieldType(config map[string]any, field model.PluginConfigField, fields map[string]string) {
+	value, present := config[field.Key]
+	if !present || value == nil || isEmptyConfigValue(value) {
+		return
+	}
+	problemField := "config." + field.Key
+	switch field.Type {
+	case "string", "secret", "url", "textarea":
+		if _, ok := value.(string); !ok {
+			fields[problemField] = field.Label + "必须是字符串。"
+		}
+	case "number":
+		number, ok := value.(float64)
+		if !ok || math.Trunc(number) != number {
+			fields[problemField] = field.Label + "必须是整数。"
+		}
+	case "boolean":
+		if _, ok := value.(bool); !ok {
+			fields[problemField] = field.Label + "必须是布尔值。"
+		}
+	case "string-list":
+		items, ok := value.([]any)
+		if !ok {
+			fields[problemField] = field.Label + "必须是字符串数组。"
+			return
+		}
+		for _, item := range items {
+			if _, ok := item.(string); !ok {
+				fields[problemField] = field.Label + "必须是字符串数组。"
+				return
+			}
+		}
+	}
 }
 
 func validateMonitorConfig(monitorType string, config map[string]any, fields map[string]string) {
@@ -95,6 +176,9 @@ func (s *Server) validateRuleInput(ctx context.Context, input model.RuleInput) e
 	if input.CooldownSeconds < 0 || input.CooldownSeconds > 31_536_000 {
 		fields["cooldownSeconds"] = "冷却时间必须在 0 到 365 天之间。"
 	}
+	if field, err := rule.ValidateQuietHours(input.QuietHours); err != nil {
+		fields["quietHours."+field] = err.Error()
+	}
 	if len(input.NotifyChannelIDs) == 0 {
 		fields["notifyChannelIds"] = "请至少选择一个通知渠道。"
 	}
@@ -116,6 +200,20 @@ func (s *Server) validateRuleInput(ctx context.Context, input model.RuleInput) e
 	}
 	if len(fields) > 0 {
 		return validationProblem("请修正规则配置中的问题。", fields)
+	}
+	return nil
+}
+
+func (s *Server) validateRuleNaturalKey(ctx context.Context, input model.RuleInput, excludeID int64) error {
+	items, err := s.store.ListRules(ctx)
+	if err != nil {
+		return err
+	}
+	name := strings.TrimSpace(input.Name)
+	for _, item := range items {
+		if item.ID != excludeID && item.MonitorID == input.MonitorID && strings.TrimSpace(item.Name) == name {
+			return validationProblem("同一监控下的规则名称不能重复。", map[string]string{"name": "这个监控已有同名规则。"})
+		}
 	}
 	return nil
 }
@@ -148,47 +246,80 @@ func validateChannelInput(input model.NotifyChannelInput) error {
 	if strings.TrimSpace(input.Name) == "" {
 		fields["name"] = "请输入渠道名称。"
 	}
-	if input.Type != model.ChannelTypeBark && input.Type != model.ChannelTypeEmail {
+	if input.Type != model.ChannelTypeBark && input.Type != model.ChannelTypeEmail && input.Type != model.ChannelTypeWebhook {
 		fields["type"] = "请选择支持的渠道类型。"
 	}
-	config, err := decodeJSONObject(input.Config)
+	_, err := decodeJSONObject(input.Config)
 	if err != nil {
 		fields["config"] = err.Error()
 	} else if input.Type == model.ChannelTypeBark {
-		if strings.TrimSpace(stringValue(config["deviceKey"])) == "" {
-			fields["config.deviceKey"] = "请填写设备密钥。"
-		}
-		if raw := stringValue(config["serverUrl"]); raw != "" && !validHTTPURL(raw) {
-			fields["config.serverUrl"] = "服务地址必须是有效的 HTTP 或 HTTPS URL。"
+		var cfg notifier.BarkConfig
+		if err := json.Unmarshal(input.Config, &cfg); err != nil {
+			fields["config"] = "Bark 配置字段类型无效：" + err.Error()
+		} else {
+			if strings.TrimSpace(cfg.DeviceKey) == "" {
+				fields["config.deviceKey"] = "请填写设备密钥。"
+			}
+			if raw := strings.TrimSpace(cfg.ServerURL); raw != "" && !validHTTPURL(raw) {
+				fields["config.serverUrl"] = "服务地址必须是有效的 HTTP 或 HTTPS URL。"
+			}
+			if raw := strings.TrimSpace(cfg.Icon); raw != "" && !validHTTPURL(raw) {
+				fields["config.icon"] = "图标必须是有效的 HTTP 或 HTTPS URL。"
+			}
 		}
 	} else if input.Type == model.ChannelTypeEmail {
-		if strings.TrimSpace(stringValue(config["host"])) == "" {
-			fields["config.host"] = "请填写 SMTP 主机。"
-		}
-		if value, ok := numberValue(config["port"]); !ok || value < 1 || value > 65535 {
-			fields["config.port"] = "端口必须在 1 到 65535 之间。"
-		}
-		from := stringValue(config["from"])
-		if from == "" {
-			from = stringValue(config["username"])
-		}
-		if _, err := mail.ParseAddress(from); err != nil {
-			fields["config.from"] = "发件人必须是有效的邮件地址。"
-		}
-		to, ok := config["to"].([]any)
-		if !ok || len(to) == 0 {
-			fields["config.to"] = "请至少添加一个收件人。"
+		var cfg notifier.EmailConfig
+		if err := json.Unmarshal(input.Config, &cfg); err != nil {
+			fields["config"] = "邮件配置字段类型无效：" + err.Error()
 		} else {
-			for _, value := range to {
-				if _, err := mail.ParseAddress(fmt.Sprint(value)); err != nil {
-					fields["config.to"] = "每个收件人都必须是有效的邮件地址。"
-					break
+			if strings.TrimSpace(cfg.Host) == "" {
+				fields["config.host"] = "请填写 SMTP 主机。"
+			}
+			if cfg.Port < 1 || cfg.Port > 65535 {
+				fields["config.port"] = "端口必须在 1 到 65535 之间。"
+			}
+			from := strings.TrimSpace(cfg.From)
+			if from == "" {
+				from = strings.TrimSpace(cfg.Username)
+			}
+			if _, err := mail.ParseAddress(from); err != nil {
+				fields["config.from"] = "发件人必须是有效的邮件地址。"
+			}
+			if len(cfg.To) == 0 {
+				fields["config.to"] = "请至少添加一个收件人。"
+			} else {
+				for _, value := range cfg.To {
+					if _, err := mail.ParseAddress(value); err != nil {
+						fields["config.to"] = "每个收件人都必须是有效的邮件地址。"
+						break
+					}
 				}
 			}
+			if cfg.StartTLS && cfg.ImplicitTLS {
+				fields["config.implicitTls"] = "STARTTLS 与隐式 TLS 只能启用一种。"
+			}
+		}
+	} else if input.Type == model.ChannelTypeWebhook {
+		if err := notifier.ValidateWebhookConfig(input.Config); err != nil {
+			fields["config"] = "Webhook 配置无效：" + err.Error()
 		}
 	}
 	if len(fields) > 0 {
 		return validationProblem("请修正通知渠道配置中的问题。", fields)
+	}
+	return nil
+}
+
+func (s *Server) validateChannelNaturalKey(ctx context.Context, input model.NotifyChannelInput, excludeID int64) error {
+	items, err := s.store.ListNotifyChannels(ctx)
+	if err != nil {
+		return err
+	}
+	name := strings.TrimSpace(input.Name)
+	for _, item := range items {
+		if item.ID != excludeID && item.Type == input.Type && strings.TrimSpace(item.Name) == name {
+			return validationProblem("通知渠道名称与类型不能重复。", map[string]string{"name": "已存在同名、同类型的通知渠道。"})
+		}
 	}
 	return nil
 }
@@ -206,6 +337,20 @@ func validateTemplateInput(input model.NotificationTemplateInput) error {
 	}
 	if len(fields) > 0 {
 		return validationProblem("请修正通知模板中的问题。", fields)
+	}
+	return nil
+}
+
+func (s *Server) validateTemplateNaturalKey(ctx context.Context, input model.NotificationTemplateInput, excludeID int64) error {
+	items, err := s.store.ListNotificationTemplates(ctx)
+	if err != nil {
+		return err
+	}
+	name := strings.TrimSpace(input.Name)
+	for _, item := range items {
+		if item.ID != excludeID && strings.TrimSpace(item.Name) == name {
+			return validationProblem("通知模板名称不能重复。", map[string]string{"name": "已存在同名通知模板。"})
+		}
 	}
 	return nil
 }

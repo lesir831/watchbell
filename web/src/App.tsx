@@ -22,16 +22,18 @@ import {
   UnorderedListOutlined
 } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api, APIError } from './api';
+import { api, APIError, AUTH_EXPIRED_EVENT } from './api';
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage'));
 const MonitorsPage = lazy(() => import('./pages/MonitorsPage'));
+const MonitorDetailPage = lazy(() => import('./pages/MonitorDetailPage'));
 const RulesPage = lazy(() => import('./pages/RulesPage'));
 const ChannelsPage = lazy(() => import('./pages/ChannelsPage'));
 const TemplatesPage = lazy(() => import('./pages/TemplatesPage'));
 const ActivityPage = lazy(() => import('./pages/ActivityPage'));
 
-type PageKey = 'dashboard' | 'monitors' | 'rules' | 'channels' | 'templates' | 'activity';
+type PageKey = 'dashboard' | 'monitors' | 'monitorDetail' | 'rules' | 'channels' | 'templates' | 'activity';
+type RouteState = { page: PageKey; monitorId?: number };
 
 const { Header, Sider, Content } = Layout;
 const { Text, Title } = Typography;
@@ -50,6 +52,7 @@ export default function App() {
 }
 
 function AuthGate() {
+  const queryClient = useQueryClient();
   const status = useQuery({ queryKey: ['authStatus'], queryFn: api.authStatus, retry: false });
   const me = useQuery({
     queryKey: ['authMe'],
@@ -57,6 +60,12 @@ function AuthGate() {
     enabled: status.data?.enabled === true,
     retry: false
   });
+
+  useEffect(() => {
+    const expireSession = () => { void queryClient.resetQueries({ queryKey: ['authMe'], exact: true }); };
+    window.addEventListener(AUTH_EXPIRED_EVENT, expireSession);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, expireSession);
+  }, [queryClient]);
 
   if (status.isLoading || (status.data?.enabled && me.isLoading)) {
     return <LoadingScreen />;
@@ -116,7 +125,7 @@ function Shell(props: { authEnabled: boolean; username: string }) {
   const screens = Grid.useBreakpoint();
   const mobile = !screens.md;
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [page, setPage] = useState<PageKey>(() => pageFromHash());
+  const [route, setRoute] = useState<RouteState>(() => routeFromHash());
   const queryClient = useQueryClient();
   const logout = useMutation({
     mutationFn: api.logout,
@@ -124,7 +133,7 @@ function Shell(props: { authEnabled: boolean; username: string }) {
   });
 
   useEffect(() => {
-    const onHashChange = () => setPage(pageFromHash());
+    const onHashChange = () => setRoute(routeFromHash());
     window.addEventListener('hashchange', onHashChange);
     if (!window.location.hash) window.history.replaceState(null, '', '#/dashboard');
     return () => window.removeEventListener('hashchange', onHashChange);
@@ -135,7 +144,7 @@ function Shell(props: { authEnabled: boolean; username: string }) {
     setMobileMenuOpen(false);
   };
   const menu = (
-    <Menu theme="dark" mode="inline" selectedKeys={[page]} onClick={({ key }) => navigate(key)} items={pageItems} />
+    <Menu theme="dark" mode="inline" selectedKeys={[route.page === 'monitorDetail' ? 'monitors' : route.page]} onClick={({ key }) => navigate(key)} items={pageItems} />
   );
 
   return (
@@ -155,7 +164,7 @@ function Shell(props: { authEnabled: boolean; username: string }) {
         <Header className="app-header">
           <div className="header-title">
             {mobile && <Button type="text" icon={<MenuOutlined />} aria-label="打开导航" onClick={() => setMobileMenuOpen(true)} />}
-            <Title level={4}>{titleForPage(page)}</Title>
+            <Title level={4}>{titleForRoute(route)}</Title>
           </div>
           <div className="header-actions">
             {props.authEnabled && <Text type="secondary" className="header-user">{props.username}</Text>}
@@ -168,12 +177,13 @@ function Shell(props: { authEnabled: boolean; username: string }) {
         </Header>
         <Content className="app-content">
           <Suspense fallback={<div className="page-loading"><Spin /></div>}>
-            {page === 'dashboard' && <DashboardPage onNavigate={navigate} />}
-            {page === 'monitors' && <MonitorsPage />}
-            {page === 'rules' && <RulesPage />}
-            {page === 'channels' && <ChannelsPage />}
-            {page === 'templates' && <TemplatesPage />}
-            {page === 'activity' && <ActivityPage />}
+            {route.page === 'dashboard' && <DashboardPage onNavigate={navigate} />}
+            {route.page === 'monitors' && <MonitorsPage onNavigate={navigate} />}
+            {route.page === 'monitorDetail' && route.monitorId && <MonitorDetailPage monitorId={route.monitorId} onNavigate={navigate} />}
+            {route.page === 'rules' && <RulesPage />}
+            {route.page === 'channels' && <ChannelsPage />}
+            {route.page === 'templates' && <TemplatesPage />}
+            {route.page === 'activity' && <ActivityPage />}
           </Suspense>
         </Content>
       </Layout>
@@ -198,13 +208,15 @@ function ErrorScreen({ error }: { error: Error }) {
   return <div className="center-screen"><Card><Text type="danger">{error.message}</Text></Card></div>;
 }
 
-function pageFromHash(): PageKey {
-  const value = window.location.hash.replace(/^#\/?/, '') as PageKey;
-  return pageItems.some((item) => item.key === value) ? value : 'dashboard';
+function routeFromHash(): RouteState {
+  const value = window.location.hash.replace(/^#\/?/, '');
+  const monitorMatch = value.match(/^monitors\/(\d+)$/);
+  if (monitorMatch && Number(monitorMatch[1]) > 0) return { page: 'monitorDetail', monitorId: Number(monitorMatch[1]) };
+  return pageItems.some((item) => item.key === value) ? { page: value as PageKey } : { page: 'dashboard' };
 }
 
-function titleForPage(page: PageKey) {
+function titleForRoute(route: RouteState) {
   return {
-    dashboard: '运行概览', monitors: '监控', rules: '规则', channels: '通知渠道', templates: '通知模板', activity: '活动与诊断'
-  }[page];
+    dashboard: '运行概览', monitors: '监控', monitorDetail: `监控详情 #${route.monitorId}`, rules: '规则', channels: '通知渠道', templates: '通知模板', activity: '活动与诊断'
+  }[route.page];
 }

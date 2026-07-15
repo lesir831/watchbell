@@ -11,6 +11,9 @@ import (
 	"github.com/watchbell/watchbell/internal/model"
 )
 
+const maxOutboxAttempts = 10
+const notificationRetryLease = 5 * time.Minute
+
 type OutboxItem struct {
 	EventID  int64
 	Attempts int
@@ -55,21 +58,8 @@ func (s *Store) GetCheckRun(ctx context.Context, id int64) (model.CheckRun, erro
 }
 
 func (s *Store) ListCheckRuns(ctx context.Context, limit int) ([]model.CheckRun, error) {
-	limit = normalizeLimit(limit)
-	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, monitor_name, monitor_type, trigger, config_json, status, message, error, event_count, duration_ms, started_at, finished_at, created_at FROM check_runs ORDER BY id DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := make([]model.CheckRun, 0)
-	for rows.Next() {
-		item, err := scanCheckRun(rows)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	return items, rows.Err()
+	page, err := s.ListCheckRunsPage(ctx, CheckRunFilter{PageRequest: PageRequest{Page: 1, PageSize: normalizeLimit(limit)}})
+	return page.Items, err
 }
 
 func (s *Store) CreateRuleEvaluation(ctx context.Context, eventID int64, ruleID *int64, ruleName, status, reason string, matched []string) (model.RuleEvaluation, error) {
@@ -98,21 +88,8 @@ func (s *Store) GetRuleEvaluation(ctx context.Context, id int64) (model.RuleEval
 }
 
 func (s *Store) ListRuleEvaluations(ctx context.Context, limit int) ([]model.RuleEvaluation, error) {
-	limit = normalizeLimit(limit)
-	rows, err := s.db.QueryContext(ctx, `SELECT id, event_id, rule_id, rule_name, status, reason, matched_json, created_at FROM rule_evaluations ORDER BY id DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := make([]model.RuleEvaluation, 0)
-	for rows.Next() {
-		item, err := scanRuleEvaluation(rows)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	return items, rows.Err()
+	page, err := s.ListRuleEvaluationsPage(ctx, RuleEvaluationFilter{PageRequest: PageRequest{Page: 1, PageSize: normalizeLimit(limit)}})
+	return page.Items, err
 }
 
 func (s *Store) CreateNotificationAttempt(ctx context.Context, input model.NotificationAttemptInput) (model.NotificationAttempt, error) {
@@ -122,9 +99,9 @@ func (s *Store) CreateNotificationAttempt(ctx context.Context, input model.Notif
 	if strings.TrimSpace(input.Kind) == "" {
 		input.Kind = "delivery"
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO notification_attempts (event_id, rule_evaluation_id, channel_id, retry_of_id, channel_name, channel_type, kind, status, subject, body, error, attempt_no, duration_ms, sent_at, next_retry_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		nullableInt64(input.EventID), nullableInt64(input.RuleEvaluationID), nullableInt64(input.ChannelID), nullableInt64(input.RetryOfID), input.ChannelName, input.ChannelType,
-		input.Kind, input.Status, input.Subject, input.Body, input.Error, input.AttemptNo, input.DurationMS, formatTimePtr(input.SentAt), formatTimePtr(input.NextRetryAt), nowString())
+	res, err := s.db.ExecContext(ctx, `INSERT INTO notification_attempts (monitor_id, event_id, rule_evaluation_id, channel_id, retry_of_id, channel_name, channel_type, kind, status, subject, body, data_json, error, attempt_no, duration_ms, sent_at, next_retry_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		nullableInt64(input.MonitorID), nullableInt64(input.EventID), nullableInt64(input.RuleEvaluationID), nullableInt64(input.ChannelID), nullableInt64(input.RetryOfID), input.ChannelName, input.ChannelType,
+		input.Kind, input.Status, input.Subject, input.Body, string(normalizedJSON(input.Data, "{}")), input.Error, input.AttemptNo, input.DurationMS, formatTimePtr(input.SentAt), formatTimePtr(input.NextRetryAt), nowString())
 	if err != nil {
 		return model.NotificationAttempt{}, err
 	}
@@ -141,26 +118,14 @@ func (s *Store) GetNotificationAttempt(ctx context.Context, id int64) (model.Not
 }
 
 func (s *Store) ListNotificationAttempts(ctx context.Context, limit int) ([]model.NotificationAttempt, error) {
-	limit = normalizeLimit(limit)
-	rows, err := s.db.QueryContext(ctx, notificationAttemptSelect+` ORDER BY id DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := make([]model.NotificationAttempt, 0)
-	for rows.Next() {
-		item, err := scanNotificationAttempt(rows)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	return items, rows.Err()
+	page, err := s.ListNotificationAttemptsPage(ctx, NotificationAttemptFilter{PageRequest: PageRequest{Page: 1, PageSize: normalizeLimit(limit)}})
+	return page.Items, err
 }
 
 func (s *Store) ListDueNotificationAttempts(ctx context.Context, limit int, now time.Time) ([]model.NotificationAttempt, error) {
 	limit = normalizeLimit(limit)
-	rows, err := s.db.QueryContext(ctx, notificationAttemptSelect+` WHERE status = 'failed' AND next_retry_at IS NOT NULL AND next_retry_at <= ? ORDER BY id ASC LIMIT ?`, formatTime(now), limit)
+	stale := now.UTC().Add(-notificationRetryLease)
+	rows, err := s.db.QueryContext(ctx, notificationAttemptSelect+` WHERE status = 'failed' AND next_retry_at IS NOT NULL AND next_retry_at <= ? AND (retry_claimed_at IS NULL OR retry_claimed_at <= ?) ORDER BY id ASC LIMIT ?`, formatTime(now), formatTime(stale), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -176,8 +141,24 @@ func (s *Store) ListDueNotificationAttempts(ctx context.Context, limit int, now 
 	return items, rows.Err()
 }
 
-func (s *Store) ClaimNotificationAttempt(ctx context.Context, id int64) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `UPDATE notification_attempts SET next_retry_at = NULL WHERE id = ? AND status = 'failed' AND next_retry_at IS NOT NULL`, id)
+func (s *Store) ClaimNotificationAttempt(ctx context.Context, id int64, now time.Time) (bool, error) {
+	return s.claimNotificationAttempt(ctx, id, now, true)
+}
+
+func (s *Store) ClaimNotificationAttemptNow(ctx context.Context, id int64, now time.Time) (bool, error) {
+	return s.claimNotificationAttempt(ctx, id, now, false)
+}
+
+func (s *Store) claimNotificationAttempt(ctx context.Context, id int64, now time.Time, requireDue bool) (bool, error) {
+	now = now.UTC()
+	stale := now.Add(-notificationRetryLease)
+	query := `UPDATE notification_attempts SET retry_claimed_at = ? WHERE id = ? AND status = 'failed' AND (retry_claimed_at IS NULL OR retry_claimed_at <= ?)`
+	args := []any{formatTime(now), id, formatTime(stale)}
+	if requireDue {
+		query += ` AND next_retry_at IS NOT NULL AND next_retry_at <= ?`
+		args = append(args, formatTime(now))
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return false, err
 	}
@@ -186,7 +167,27 @@ func (s *Store) ClaimNotificationAttempt(ctx context.Context, id int64) (bool, e
 }
 
 func (s *Store) CancelNotificationRetry(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE notification_attempts SET next_retry_at = NULL WHERE id = ?`, id)
+	_, err := s.db.ExecContext(ctx, `UPDATE notification_attempts SET next_retry_at = NULL, retry_claimed_at = NULL WHERE id = ?`, id)
+	return err
+}
+
+func (s *Store) StopNotificationRetry(ctx context.Context, id int64, reason string) error {
+	reason = strings.TrimSpace(reason)
+	_, err := s.db.ExecContext(ctx, `UPDATE notification_attempts SET next_retry_at = NULL, retry_claimed_at = NULL,
+		error = CASE WHEN ? = '' THEN error WHEN error = '' THEN ? ELSE error || '; ' || ? END WHERE id = ?`, reason, reason, reason, id)
+	return err
+}
+
+func (s *Store) StopMonitorNotificationRetries(ctx context.Context, monitorID int64, kind, reason string) error {
+	reason = strings.TrimSpace(reason)
+	_, err := s.db.ExecContext(ctx, `UPDATE notification_attempts SET next_retry_at = NULL, retry_claimed_at = NULL,
+		error = CASE WHEN ? = '' THEN error WHEN error = '' THEN ? ELSE error || '; ' || ? END
+		WHERE monitor_id = ? AND kind = ? AND status = 'failed' AND next_retry_at IS NOT NULL`, reason, reason, reason, monitorID, kind)
+	return err
+}
+
+func (s *Store) ReleaseNotificationRetry(ctx context.Context, id int64, next time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE notification_attempts SET next_retry_at = ?, retry_claimed_at = NULL WHERE id = ? AND status = 'failed'`, formatTime(next), id)
 	return err
 }
 
@@ -209,8 +210,17 @@ func (s *Store) ListDueOutbox(ctx context.Context, limit int, now time.Time) ([]
 	return items, rows.Err()
 }
 
-func (s *Store) ClaimOutbox(ctx context.Context, eventID int64) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `UPDATE event_outbox SET status = 'processing', attempts = attempts + 1, updated_at = ? WHERE event_id = ? AND status IN ('pending', 'processing')`, nowString(), eventID)
+func (s *Store) ClaimOutbox(ctx context.Context, eventID int64, now time.Time, requireDue bool) (bool, error) {
+	now = now.UTC()
+	query := `UPDATE event_outbox SET status = 'processing', attempts = attempts + 1, updated_at = ? WHERE event_id = ? AND status = 'pending'`
+	args := []any{formatTime(now), eventID}
+	if requireDue {
+		stale := now.Add(-5 * time.Minute)
+		query = `UPDATE event_outbox SET status = 'processing', attempts = attempts + 1, updated_at = ?
+			WHERE event_id = ? AND ((status = 'pending' AND next_attempt_at <= ?) OR (status = 'processing' AND updated_at <= ?))`
+		args = append(args, formatTime(now), formatTime(stale))
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return false, err
 	}
@@ -237,6 +247,10 @@ func (s *Store) MarkOutboxFailed(ctx context.Context, eventID int64, attempts in
 	if dispatchErr != nil {
 		errText = dispatchErr.Error()
 	}
+	if attempts >= maxOutboxAttempts {
+		_, err := s.db.ExecContext(ctx, `UPDATE event_outbox SET status = 'dead_letter', attempts = ?, last_error = ?, updated_at = ? WHERE event_id = ?`, attempts, errText, nowString(), eventID)
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, `UPDATE event_outbox SET status = 'pending', next_attempt_at = ?, last_error = ?, updated_at = ? WHERE event_id = ?`, formatTime(next), errText, nowString(), eventID)
 	return err
 }
@@ -252,21 +266,8 @@ func (s *Store) CreateAuditLog(ctx context.Context, actor, action, entityType st
 }
 
 func (s *Store) ListAuditLogs(ctx context.Context, limit int) ([]model.AuditLog, error) {
-	limit = normalizeLimit(limit)
-	rows, err := s.db.QueryContext(ctx, `SELECT id, actor, action, entity_type, entity_id, summary, changes_json, created_at FROM audit_logs ORDER BY id DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := make([]model.AuditLog, 0)
-	for rows.Next() {
-		item, err := scanAuditLog(rows)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	return items, rows.Err()
+	page, err := s.ListAuditLogsPage(ctx, AuditLogFilter{PageRequest: PageRequest{Page: 1, PageSize: normalizeLimit(limit)}})
+	return page.Items, err
 }
 
 func (s *Store) DashboardSummary(ctx context.Context) (model.DashboardSummary, error) {
@@ -282,8 +283,8 @@ func (s *Store) DashboardSummary(ctx context.Context) (model.DashboardSummary, e
 		{&result.PendingMonitors, `SELECT COUNT(*) FROM monitors WHERE deleted_at IS NULL AND enabled = 1 AND last_status = ''`, nil},
 		{&result.RuleCount, `SELECT COUNT(*) FROM rules WHERE deleted_at IS NULL`, nil},
 		{&result.ChannelCount, `SELECT COUNT(*) FROM notify_channels WHERE deleted_at IS NULL`, nil},
-		{&result.EventsLast24Hours, `SELECT COUNT(*) FROM events WHERE created_at >= ?`, []any{formatTime(time.Now().UTC().Add(-24 * time.Hour))}},
-		{&result.FailedAttempts, `SELECT COUNT(*) FROM notification_attempts WHERE status = 'failed' AND created_at >= ?`, []any{formatTime(time.Now().UTC().Add(-24 * time.Hour))}},
+		{&result.EventsLast24Hours, `SELECT COUNT(*) FROM events WHERE julianday(created_at) >= julianday(?)`, []any{formatTime(time.Now().UTC().Add(-24 * time.Hour))}},
+		{&result.FailedAttempts, `SELECT COUNT(*) FROM notification_attempts WHERE status = 'failed' AND julianday(created_at) >= julianday(?)`, []any{formatTime(time.Now().UTC().Add(-24 * time.Hour))}},
 	}
 	for _, item := range queries {
 		if err := s.db.QueryRowContext(ctx, item.query, item.args...).Scan(item.destination); err != nil {
@@ -324,21 +325,23 @@ func scanRuleEvaluation(row scanner) (model.RuleEvaluation, error) {
 	return item, nil
 }
 
-const notificationAttemptSelect = `SELECT id, event_id, rule_evaluation_id, channel_id, retry_of_id, channel_name, channel_type, kind, status, subject, body, error, attempt_no, duration_ms, sent_at, next_retry_at, created_at FROM notification_attempts`
+const notificationAttemptSelect = `SELECT id, monitor_id, event_id, rule_evaluation_id, channel_id, retry_of_id, channel_name, channel_type, kind, status, subject, body, data_json, error, attempt_no, duration_ms, sent_at, next_retry_at, created_at FROM notification_attempts`
 
 func scanNotificationAttempt(row scanner) (model.NotificationAttempt, error) {
 	var item model.NotificationAttempt
-	var eventID, evaluationID, channelID, retryOfID sql.NullInt64
+	var monitorID, eventID, evaluationID, channelID, retryOfID sql.NullInt64
 	var sentAt, nextRetryAt sql.NullString
-	var createdAt string
-	err := row.Scan(&item.ID, &eventID, &evaluationID, &channelID, &retryOfID, &item.ChannelName, &item.ChannelType, &item.Kind, &item.Status, &item.Subject, &item.Body, &item.Error, &item.AttemptNo, &item.DurationMS, &sentAt, &nextRetryAt, &createdAt)
+	var data, createdAt string
+	err := row.Scan(&item.ID, &monitorID, &eventID, &evaluationID, &channelID, &retryOfID, &item.ChannelName, &item.ChannelType, &item.Kind, &item.Status, &item.Subject, &item.Body, &data, &item.Error, &item.AttemptNo, &item.DurationMS, &sentAt, &nextRetryAt, &createdAt)
 	if err != nil {
 		return item, err
 	}
+	item.MonitorID = nullInt64Ptr(monitorID)
 	item.EventID = nullInt64Ptr(eventID)
 	item.RuleEvaluationID = nullInt64Ptr(evaluationID)
 	item.ChannelID = nullInt64Ptr(channelID)
 	item.RetryOfID = nullInt64Ptr(retryOfID)
+	item.Data = json.RawMessage(defaultJSON(data, "{}"))
 	item.SentAt = parseTimePtr(sentAt)
 	item.NextRetryAt = parseTimePtr(nextRetryAt)
 	item.CreatedAt = parseTime(createdAt)
@@ -381,7 +384,7 @@ func nullInt64Ptr(value sql.NullInt64) *int64 {
 }
 
 func (s *Store) DebugCounts(ctx context.Context) (map[string]int, error) {
-	tables := []string{"monitors", "rules", "notify_channels", "check_runs", "events", "rule_evaluations", "notification_attempts"}
+	tables := []string{"monitors", "rules", "notify_channels", "check_runs", "events", "rule_evaluations", "notification_attempts", "event_outbox"}
 	result := make(map[string]int, len(tables))
 	for _, table := range tables {
 		var count int
@@ -390,5 +393,30 @@ func (s *Store) DebugCounts(ctx context.Context) (map[string]int, error) {
 		}
 		result[table] = count
 	}
+	outbox, err := s.OutboxStatusCounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for status, count := range outbox {
+		result["event_outbox_"+status] = count
+	}
 	return result, nil
+}
+
+func (s *Store) OutboxStatusCounts(ctx context.Context) (map[string]int, error) {
+	result := map[string]int{"pending": 0, "processing": 0, "processed": 0, "dead_letter": 0}
+	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM event_outbox GROUP BY status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, err
+		}
+		result[status] = count
+	}
+	return result, rows.Err()
 }

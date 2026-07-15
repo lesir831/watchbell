@@ -2,9 +2,14 @@ import type {
   AuthStatus,
   AuditLog,
   CheckRun,
+  ConfigBackup,
+  ConfigImportReport,
   CurrentUser,
   DashboardSummary,
+  DeadLetter,
   EventRecord,
+  HistoryPage,
+  HistoryQuery,
   LoginInput,
   Monitor,
   MonitorInput,
@@ -18,6 +23,7 @@ import type {
   Rule,
   RuleEvaluation,
   RuleInput,
+  RuleTestResponse,
   SystemStatus
 } from './types';
 
@@ -39,6 +45,8 @@ export class APIError extends Error {
   }
 }
 
+export const AUTH_EXPIRED_EVENT = 'watchbell:auth-expired';
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -53,10 +61,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
+    if (response.status === 401 && !path.startsWith('/api/auth/')) {
+      window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+    }
     const message = `${data.error ?? `HTTP ${response.status}`}${data.requestId ? ` · 请求 ${data.requestId}` : ''}`;
     throw new APIError(message, response.status, data);
   }
   return data as T;
+}
+
+function withQuery(path: string, query: HistoryQuery) {
+  const values = new URLSearchParams();
+  Object.entries(query).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') values.set(key, String(value));
+  });
+  return `${path}?${values.toString()}`;
 }
 
 function jsonInit(method: string, body?: unknown): RequestInit {
@@ -77,15 +96,18 @@ export const api = {
   dashboard: () => request<DashboardSummary>('/api/dashboard'),
   systemStatus: () => request<SystemStatus>('/api/system/status'),
   diagnostics: () => request<Record<string, unknown>>('/api/diagnostics'),
+  exportConfig: (includeSecrets = false) => request<ConfigBackup>(`/api/config/export?includeSecrets=${includeSecrets}`),
+  importConfig: (backup: ConfigBackup) => request<ConfigImportReport>('/api/config/import', jsonInit('POST', { mode: 'merge', backup })),
 
   listMonitors: () => request<Monitor[]>('/api/monitors'),
   createMonitor: (body: MonitorInput) => request<Monitor>('/api/monitors', jsonInit('POST', body)),
   updateMonitor: (id: number, body: MonitorInput) => request<Monitor>(`/api/monitors/${id}`, jsonInit('PUT', body)),
   deleteMonitor: (id: number) => request<void>(`/api/monitors/${id}`, jsonInit('DELETE')),
-  checkMonitor: (id: number) => request<{ status: string }>(`/api/monitors/${id}/check`, jsonInit('POST')),
+  checkMonitor: (id: number) => request<{ status: string; eventCount: number; checkRun?: CheckRun }>(`/api/monitors/${id}/check`, jsonInit('POST')),
 
   listRules: () => request<Rule[]>('/api/rules'),
   createRule: (body: RuleInput) => request<Rule>('/api/rules', jsonInit('POST', body)),
+  testRule: (body: Pick<RuleInput, 'monitorId' | 'condition'> & { limit?: number }) => request<RuleTestResponse>('/api/rules/test', jsonInit('POST', body)),
   updateRule: (id: number, body: RuleInput) => request<Rule>(`/api/rules/${id}`, jsonInit('PUT', body)),
   deleteRule: (id: number) => request<void>(`/api/rules/${id}`, jsonInit('DELETE')),
 
@@ -99,14 +121,21 @@ export const api = {
   createTemplate: (body: NotificationTemplateInput) => request<NotificationTemplate>('/api/templates', jsonInit('POST', body)),
   updateTemplate: (id: number, body: NotificationTemplateInput) => request<NotificationTemplate>(`/api/templates/${id}`, jsonInit('PUT', body)),
   deleteTemplate: (id: number) => request<void>(`/api/templates/${id}`, jsonInit('DELETE')),
-  previewTemplate: (body: Partial<NotificationTemplateInput>) =>
+  previewTemplate: (body: Partial<NotificationTemplateInput> & { eventId?: number }) =>
     request<{ subject: string; body: string }>('/api/templates/preview', jsonInit('POST', body)),
 
   listEvents: () => request<EventRecord[]>('/api/events?limit=100'),
+  listEventsPage: (query: HistoryQuery) => request<HistoryPage<EventRecord>>(withQuery('/api/events', query)),
   listNotificationLogs: () => request<NotificationLog[]>('/api/notification-logs?limit=100'),
   listCheckRuns: () => request<CheckRun[]>('/api/check-runs?limit=100'),
+  listCheckRunsPage: (query: HistoryQuery) => request<HistoryPage<CheckRun>>(withQuery('/api/check-runs', query)),
   listRuleEvaluations: () => request<RuleEvaluation[]>('/api/rule-evaluations?limit=100'),
+  listRuleEvaluationsPage: (query: HistoryQuery) => request<HistoryPage<RuleEvaluation>>(withQuery('/api/rule-evaluations', query)),
   listNotificationAttempts: () => request<NotificationAttempt[]>('/api/notification-attempts?limit=100'),
+  listNotificationAttemptsPage: (query: HistoryQuery) => request<HistoryPage<NotificationAttempt>>(withQuery('/api/notification-attempts', query)),
   retryNotificationAttempt: (id: number) => request<NotificationAttempt>(`/api/notification-attempts/${id}/retry`, jsonInit('POST')),
-  listAuditLogs: () => request<AuditLog[]>('/api/audit-logs?limit=100')
+  listDeadLettersPage: (query: Pick<HistoryQuery, 'page' | 'pageSize' | 'monitorId'>) => request<HistoryPage<DeadLetter>>(withQuery('/api/dead-letters', query)),
+  retryDeadLetter: (eventId: number) => request<{ status: string; eventId: number }>(`/api/dead-letters/${eventId}/retry`, jsonInit('POST')),
+  listAuditLogs: () => request<AuditLog[]>('/api/audit-logs?limit=100'),
+  listAuditLogsPage: (query: HistoryQuery) => request<HistoryPage<AuditLog>>(withQuery('/api/audit-logs', query))
 };

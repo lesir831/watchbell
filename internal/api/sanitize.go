@@ -53,7 +53,7 @@ func redactConfig(raw json.RawMessage, secretKeys []string) (json.RawMessage, []
 	}
 	configured := make([]string, 0)
 	for _, key := range secretKeys {
-		if value, exists := config[key]; exists && strings.TrimSpace(stringValue(value)) != "" {
+		if value, exists := config[key]; exists && hasConfiguredSecretValue(value) {
 			configured = append(configured, key)
 		}
 		delete(config, key)
@@ -63,6 +63,21 @@ func redactConfig(raw json.RawMessage, secretKeys []string) (json.RawMessage, []
 		return json.RawMessage("{}"), configured
 	}
 	return data, configured
+}
+
+func hasConfiguredSecretValue(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(typed) != ""
+	case map[string]any:
+		return len(typed) > 0
+	case []any:
+		return len(typed) > 0
+	default:
+		return true
+	}
 }
 
 func mergeSecretConfig(existing, incoming json.RawMessage, secretKeys []string) json.RawMessage {
@@ -108,6 +123,9 @@ func channelSecretKeys(channelType string) []string {
 		return []string{"deviceKey"}
 	case model.ChannelTypeEmail:
 		return []string{"password"}
+	case model.ChannelTypeWebhook:
+		// Tokens are commonly embedded in both provider URLs and headers.
+		return []string{"url", "headers"}
 	default:
 		return nil
 	}

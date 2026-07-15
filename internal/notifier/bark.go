@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/watchbell/watchbell/internal/model"
+	"github.com/watchbell/watchbell/internal/templatex"
 )
 
 type BarkNotifier struct {
@@ -60,8 +61,8 @@ func (n *BarkNotifier) Send(ctx context.Context, channel model.NotifyChannel, me
 	if cfg.Icon != "" {
 		body["icon"] = cfg.Icon
 	}
-	if cfg.URL != "" {
-		body["url"] = cfg.URL
+	if targetURL := strings.TrimSpace(templatex.Render(cfg.URL, templateData(message))); targetURL != "" {
+		body["url"] = targetURL
 	}
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -72,7 +73,16 @@ func (n *BarkNotifier) Send(ctx context.Context, channel model.NotifyChannel, me
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := n.client.Do(req)
+	client := n.client
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	requestClient := *client
+	// Bark's request body contains the device key. Following a redirect to a
+	// different host would disclose that credential, so endpoints must be
+	// configured with their final URL.
+	requestClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := requestClient.Do(req)
 	if err != nil {
 		return err
 	}

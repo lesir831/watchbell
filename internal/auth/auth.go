@@ -9,12 +9,17 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/go-chi/chi/v5/middleware"
 )
 
 const (
@@ -22,26 +27,58 @@ const (
 	defaultCookieName      = "watchbell_session"
 	defaultPBKDF2Iter      = 210_000
 	defaultPasswordKeySize = 32
+	defaultMaxFailures     = 5
+	defaultFailureWindow   = 15 * time.Minute
 )
 
+var ErrInvalidCredentials = errors.New("invalid username or password")
+
 type Config struct {
-	Enabled       bool
-	Username      string
-	Password      string
-	PasswordHash  string
-	SessionSecret string
-	SessionTTL    time.Duration
-	CookieName    string
+	Enabled            bool
+	Username           string
+	Password           string
+	PasswordHash       string
+	SessionSecret      string
+	SessionTTL         time.Duration
+	CookieName         string
+	CookieSecure       *bool
+	TrustProxyHeaders  bool
+	TrustedProxyHops   int
+	LoginMaxFailures   int
+	LoginFailureWindow time.Duration
 }
 
 type Manager struct {
-	enabled       bool
-	username      string
-	passwordHash  string
-	sessionSecret []byte
-	sessionTTL    time.Duration
-	cookieName    string
-	logger        *slog.Logger
+	enabled           bool
+	username          string
+	passwordHash      string
+	sessionSecret     []byte
+	sessionTTL        time.Duration
+	cookieName        string
+	cookieSecure      *bool
+	trustProxyHeaders bool
+	trustedProxyHops  int
+	loginFailures     *failureLimiter
+	logger            *slog.Logger
+}
+
+// RateLimitError indicates that this client has made too many failed login
+// attempts. RetryAfter is always positive.
+type RateLimitError struct {
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitError) Error() string {
+	return fmt.Sprintf("too many failed login attempts; retry after %s", e.RetryAfter.Round(time.Second))
+}
+
+type failureLimiter struct {
+	mu        sync.Mutex
+	failures  map[string][]time.Time
+	max       int
+	window    time.Duration
+	now       func() time.Time
+	lastSweep time.Time
 }
 
 type contextKey struct{}
@@ -55,8 +92,11 @@ func NewManager(cfg Config, logger *slog.Logger) (*Manager, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if cfg.TrustedProxyHops <= 0 {
+		cfg.TrustedProxyHops = 1
+	}
 	if !cfg.Enabled {
-		return &Manager{enabled: false, logger: logger}, nil
+		return &Manager{enabled: false, trustProxyHeaders: cfg.TrustProxyHeaders, trustedProxyHops: cfg.TrustedProxyHops, logger: logger}, nil
 	}
 	if strings.TrimSpace(cfg.Username) == "" {
 		cfg.Username = defaultUsername
@@ -66,6 +106,12 @@ func NewManager(cfg Config, logger *slog.Logger) (*Manager, error) {
 	}
 	if strings.TrimSpace(cfg.CookieName) == "" {
 		cfg.CookieName = defaultCookieName
+	}
+	if cfg.LoginMaxFailures <= 0 {
+		cfg.LoginMaxFailures = defaultMaxFailures
+	}
+	if cfg.LoginFailureWindow <= 0 {
+		cfg.LoginFailureWindow = defaultFailureWindow
 	}
 	passwordHash := strings.TrimSpace(cfg.PasswordHash)
 	if passwordHash == "" {
@@ -90,13 +136,22 @@ func NewManager(cfg Config, logger *slog.Logger) (*Manager, error) {
 		logger.Warn("WATCHBELL_SESSION_SECRET should be at least 32 bytes")
 	}
 	return &Manager{
-		enabled:       true,
-		username:      cfg.Username,
-		passwordHash:  passwordHash,
-		sessionSecret: secret,
-		sessionTTL:    cfg.SessionTTL,
-		cookieName:    cfg.CookieName,
-		logger:        logger,
+		enabled:           true,
+		username:          cfg.Username,
+		passwordHash:      passwordHash,
+		sessionSecret:     secret,
+		sessionTTL:        cfg.SessionTTL,
+		cookieName:        cfg.CookieName,
+		cookieSecure:      cloneBool(cfg.CookieSecure),
+		trustProxyHeaders: cfg.TrustProxyHeaders,
+		trustedProxyHops:  cfg.TrustedProxyHops,
+		loginFailures: &failureLimiter{
+			failures: make(map[string][]time.Time),
+			max:      cfg.LoginMaxFailures,
+			window:   cfg.LoginFailureWindow,
+			now:      time.Now,
+		},
+		logger: logger,
 	}, nil
 }
 
@@ -111,13 +166,30 @@ func (m *Manager) Username() string {
 	return m.username
 }
 
+func (m *Manager) TrustProxyHeaders() bool {
+	return m != nil && m.trustProxyHeaders
+}
+
+func (m *Manager) TrustedProxyHops() int {
+	if m == nil || m.trustedProxyHops <= 0 {
+		return 1
+	}
+	return m.trustedProxyHops
+}
+
 func (m *Manager) Login(w http.ResponseWriter, r *http.Request, username string, password string) error {
 	if !m.Enabled() {
 		return fmt.Errorf("auth is disabled")
 	}
-	if username != m.username || !VerifyPassword(m.passwordHash, password) {
-		return fmt.Errorf("invalid username or password")
+	client := loginClientKey(r)
+	if retryAfter := m.loginFailures.retryAfter(client); retryAfter > 0 {
+		return &RateLimitError{RetryAfter: retryAfter}
 	}
+	if username != m.username || !VerifyPassword(m.passwordHash, password) {
+		m.loginFailures.record(client)
+		return ErrInvalidCredentials
+	}
+	m.loginFailures.reset(client)
 	value, err := m.signSession(sessionPayload{
 		Username:  username,
 		ExpiresAt: time.Now().Add(m.sessionTTL).Unix(),
@@ -131,7 +203,7 @@ func (m *Manager) Login(w http.ResponseWriter, r *http.Request, username string,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
+		Secure:   m.secureCookie(r),
 		MaxAge:   int(m.sessionTTL.Seconds()),
 	})
 	return nil
@@ -147,9 +219,163 @@ func (m *Manager) Logout(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
+		Secure:   m.secureCookie(r),
 		MaxAge:   -1,
 	})
+}
+
+// LoginRetryAfter extracts retry timing from a failed Login call.
+func LoginRetryAfter(err error) (time.Duration, bool) {
+	var rateLimitErr *RateLimitError
+	if !errors.As(err, &rateLimitErr) {
+		return 0, false
+	}
+	return rateLimitErr.RetryAfter, true
+}
+
+func (m *Manager) secureCookie(r *http.Request) bool {
+	if m != nil && m.cookieSecure != nil {
+		return *m.cookieSecure
+	}
+	if requestUsesDirectHTTPS(r) {
+		return true
+	}
+	return m != nil && m.trustProxyHeaders && requestUsesForwardedHTTPS(r)
+}
+
+func requestUsesDirectHTTPS(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	return r.TLS != nil || (r.URL != nil && strings.EqualFold(r.URL.Scheme, "https"))
+}
+
+func requestUsesForwardedHTTPS(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if forwardedProto(strings.Join(r.Header.Values("Forwarded"), ",")) == "https" {
+		return true
+	}
+	proto := strings.Trim(lastForwardedValue(strings.Join(r.Header.Values("X-Forwarded-Proto"), ",")), `"`)
+	return strings.EqualFold(proto, "https")
+}
+
+func forwardedProto(header string) string {
+	last := lastForwardedValue(header)
+	for _, parameter := range strings.Split(last, ";") {
+		key, value, ok := strings.Cut(strings.TrimSpace(parameter), "=")
+		if ok && strings.EqualFold(key, "proto") {
+			return strings.ToLower(strings.Trim(strings.TrimSpace(value), `"`))
+		}
+	}
+	return ""
+}
+
+func lastForwardedValue(header string) string {
+	values := strings.Split(header, ",")
+	for index := len(values) - 1; index >= 0; index-- {
+		if value := strings.TrimSpace(values[index]); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func loginClientKey(r *http.Request) string {
+	if r == nil {
+		return "unknown"
+	}
+	if address := middleware.GetClientIP(r.Context()); address != "" {
+		return address
+	}
+	address := strings.TrimSpace(r.RemoteAddr)
+	if host, _, err := net.SplitHostPort(address); err == nil {
+		address = host
+	}
+	if address == "" {
+		return "unknown"
+	}
+	return address
+}
+
+func cloneBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func (l *failureLimiter) retryAfter(key string) time.Duration {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	l.sweepLocked(now)
+	failures := l.activeLocked(key, now)
+	if len(failures) < l.max {
+		return 0
+	}
+	retryAfter := failures[0].Add(l.window).Sub(now)
+	if retryAfter <= 0 {
+		return time.Nanosecond
+	}
+	return retryAfter
+}
+
+func (l *failureLimiter) record(key string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	l.sweepLocked(now)
+	failures := l.activeLocked(key, now)
+	if len(failures) >= l.max {
+		return
+	}
+	l.failures[key] = append(failures, now)
+}
+
+func (l *failureLimiter) reset(key string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	delete(l.failures, key)
+	l.mu.Unlock()
+}
+
+func (l *failureLimiter) activeLocked(key string, now time.Time) []time.Time {
+	cutoff := now.Add(-l.window)
+	failures := l.failures[key]
+	firstActive := 0
+	for firstActive < len(failures) && !failures[firstActive].After(cutoff) {
+		firstActive++
+	}
+	if firstActive == len(failures) {
+		delete(l.failures, key)
+		return nil
+	}
+	if firstActive > 0 {
+		failures = append([]time.Time(nil), failures[firstActive:]...)
+		l.failures[key] = failures
+	}
+	return failures
+}
+
+func (l *failureLimiter) sweepLocked(now time.Time) {
+	if !l.lastSweep.IsZero() && now.Sub(l.lastSweep) < l.window {
+		return
+	}
+	for key := range l.failures {
+		l.activeLocked(key, now)
+	}
+	l.lastSweep = now
 }
 
 func (m *Manager) Require(next http.Handler) http.Handler {

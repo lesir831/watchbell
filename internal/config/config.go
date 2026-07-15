@@ -29,13 +29,18 @@ func FromEnv() Config {
 		WorkerCount:   getInt("WATCHBELL_WORKERS", 4),
 		LogLevel:      getLogLevel("WATCHBELL_LOG_LEVEL", slog.LevelInfo),
 		Auth: auth.Config{
-			Enabled:       !getBool("WATCHBELL_AUTH_DISABLED", false),
-			Username:      getenv("WATCHBELL_ADMIN_USERNAME", "admin"),
-			Password:      os.Getenv("WATCHBELL_ADMIN_PASSWORD"),
-			PasswordHash:  os.Getenv("WATCHBELL_ADMIN_PASSWORD_HASH"),
-			SessionSecret: os.Getenv("WATCHBELL_SESSION_SECRET"),
-			SessionTTL:    getDuration("WATCHBELL_SESSION_TTL", 7*24*time.Hour),
-			CookieName:    getenv("WATCHBELL_SESSION_COOKIE", "watchbell_session"),
+			Enabled:            !getBool("WATCHBELL_AUTH_DISABLED", false),
+			Username:           getenv("WATCHBELL_ADMIN_USERNAME", "admin"),
+			Password:           os.Getenv("WATCHBELL_ADMIN_PASSWORD"),
+			PasswordHash:       os.Getenv("WATCHBELL_ADMIN_PASSWORD_HASH"),
+			SessionSecret:      os.Getenv("WATCHBELL_SESSION_SECRET"),
+			SessionTTL:         getDuration("WATCHBELL_SESSION_TTL", 7*24*time.Hour),
+			CookieName:         getenv("WATCHBELL_SESSION_COOKIE", "watchbell_session"),
+			CookieSecure:       getOptionalBool("WATCHBELL_COOKIE_SECURE"),
+			TrustProxyHeaders:  getBool("WATCHBELL_TRUST_PROXY_HEADERS", false),
+			TrustedProxyHops:   getInt("WATCHBELL_TRUSTED_PROXY_HOPS", 1),
+			LoginMaxFailures:   getInt("WATCHBELL_LOGIN_MAX_FAILURES", 5),
+			LoginFailureWindow: getDuration("WATCHBELL_LOGIN_FAILURE_WINDOW", 15*time.Minute),
 		},
 	}
 }
@@ -85,6 +90,20 @@ func getBool(key string, fallback bool) bool {
 	default:
 		return fallback
 	}
+}
+
+func getOptionalBool(key string) *bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	var parsed bool
+	switch value {
+	case "1", "true", "yes", "on":
+		parsed = true
+	case "0", "false", "no", "off":
+		parsed = false
+	default:
+		return nil
+	}
+	return &parsed
 }
 
 func getLogLevel(key string, fallback slog.Level) slog.Level {

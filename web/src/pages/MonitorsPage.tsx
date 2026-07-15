@@ -19,16 +19,17 @@ import {
   Tag,
   Typography
 } from 'antd';
-import { DeleteOutlined, EditOutlined, PlayCircleOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
+import { DeleteOutlined, EditOutlined, EyeOutlined, PlayCircleOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
 import ConfigFields from '../components/ConfigFields';
+import { AdvancedConfigField, ConfigMode, parseConfigJSON } from '../components/ConfigMode';
 import { EmptyState, formatDate, formatInterval, PageError, relativeDate, StatusTag } from '../components/Common';
-import type { Monitor, MonitorInput, MonitorPlugin, MonitorType } from '../types';
+import type { Monitor, MonitorInput, MonitorPlugin, MonitorType, NotifyChannel } from '../types';
 
 const { Text, Title } = Typography;
 
-export default function MonitorsPage() {
+export default function MonitorsPage({ onNavigate }: { onNavigate: (page: string) => void }) {
   const screens = Grid.useBreakpoint();
   const mobile = !screens.md;
   const queryClient = useQueryClient();
@@ -37,8 +38,9 @@ export default function MonitorsPage() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState<string>('all');
-  const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors });
+  const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors, refetchInterval: 20_000 });
   const plugins = useQuery({ queryKey: ['plugins'], queryFn: api.listPlugins });
+  const channels = useQuery({ queryKey: ['channels'], queryFn: api.listChannels, refetchInterval: 30_000 });
   const pluginByID = useMemo(() => new Map((plugins.data ?? []).map((item) => [item.id, item])), [plugins.data]);
 
   const refresh = async () => {
@@ -62,8 +64,8 @@ export default function MonitorsPage() {
       if (checkAfter) {
         const hide = message.loading('正在执行首次检查…', 0);
         try {
-          await api.checkMonitor(item.id);
-          message.success('检查完成，可在活动页面查看运行详情');
+          const result = await api.checkMonitor(item.id);
+          message.success(result.eventCount > 0 ? `检查完成，发现 ${result.eventCount} 个新事件` : '检查完成，未发现新事件');
         } catch (error) {
           message.error((error as Error).message);
         } finally {
@@ -75,12 +77,20 @@ export default function MonitorsPage() {
   });
   const checkMutation = useMutation({
     mutationFn: api.checkMonitor,
-    onSuccess: async () => { await refresh(); message.success('检查完成'); },
+    onSuccess: async (result) => { await refresh(); message.success(result.eventCount > 0 ? `检查完成，发现 ${result.eventCount} 个新事件` : '检查完成，未发现新事件'); },
     onError: async (error: Error) => { await refresh(); message.error(error.message); }
   });
   const deleteMutation = useMutation({
     mutationFn: api.deleteMonitor,
     onSuccess: async () => { await refresh(); message.success('监控已归档，历史记录仍会保留'); },
+    onError: (error: Error) => message.error(error.message)
+  });
+  const toggleMutation = useMutation({
+    mutationFn: ({ record, enabled }: { record: Monitor; enabled: boolean }) => api.updateMonitor(record.id, {
+      name: record.name, type: record.type, enabled, intervalSeconds: record.intervalSeconds, config: record.config,
+      failureAlertAfter: record.failureAlertAfter, failureNotifyChannelIds: record.failureNotifyChannelIds
+    }),
+    onSuccess: async (item) => { await refresh(); message.success(item.enabled ? '监控已启用' : '监控已停用'); },
     onError: (error: Error) => message.error(error.message)
   });
 
@@ -93,9 +103,10 @@ export default function MonitorsPage() {
   const openNew = () => { setEditing(null); setDrawerOpen(true); };
   const actions = (record: Monitor) => (
     <Space wrap>
+      <Button icon={<EyeOutlined />} onClick={() => onNavigate(`monitors/${record.id}`)}>详情</Button>
       <Button icon={<PlayCircleOutlined />} loading={checkMutation.isPending && checkMutation.variables === record.id} onClick={() => checkMutation.mutate(record.id)}>检查</Button>
       <Button icon={<EditOutlined />} onClick={() => { setEditing(record); setDrawerOpen(true); }}>编辑</Button>
-      <Popconfirm title="归档这个监控？" description="监控将停止运行，既有检查、事件和通知历史会保留。" onConfirm={() => deleteMutation.mutate(record.id)}>
+      <Popconfirm title="归档这个监控？" description="监控及其规则将停止运行，既有检查、事件和通知历史会保留。" onConfirm={() => deleteMutation.mutate(record.id)}>
         <Button danger icon={<DeleteOutlined />} aria-label={`归档 ${record.name}`} />
       </Popconfirm>
     </Space>
@@ -103,7 +114,7 @@ export default function MonitorsPage() {
 
   return (
     <Space direction="vertical" size={16} className="full-width">
-      <PageError error={(monitors.error || plugins.error) as Error | null} onRetry={() => { monitors.refetch(); plugins.refetch(); }} />
+      <PageError error={(monitors.error || plugins.error || channels.error) as Error | null} onRetry={() => { monitors.refetch(); plugins.refetch(); channels.refetch(); }} />
       <div className="page-toolbar responsive-toolbar">
         <Space wrap>
           <Input prefix={<SearchOutlined />} allowClear placeholder="搜索名称或类型" value={search} onChange={(event) => setSearch(event.target.value)} />
@@ -121,7 +132,7 @@ export default function MonitorsPage() {
         <div className="mobile-card-list">
           {filtered.map((item) => (
             <Card key={item.id} className="entity-card">
-              <div className="entity-card-head"><div><Title level={5}>{item.name}</Title><Text type="secondary">{pluginByID.get(item.type)?.name ?? item.type}</Text></div><StatusTag status={!item.enabled ? 'disabled' : item.lastStatus} /></div>
+              <div className="entity-card-head"><div><Title level={5}>{item.name}</Title><Text type="secondary">{pluginByID.get(item.type)?.name ?? item.type}</Text></div><Space direction="vertical" align="end" size={4}><StatusTag status={!item.enabled ? 'disabled' : item.lastStatus} />{item.failureAlertActive && <Tag color="error">故障告警中</Tag>}</Space></div>
               <div className="entity-meta"><span>检查频率 <strong>{formatInterval(item.intervalSeconds)}</strong></span><span>上次检查 <strong>{relativeDate(item.lastCheckedAt)}</strong></span></div>
               {(item.lastError || item.lastMessage) && <Alert type={item.lastError ? 'error' : 'info'} showIcon message={item.lastError || item.lastMessage} />}
               <div className="entity-actions">{actions(item)}</div>
@@ -148,11 +159,13 @@ export default function MonitorsPage() {
           columns={[
             { title: '名称', dataIndex: 'name', fixed: 'left', width: 180 },
             { title: '类型', dataIndex: 'type', width: 150, render: (value: MonitorType) => <Tag>{pluginByID.get(value)?.name ?? value}</Tag> },
-            { title: '状态', width: 110, render: (_, record) => <StatusTag status={!record.enabled ? 'disabled' : record.lastStatus} /> },
+            { title: '启用', width: 76, render: (_, record) => <Switch size="small" checked={record.enabled} loading={toggleMutation.isPending && toggleMutation.variables?.record.id === record.id} onChange={(enabled) => toggleMutation.mutate({ record, enabled })} /> },
+            { title: '状态', width: 100, render: (_, record) => <StatusTag status={!record.enabled ? 'disabled' : record.lastStatus} /> },
             { title: '连续失败', dataIndex: 'consecutiveFailures', width: 100, render: (value) => value || '—' },
+            { title: '故障告警', width: 110, render: (_, record) => record.failureAlertActive ? <Tag color="error">告警中</Tag> : record.failureAlertAfter > 0 ? <Tag color="green">{record.failureAlertAfter} 次触发</Tag> : <Text type="secondary">关闭</Text> },
             { title: '检查频率', dataIndex: 'intervalSeconds', width: 110, render: formatInterval },
             { title: '上次检查', dataIndex: 'lastCheckedAt', width: 150, render: relativeDate },
-            { title: '操作', width: 290, render: (_, record) => actions(record) }
+            { title: '操作', width: 370, render: (_, record) => actions(record) }
           ]}
         />
       )}
@@ -161,6 +174,7 @@ export default function MonitorsPage() {
         open={drawerOpen}
         record={editing}
         plugins={plugins.data ?? []}
+        channels={channels.data ?? []}
         saving={saveMutation.isPending}
         error={saveMutation.error as Error | null}
         onClose={() => { setDrawerOpen(false); saveMutation.reset(); }}
@@ -174,30 +188,44 @@ function MonitorDrawer(props: {
   open: boolean;
   record: Monitor | null;
   plugins: MonitorPlugin[];
+  channels: NotifyChannel[];
   saving: boolean;
   error: Error | null;
   onClose: () => void;
   onSave: (input: MonitorInput, checkAfter: boolean) => void;
 }) {
   const [form] = Form.useForm();
+  const [advanced, setAdvanced] = useState(false);
   const selectedType = Form.useWatch<MonitorType>('type', form);
+  const intervalSeconds = Form.useWatch<number>('intervalSeconds', form);
+  const failureAlertsEnabled = Form.useWatch<boolean>('failureAlertsEnabled', form);
   const plugin = props.plugins.find((item) => item.id === selectedType) ?? props.plugins[0];
   const setInitial = () => {
     const initialPlugin = props.plugins.find((item) => item.id === props.record?.type) ?? props.plugins[0];
+    const config = props.record?.config ?? initialPlugin?.defaultConfig ?? {};
+    setAdvanced(false);
     form.setFieldsValue({
       name: props.record?.name ?? '',
       type: initialPlugin?.id,
       enabled: props.record?.enabled ?? true,
       intervalSeconds: props.record?.intervalSeconds ?? initialPlugin?.defaultIntervalSeconds ?? 300,
-      config: props.record?.config ?? initialPlugin?.defaultConfig ?? {}
+      failureAlertsEnabled: (props.record?.failureAlertAfter ?? 0) > 0,
+      failureAlertAfter: props.record?.failureAlertAfter || 3,
+      failureNotifyChannelIds: props.record?.failureNotifyChannelIds ?? [],
+      config,
+      rawConfig: JSON.stringify(config, null, 2)
     });
   };
   const submit = async (checkAfter: boolean) => {
     const values = await form.validateFields();
     const activePlugin = props.plugins.find((item) => item.id === values.type);
     const knownConfig = Object.fromEntries((activePlugin?.configFields ?? []).map((field) => [field.key, values.config?.[field.key]]).filter(([, value]) => value !== undefined));
-    const config = { ...(props.record?.config ?? {}), ...knownConfig };
-    props.onSave({ name: values.name.trim(), type: values.type, enabled: values.enabled, intervalSeconds: values.intervalSeconds, config }, checkAfter);
+    const config = advanced ? parseConfigJSON(values.rawConfig) : { ...(props.record?.config ?? {}), ...knownConfig };
+    props.onSave({
+      name: values.name.trim(), type: values.type, enabled: values.enabled, intervalSeconds: values.intervalSeconds, config,
+      failureAlertAfter: values.failureAlertsEnabled ? values.failureAlertAfter : 0,
+      failureNotifyChannelIds: values.failureAlertsEnabled ? values.failureNotifyChannelIds : []
+    }, checkAfter);
   };
   return (
     <Drawer title={props.record ? '编辑监控' : '新建监控'} open={props.open} onClose={props.onClose} width={680} destroyOnClose afterOpenChange={(open) => { if (open) setInitial(); }} footer={
@@ -207,17 +235,33 @@ function MonitorDrawer(props: {
       <Form form={form} layout="vertical" requiredMark="optional" onValuesChange={(changed) => {
         if (changed.type && !props.record) {
           const next = props.plugins.find((item) => item.id === changed.type);
-          form.setFieldsValue({ intervalSeconds: next?.defaultIntervalSeconds, config: next?.defaultConfig });
+          form.setFieldsValue({ intervalSeconds: next?.defaultIntervalSeconds, config: next?.defaultConfig, rawConfig: JSON.stringify(next?.defaultConfig ?? {}, null, 2) });
         }
       }}>
         {plugin?.description && <Alert className="form-intro" type="info" showIcon message={plugin.name} description={plugin.description} />}
         <Form.Item name="name" label="名称" rules={[{ required: true, whitespace: true, message: '请输入监控名称' }]}><Input placeholder="例如：产品发布动态" /></Form.Item>
         <Row gutter={16}>
           <Col xs={24} sm={12}><Form.Item name="type" label="类型" rules={[{ required: true }]} extra={props.record ? '为保护历史状态，已创建监控的类型不可修改。' : undefined}><Select disabled={Boolean(props.record)} options={props.plugins.map((item) => ({ label: item.name, value: item.id }))} /></Form.Item></Col>
-          <Col xs={24} sm={12}><Form.Item name="intervalSeconds" label="检查间隔（秒）" rules={[{ required: true }]}><InputNumber min={30} max={2_592_000} className="full-width" /></Form.Item></Col>
+          <Col xs={24} sm={12}><Form.Item label="检查间隔" extra={intervalSeconds ? `当前：${formatInterval(intervalSeconds)}` : undefined}>
+            <Space.Compact block>
+              <Form.Item name="intervalSeconds" noStyle rules={[{ required: true }]}><InputNumber min={30} max={2_592_000} style={{ width: '58%' }} addonAfter="秒" /></Form.Item>
+              <Select placeholder="快捷选择" style={{ width: '42%' }} onChange={(value) => form.setFieldValue('intervalSeconds', value)} options={[
+                { value: 60, label: '1 分钟' }, { value: 300, label: '5 分钟' }, { value: 3600, label: '1 小时' },
+                { value: 21600, label: '6 小时' }, { value: 86400, label: '1 天' }, { value: 604800, label: '7 天' }
+              ]} />
+            </Space.Compact>
+          </Form.Item></Col>
         </Row>
         <Form.Item name="enabled" label="启用监控" valuePropName="checked"><Switch /></Form.Item>
-        {plugin && <ConfigFields fields={plugin.configFields} configuredSecrets={props.record?.configuredSecrets} />}
+        <Card size="small" title="监控自身故障告警" className="form-intro">
+          <Form.Item name="failureAlertsEnabled" label="连续检查失败时通知" valuePropName="checked" extra="同一轮故障只告警一次；恢复正常后会再发送一条恢复通知。"><Switch /></Form.Item>
+          {failureAlertsEnabled && <Row gutter={16}>
+            <Col xs={24} sm={8}><Form.Item name="failureAlertAfter" label="连续失败次数" rules={[{ required: true, message: '请输入触发次数' }]}><InputNumber min={1} max={100} className="full-width" /></Form.Item></Col>
+            <Col xs={24} sm={16}><Form.Item name="failureNotifyChannelIds" label="通知渠道" rules={[{ required: true, type: 'array', min: 1, message: '请至少选择一个已启用通知渠道' }]}><Select mode="multiple" placeholder="选择故障与恢复通知渠道" options={props.channels.map((item) => ({ label: `${item.name}${item.enabled ? '' : '（已停用）'}`, value: item.id, disabled: !item.enabled }))} /></Form.Item></Col>
+          </Row>}
+        </Card>
+        <ConfigMode form={form} advanced={advanced} onChange={setAdvanced} baseConfig={props.record?.config} />
+        {advanced ? <AdvancedConfigField /> : plugin && <ConfigFields fields={plugin.configFields} configuredSecrets={props.record?.configuredSecrets} />}
       </Form>
     </Drawer>
   );

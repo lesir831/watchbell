@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/mail"
 	"net/smtp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/watchbell/watchbell/internal/model"
 )
@@ -54,46 +56,66 @@ func (n *EmailNotifier) Send(ctx context.Context, channel model.NotifyChannel, m
 	}
 
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-	done := make(chan error, 1)
-	go func() {
-		done <- sendMail(addr, cfg, message)
-	}()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-done:
-		return err
-	}
+	return sendMail(ctx, addr, cfg, message)
 }
 
-func sendMail(addr string, cfg EmailConfig, message Message) error {
-	var client *smtp.Client
-	var err error
+func sendMail(ctx context.Context, addr string, cfg EmailConfig, message Message) error {
+	from, err := mail.ParseAddress(strings.TrimSpace(cfg.From))
+	if err != nil {
+		return fmt.Errorf("parse email sender: %w", err)
+	}
+	recipients := make([]string, 0, len(cfg.To))
+	for _, raw := range cfg.To {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		recipient, err := mail.ParseAddress(raw)
+		if err != nil {
+			return fmt.Errorf("parse email recipient: %w", err)
+		}
+		recipients = append(recipients, recipient.Address)
+	}
+	if len(recipients) == 0 {
+		return fmt.Errorf("email recipient is required")
+	}
+
 	tlsConfig := &tls.Config{ServerName: cfg.Host, InsecureSkipVerify: cfg.SkipVerify} //nolint:gosec
+	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
+	var connection net.Conn
+	err = nil
 	if cfg.ImplicitTLS {
-		conn, err := tls.Dial("tcp", addr, tlsConfig)
-		if err != nil {
-			return err
-		}
-		client, err = smtp.NewClient(conn, cfg.Host)
-		if err != nil {
-			_ = conn.Close()
-			return err
-		}
+		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: tlsConfig}
+		connection, err = tlsDialer.DialContext(ctx, "tcp", addr)
 	} else {
-		client, err = smtp.Dial(addr)
-		if err != nil {
-			return err
-		}
+		connection, err = dialer.DialContext(ctx, "tcp", addr)
+	}
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	deadline := time.Now().Add(30 * time.Second)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := connection.SetDeadline(deadline); err != nil {
+		return err
+	}
+	stopCancellation := context.AfterFunc(ctx, func() { _ = connection.SetDeadline(time.Now()) })
+	defer stopCancellation()
+
+	client, err := smtp.NewClient(connection, cfg.Host)
+	if err != nil {
+		return err
 	}
 	defer client.Close()
 
 	if cfg.StartTLS && !cfg.ImplicitTLS {
-		if ok, _ := client.Extension("STARTTLS"); ok {
-			if err := client.StartTLS(tlsConfig); err != nil {
-				return err
-			}
+		if ok, _ := client.Extension("STARTTLS"); !ok {
+			return fmt.Errorf("SMTP server does not support required STARTTLS")
+		}
+		if err := client.StartTLS(tlsConfig); err != nil {
+			return err
 		}
 	}
 	if cfg.Username != "" {
@@ -102,14 +124,10 @@ func sendMail(addr string, cfg EmailConfig, message Message) error {
 			return err
 		}
 	}
-	if err := client.Mail(cfg.From); err != nil {
+	if err := client.Mail(from.Address); err != nil {
 		return err
 	}
-	for _, to := range cfg.To {
-		to = strings.TrimSpace(to)
-		if to == "" {
-			continue
-		}
+	for _, to := range recipients {
 		if err := client.Rcpt(to); err != nil {
 			return err
 		}

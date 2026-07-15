@@ -15,13 +15,16 @@ WatchBell 是一个自托管的监控和通知小工具。
 - 网页文本变化检查，支持简单的 `#id`、`.class` 和标签选择器
 - Bark 推送
 - SMTP 邮件通知
+- 通用 Webhook，支持模板化 URL、Headers 和 Body
 - 通知模板，支持 `${rss.title}` 这类变量
 - SQLite 持久化
 - 单用户登录，使用 HttpOnly 签名 cookie
 - 响应式 React + Ant Design 管理界面，支持手机端导航和卡片视图
 - 可视化监控、通知渠道和规则表单，敏感字段不会从 API 回传
 - 从检查、事件、规则判断到通知发送的完整活动追踪
-- 通知失败自动重试，也可以在活动页面手动重试
+- 通知失败自动重试，也可以在活动页面手动重试；事件处理死信可检查并重新入队
+- 规则试跑、每规则免打扰时段和监控连续失败/恢复告警
+- 历史真分页与筛选、自动保留策略、配置 JSON 导入导出
 - 就绪探针、请求 ID、结构化访问日志和一键诊断导出
 - Docker 部署
 - 内置插件清单 API，前端从后端读取插件及默认配置
@@ -168,6 +171,10 @@ go run ./cmd/watchbell
 
 `WATCHBELL_SESSION_SECRET` 用来签名登录 cookie。生产环境一定要固定它；如果不设置，程序会临时生成一个，重启后旧登录会全部失效。
 
+登录失败默认按客户端地址在 15 分钟滑动窗口内限制为 5 次；超过限制时接口返回 `429 Too Many Requests` 和 `Retry-After`。成功登录会清除该客户端的失败记录。可以通过 `WATCHBELL_LOGIN_MAX_FAILURES` 和 `WATCHBELL_LOGIN_FAILURE_WINDOW` 调整。
+
+Cookie 默认只在直接 TLS 请求中自动添加 `Secure`。生产环境建议显式设置 `WATCHBELL_COOKIE_SECURE=true`。如果 WatchBell 只能通过可信反向代理访问，可设 `WATCHBELL_TRUST_PROXY_HEADERS=true`，并用 `WATCHBELL_TRUSTED_PROXY_HOPS` 填写应用与公网之间准确的代理层数（默认 `1`）。登录限流只读取 `X-Forwarded-For` 中由该代理边界控制的位置，不采信可被客户端伪造的 `True-Client-IP` / `X-Real-IP`；HTTPS 判断读取最靠近应用的转发协议值。代理层数配置错误会影响客户地址识别；直接暴露 WatchBell 端口时不要开启。
+
 只有本地临时调试时才建议关闭认证：
 
 ```bash
@@ -193,6 +200,18 @@ WATCHBELL_AUTH_DISABLED=true go run ./cmd/watchbell
 | `WATCHBELL_SESSION_SECRET` | 空 | cookie 签名密钥，建议至少 32 字节 |
 | `WATCHBELL_SESSION_TTL` | `168h` | 登录有效期 |
 | `WATCHBELL_SESSION_COOKIE` | `watchbell_session` | cookie 名称 |
+| `WATCHBELL_COOKIE_SECURE` | 自动判断 | 显式控制 cookie 的 `Secure` 属性；生产环境建议设为 `true` |
+| `WATCHBELL_TRUST_PROXY_HEADERS` | `false` | 仅在应用只能由可信代理访问时，启用安全的代理地址/协议解析 |
+| `WATCHBELL_TRUSTED_PROXY_HOPS` | `1` | 开启代理信任后，应用与公网之间准确的可信代理层数 |
+| `WATCHBELL_LOGIN_MAX_FAILURES` | `5` | 单个客户端在登录窗口内允许的失败次数 |
+| `WATCHBELL_LOGIN_FAILURE_WINDOW` | `15m` | 登录失败限速的滑动窗口 |
+| `WATCHBELL_HISTORY_RETENTION` | `90d` | 事件、检查、通知尝试和审计记录的默认保留时间；`0` / `off` 关闭 |
+| `WATCHBELL_EVENT_RETENTION` | 跟随默认 | 单独设置事件保留时间 |
+| `WATCHBELL_CHECK_RUN_RETENTION` | 跟随默认 | 单独设置检查运行保留时间 |
+| `WATCHBELL_NOTIFICATION_ATTEMPT_RETENTION` | 跟随默认 | 单独设置通知尝试保留时间 |
+| `WATCHBELL_AUDIT_LOG_RETENTION` | 跟随默认 | 单独设置操作审计保留时间 |
+| `WATCHBELL_HISTORY_CLEANUP_INTERVAL` | `6h` | 历史清理扫描间隔 |
+| `WATCHBELL_HISTORY_CLEANUP_BATCH` | `500` | 每类记录单批清理上限 |
 
 ## 监控器配置示例
 
@@ -258,7 +277,7 @@ TestFlight 检查目前基于公开页面里的文字判断状态。默认识别
 
 ## 规则配置
 
-规则使用 JSON。最常用的是 `contains` 和 `regex`。
+管理界面可以用下拉框组合规则，并用该监控最近的真实事件试跑。底层条件是以下 JSON 结构，最常用的操作符是 `contains` 和 `regex`。
 
 ```json
 {
@@ -292,6 +311,8 @@ TestFlight 有空位时本身就会产生事件。如果只想有事件就通知
 {}
 ```
 
+每条规则可单独设置免打扰时段。时区使用 IANA 名称（例如 `Asia/Shanghai`），支持 `22:00` 到次日 `08:00` 这类跨夜区间；处于免打扰时仍会留下“已匹配但跳过”的规则判断记录。
+
 ## 通知渠道
 
 ### Bark
@@ -300,11 +321,12 @@ TestFlight 有空位时本身就会产生事件。如果只想有事件就通知
 {
   "serverUrl": "https://api.day.app",
   "deviceKey": "YOUR_DEVICE_KEY",
-  "group": "WatchBell"
+  "group": "WatchBell",
+  "url": "${rss.link}"
 }
 ```
 
-如果你自己部署了 Bark Server，把 `serverUrl` 换成自己的地址即可。
+如果你自己部署了 Bark Server，把 `serverUrl` 换成自己的地址即可。`url` 支持通知模板变量，点开推送可直达 RSS 条目或 GitHub Release 页面。
 
 ### 邮件
 
@@ -326,17 +348,34 @@ TestFlight 有空位时本身就会产生事件。如果只想有事件就通知
 - `587`：通常配 `startTls=true`
 - `465`：通常配 `implicitTls=true`
 
+### Webhook
+
+```json
+{
+  "url": "https://hooks.example.com/events/${event.id}",
+  "method": "POST",
+  "headers": {
+    "Authorization": "Bearer YOUR_TOKEN",
+    "Content-Type": "application/json"
+  },
+  "bodyTemplate": "{\"title\":\"${message.subject}\",\"body\":\"${message.body}\",\"link\":\"${rss.link}\"}",
+  "allowPrivate": false
+}
+```
+
+URL、请求头和请求体都支持事件变量。此渠道可用来连接 ntfy、Telegram、Discord、飞书、钉钉、企业微信或自己的 HTTP 服务。Webhook URL 和 Headers 都按密钥脱敏，因为很多服务会把 Token 直接放在 URL 中。Webhook 不跟随重定向，会拒绝 `Host`、`Content-Length` 等不安全请求头，并默认阻止回环、内网、link-local 和云 metadata 地址。只有当目标是你控制的内部服务时才应开启 `allowPrivate`。
+
 渠道密钥、SMTP 密码和 GitHub token 只保存在后端。编辑时留空表示保留现有值；列表 API 只返回“已配置”标识，不返回明文。
 
 ## 活动追踪与排查
 
-“活动与诊断”页面按链路展示：
+“活动与诊断”页面按链路展示，支持服务端分页、关联 ID、状态、类型和时间范围筛选：
 
 ```text
 检查记录 -> 事件 -> 规则判断 -> 通知发送
 ```
 
-每次检查都会记录触发方式、状态、耗时、事件数和错误；每条规则都会记录匹配、未匹配、跳过或异常的原因；每次通知会记录渠道、重试次数、下次重试时间和最终错误。配置修改、手动检查、渠道测试与手动重试也会写入审计记录。
+每次检查都会记录触发方式、状态、耗时、事件数和错误；每条规则都会记录匹配、未匹配、跳过或异常的原因；每次通知会记录渠道、重试次数、下次重试时间和最终错误。连续处理失败的事件会进入死信列表，修正配置后可以手动重新入队。配置修改、手动检查、渠道测试与手动重试也会写入审计记录。
 
 健康检查：
 
@@ -348,6 +387,12 @@ GET /api/health/ready
 `/api/health/ready` 同时检查数据库和调度器心跳，适合容器编排的 readiness probe。所有 API 响应带 `X-Request-ID`，错误响应也会返回相同的 `requestId`；服务端访问日志包含请求方法、路径、状态码、耗时和请求 ID，便于从界面错误定位到日志。
 
 出现问题时，可以在“活动与诊断 > 系统”查看数据库、调度器和积压情况，并导出不包含渠道密钥的 JSON 诊断包。
+
+## 配置备份与迁移
+
+在“活动与诊断 > 系统诊断”中可以导出或导入版本化 JSON 配置。默认导出会脱敏；这类备份适合审查或合并回同一实例，但新机恢复需要在明确的风险确认后导出“包含密钥”的完整备份。
+
+导入使用 `merge` 语义：按名称和类型更新现有配置，创建缺失配置，重映射规则关联，但不删除目标实例的配置或运行历史。整次导入在一个事务中执行，失败时不会留下部分修改。
 
 ## 通知模板变量
 
@@ -435,13 +480,15 @@ data/watchbell.db
 
 Docker Compose 使用 volume 持久化 `/data/watchbell.db`。升级镜像前，建议先备份这个文件或 volume。
 
+运行历史默认保留 90 天，清理任务会保护运行中检查、待发送事件和已计划重试。可以通过上述保留策略环境变量为各类数据单独调整或关闭清理。
+
 ## 当前限制
 
 - 目前是单用户系统。
 - 网页检查不执行 JavaScript。
 - TestFlight 状态识别依赖页面文案。
 - 通知会按内置的保守策略重试，重试次数和退避时间暂时不能在界面自定义。
-- 还没有内置数据库备份、恢复和跨实例导入功能。
+- JSON 备份只覆盖可移植配置；运行历史和数据库级容灾仍需备份 SQLite 文件或 volume。
 
 这些限制不是架构障碍，只是还没做到那一步。
 

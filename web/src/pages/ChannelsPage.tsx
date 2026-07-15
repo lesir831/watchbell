@@ -20,6 +20,7 @@ import { DeleteOutlined, EditOutlined, PlusOutlined, SendOutlined } from '@ant-d
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, APIError } from '../api';
 import ConfigFields from '../components/ConfigFields';
+import { AdvancedConfigField, ConfigMode, parseConfigJSON } from '../components/ConfigMode';
 import { EmptyState, PageError, relativeDate, StatusTag } from '../components/Common';
 import type { ChannelType, NotifyChannel, NotifyChannelInput, PluginConfigField } from '../types';
 
@@ -32,7 +33,7 @@ const channelSchemas: Record<ChannelType, { name: string; description: string; f
       { key: 'serverUrl', label: '服务地址', type: 'url', description: '默认使用 https://api.day.app' },
       { key: 'deviceKey', label: '设备密钥', type: 'secret', secret: true, required: true },
       { key: 'group', label: '分组', type: 'string' }, { key: 'sound', label: '提示音', type: 'string' },
-      { key: 'icon', label: '图标 URL', type: 'url' }, { key: 'url', label: '点击跳转 URL', type: 'url' }
+      { key: 'icon', label: '图标 URL', type: 'url' }, { key: 'url', label: '点击跳转 URL', type: 'string', description: '支持 ${rss.link}、${github.release.url} 等模板变量' }
     ],
     defaults: { serverUrl: 'https://api.day.app', deviceKey: '', group: 'WatchBell', sound: '', icon: '', url: '' }
   },
@@ -45,6 +46,17 @@ const channelSchemas: Record<ChannelType, { name: string; description: string; f
       { key: 'startTls', label: '启用 STARTTLS', type: 'boolean' }, { key: 'implicitTls', label: '启用隐式 TLS', type: 'boolean' }
     ],
     defaults: { host: '', port: 587, username: '', password: '', from: '', to: [], startTls: true, implicitTls: false }
+  },
+  webhook: {
+    name: 'Webhook', description: '向任意 HTTP 服务发送模板化请求，可用于 Telegram、Discord、ntfy、飞书、企业微信等集成。',
+    fields: [
+      { key: 'url', label: '请求地址', type: 'secret', secret: true, required: true, description: '支持 ${...} 模板变量；路径或查询中可能含 Token，因此不会回显' },
+      { key: 'method', label: 'HTTP 方法', type: 'string', description: 'POST、PUT、PATCH、DELETE 或 GET' },
+      { key: 'headers', label: '请求头', type: 'json', secret: true, description: 'JSON 对象；Authorization 等敏感值不会回显' },
+      { key: 'bodyTemplate', label: '请求正文模板', type: 'textarea', description: '支持 ${message.subject}、${message.body} 和事件变量' },
+      { key: 'allowPrivate', label: '允许内网地址', type: 'boolean', description: '仅在连接你信任的内网/本机服务时开启；默认阻止 SSRF' }
+    ],
+    defaults: { url: '', method: 'POST', headers: { 'Content-Type': 'application/json' }, bodyTemplate: '{\n  "title": "${message.subject}",\n  "body": "${message.body}",\n  "event": "${event.type}"\n}', allowPrivate: false }
   }
 };
 
@@ -54,7 +66,7 @@ export default function ChannelsPage() {
   const { message } = AntApp.useApp();
   const [editing, setEditing] = useState<NotifyChannel | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const channels = useQuery({ queryKey: ['channels'], queryFn: api.listChannels });
+  const channels = useQuery({ queryKey: ['channels'], queryFn: api.listChannels, refetchInterval: 30_000 });
   const refresh = async () => Promise.all([
     queryClient.invalidateQueries({ queryKey: ['channels'] }), queryClient.invalidateQueries({ queryKey: ['dashboard'] }),
     queryClient.invalidateQueries({ queryKey: ['notificationAttempts'] }), queryClient.invalidateQueries({ queryKey: ['auditLogs'] })
@@ -86,7 +98,7 @@ export default function ChannelsPage() {
     <Space wrap>
       <Button icon={<SendOutlined />} loading={testMutation.isPending && testMutation.variables === record.id} onClick={() => testMutation.mutate(record.id)}>测试</Button>
       <Button icon={<EditOutlined />} onClick={() => { setEditing(record); setDrawerOpen(true); }}>编辑</Button>
-      <Popconfirm title="归档这个渠道？" description="规则中的关联会失效，但历史发送记录会保留。" onConfirm={() => deleteMutation.mutate(record.id)}><Button danger icon={<DeleteOutlined />} aria-label={`归档 ${record.name}`} /></Popconfirm>
+      <Popconfirm title="归档这个渠道？" description="关联会从规则和故障告警中移除；失去全部渠道的规则将一并归档。历史发送记录会保留。" onConfirm={() => deleteMutation.mutate(record.id)}><Button danger icon={<DeleteOutlined />} aria-label={`归档 ${record.name}`} /></Popconfirm>
     </Space>
   );
   return (
@@ -120,26 +132,35 @@ export default function ChannelsPage() {
 
 function ChannelDrawer(props: { open: boolean; record: NotifyChannel | null; saving: boolean; error: Error | null; onClose: () => void; onSave: (input: NotifyChannelInput, testAfter: boolean) => void }) {
   const [form] = Form.useForm();
+  const [advanced, setAdvanced] = useState(false);
   const selectedType = Form.useWatch<ChannelType>('type', form) ?? props.record?.type ?? 'bark';
   const schema = channelSchemas[selectedType];
-  const setInitial = () => form.setFieldsValue({ name: props.record?.name ?? '', type: props.record?.type ?? 'bark', enabled: props.record?.enabled ?? true, config: props.record?.config ?? channelSchemas.bark.defaults });
+  const setInitial = () => {
+    const config = props.record?.config ?? channelSchemas.bark.defaults;
+    setAdvanced(false);
+    form.setFieldsValue({ name: props.record?.name ?? '', type: props.record?.type ?? 'bark', enabled: props.record?.enabled ?? true, config, rawConfig: JSON.stringify(config, null, 2) });
+  };
   const submit = async (testAfter: boolean) => {
     const values = await form.validateFields();
     const knownConfig = Object.fromEntries(schema.fields.map((field) => [field.key, values.config?.[field.key]]).filter(([, value]) => value !== undefined));
-    const config = { ...(props.record?.config ?? {}), ...knownConfig };
+    const config = advanced ? parseConfigJSON(values.rawConfig) : { ...(props.record?.config ?? {}), ...knownConfig };
     props.onSave({ name: values.name.trim(), type: values.type, enabled: values.enabled, config }, testAfter);
   };
   return (
     <Drawer title={props.record ? '编辑通知渠道' : '新建通知渠道'} open={props.open} onClose={props.onClose} width={680} destroyOnClose afterOpenChange={(open) => { if (open) setInitial(); }} footer={<div className="drawer-footer"><Button onClick={props.onClose}>取消</Button><Space><Button loading={props.saving} onClick={() => submit(false)}>保存</Button><Button type="primary" icon={<SendOutlined />} loading={props.saving} onClick={() => submit(true)}>保存并测试</Button></Space></div>}>
       <PageError error={props.error} />
       <Form form={form} layout="vertical" requiredMark="optional" onValuesChange={(changed) => {
-        if (changed.type && !props.record) form.setFieldValue('config', channelSchemas[changed.type as ChannelType].defaults);
+        if (changed.type && !props.record) {
+          const config = channelSchemas[changed.type as ChannelType].defaults;
+          form.setFieldsValue({ config, rawConfig: JSON.stringify(config, null, 2) });
+        }
       }}>
         <Alert className="form-intro" type="info" showIcon message={schema.name} description={schema.description} />
         <Form.Item name="name" label="名称" rules={[{ required: true, whitespace: true }]}><Input placeholder="例如：我的 iPhone" /></Form.Item>
         <Form.Item name="type" label="渠道类型" extra={props.record ? '已创建渠道的类型不可修改。' : undefined}><Select disabled={Boolean(props.record)} options={Object.entries(channelSchemas).map(([value, item]) => ({ label: item.name, value }))} /></Form.Item>
         <Form.Item name="enabled" label="启用渠道" valuePropName="checked"><Switch /></Form.Item>
-        <ConfigFields fields={schema.fields} configuredSecrets={props.record?.configuredSecrets} />
+        <ConfigMode form={form} advanced={advanced} onChange={setAdvanced} baseConfig={props.record?.config} />
+        {advanced ? <AdvancedConfigField /> : <ConfigFields fields={schema.fields} configuredSecrets={props.record?.configuredSecrets} />}
       </Form>
     </Drawer>
   );
