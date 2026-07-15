@@ -44,18 +44,18 @@ func (c *WebpageChecker) Type() string {
 
 func (c *WebpageChecker) Plugin() model.MonitorPlugin {
 	return model.MonitorPlugin{
-		ID: model.MonitorTypeWebpage, Name: "Webpage", Builtin: true,
-		Description:            "Notify when selected text on a webpage changes.",
+		ID: model.MonitorTypeWebpage, Name: "网页变化", Builtin: true,
+		Description:            "抓取网页或指定选择器的文本，在内容发生变化时通知。",
 		DefaultIntervalSeconds: 300,
 		DefaultConfig: map[string]any{
 			"url": "https://example.com", "selector": "", "timeoutSeconds": 15,
 			"ignorePatterns": []string{},
 		},
 		ConfigFields: []model.PluginConfigField{
-			{Key: "url", Label: "Page URL", Type: "url", Required: true},
-			{Key: "selector", Label: "Selector", Type: "string"},
-			{Key: "timeoutSeconds", Label: "Timeout seconds", Type: "number"},
-			{Key: "ignorePatterns", Label: "Ignore patterns", Type: "string-list"},
+			{Key: "url", Label: "网页地址", Type: "url", Required: true},
+			{Key: "selector", Label: "CSS 选择器", Type: "string"},
+			{Key: "timeoutSeconds", Label: "超时时间（秒）", Type: "number"},
+			{Key: "ignorePatterns", Label: "忽略模式", Type: "string-list"},
 		},
 		Events:            []string{"webpage.changed"},
 		TemplateVariables: []string{"webpage.url", "webpage.selector", "webpage.oldHash", "webpage.newHash", "webpage.summary"},

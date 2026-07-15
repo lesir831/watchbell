@@ -48,17 +48,17 @@ func (c *RSSChecker) Type() string {
 func (c *RSSChecker) Plugin() model.MonitorPlugin {
 	return model.MonitorPlugin{
 		ID: model.MonitorTypeRSS, Name: "RSS / Atom", Builtin: true,
-		Description:            "Notify when a feed publishes a new matching item.",
+		Description:            "订阅 RSS、Atom 或 JSON Feed，在出现新条目时生成事件。",
 		DefaultIntervalSeconds: 300,
 		DefaultConfig: map[string]any{
 			"url": "https://example.com/feed.xml", "timeoutSeconds": 15,
 			"notifyExisting": false, "includeFullText": false,
 		},
 		ConfigFields: []model.PluginConfigField{
-			{Key: "url", Label: "Feed URL", Type: "url", Required: true},
-			{Key: "timeoutSeconds", Label: "Timeout seconds", Type: "number"},
-			{Key: "notifyExisting", Label: "Notify existing items", Type: "boolean"},
-			{Key: "includeFullText", Label: "Include full text", Type: "boolean"},
+			{Key: "url", Label: "订阅地址", Type: "url", Required: true},
+			{Key: "timeoutSeconds", Label: "超时时间（秒）", Type: "number"},
+			{Key: "notifyExisting", Label: "首次检查通知已有条目", Type: "boolean"},
+			{Key: "includeFullText", Label: "包含完整正文", Type: "boolean"},
 		},
 		Events:            []string{"rss.item"},
 		TemplateVariables: []string{"rss.title", "rss.link", "rss.author", "rss.summary", "rss.content", "rss.publishedAt", "rss.sourceTitle", "rss.sourceLink"},

@@ -41,14 +41,14 @@ func (c *TestFlightChecker) Type() string {
 func (c *TestFlightChecker) Plugin() model.MonitorPlugin {
 	return model.MonitorPlugin{
 		ID: model.MonitorTypeTestFlight, Name: "TestFlight", Builtin: true,
-		Description:            "Notify when a public TestFlight beta has room for another tester.",
+		Description:            "监控公开 TestFlight 测试链接，在重新出现测试名额时通知。",
 		DefaultIntervalSeconds: 60,
 		DefaultConfig: map[string]any{
 			"url": "https://testflight.apple.com/join/example", "timeoutSeconds": 15,
 		},
 		ConfigFields: []model.PluginConfigField{
-			{Key: "url", Label: "Public invitation URL", Type: "url", Required: true},
-			{Key: "timeoutSeconds", Label: "Timeout seconds", Type: "number"},
+			{Key: "url", Label: "公开邀请地址", Type: "url", Required: true},
+			{Key: "timeoutSeconds", Label: "超时时间（秒）", Type: "number"},
 		},
 		Events:            []string{"testflight.available"},
 		TemplateVariables: []string{"testflight.url", "testflight.status", "testflight.message"},

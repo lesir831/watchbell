@@ -2,9 +2,12 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/watchbell/watchbell/internal/model"
 )
 
 func TestDefaultTemplateIncludesGitHubReleaseAndMigratesOldDefault(t *testing.T) {
@@ -48,5 +51,37 @@ ${rss.link}${testflight.url}${webpage.url}`
 	}
 	if !strings.Contains(template.BodyTemplate, "${github.release.url}") {
 		t.Fatalf("old default template was not migrated: %q", template.BodyTemplate)
+	}
+}
+
+func TestMonitorUpdateOnlyResetsStateWhenConfigMeaningChanges(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "watchbell.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	monitor, err := store.CreateMonitor(ctx, model.MonitorInput{Name: "Example", Type: "rss", Enabled: true, IntervalSeconds: 60, Config: json.RawMessage(`{"a":1,"b":2}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateMonitorCheckResult(ctx, monitor.ID, model.CheckResult{Status: "ok", State: map[string]any{"seen": true}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.UpdateMonitor(ctx, monitor.ID, model.MonitorInput{Name: "Example", Type: "rss", Enabled: true, IntervalSeconds: 60, Config: json.RawMessage(`{"b":2,"a":1}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unchanged, _ := store.GetMonitor(ctx, monitor.ID)
+	if unchanged.LastCheckedAt == nil {
+		t.Fatal("reordered JSON keys must not reset monitor history")
+	}
+	_, err = store.UpdateMonitor(ctx, monitor.ID, model.MonitorInput{Name: "Example", Type: "rss", Enabled: true, IntervalSeconds: 60, Config: json.RawMessage(`{"a":2,"b":2}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, _ := store.GetMonitor(ctx, monitor.ID)
+	if changed.LastCheckedAt != nil || changed.LastStatus != "" {
+		t.Fatal("meaningful config changes must reset checker state")
 	}
 }

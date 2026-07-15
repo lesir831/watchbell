@@ -77,7 +77,7 @@ func (c *GitHubReleaseChecker) Type() string {
 func (c *GitHubReleaseChecker) Plugin() model.MonitorPlugin {
 	return model.MonitorPlugin{
 		ID: model.MonitorTypeGitHubRelease, Name: "GitHub Releases", Builtin: true,
-		Description:            "Notify when a GitHub repository publishes a release.",
+		Description:            "监控 GitHub 仓库，在发布新 Release 时生成通知。",
 		DefaultIntervalSeconds: 300,
 		DefaultConfig: map[string]any{
 			"repository": "owner/repository", "token": "", "apiUrl": defaultGitHubAPIURL,
@@ -85,14 +85,14 @@ func (c *GitHubReleaseChecker) Plugin() model.MonitorPlugin {
 			"includePrereleases": false, "notifyExisting": false,
 		},
 		ConfigFields: []model.PluginConfigField{
-			{Key: "repository", Label: "Repository", Type: "string", Required: true, Description: "owner/repository"},
-			{Key: "token", Label: "Access token", Type: "secret", Secret: true, Description: "Optional for public repositories"},
+			{Key: "repository", Label: "仓库", Type: "string", Required: true, Description: "格式：owner/repository"},
+			{Key: "token", Label: "访问令牌", Type: "secret", Secret: true, Description: "公开仓库可以留空"},
 			{Key: "apiUrl", Label: "API URL", Type: "url"},
-			{Key: "apiVersion", Label: "API version", Type: "string"},
-			{Key: "timeoutSeconds", Label: "Timeout seconds", Type: "number"},
-			{Key: "maxReleases", Label: "Releases per check", Type: "number"},
-			{Key: "includePrereleases", Label: "Include prereleases", Type: "boolean"},
-			{Key: "notifyExisting", Label: "Notify latest on first check", Type: "boolean"},
+			{Key: "apiVersion", Label: "API 版本", Type: "string"},
+			{Key: "timeoutSeconds", Label: "超时时间（秒）", Type: "number"},
+			{Key: "maxReleases", Label: "每次检查的 Release 数量", Type: "number"},
+			{Key: "includePrereleases", Label: "包含预发布版本", Type: "boolean"},
+			{Key: "notifyExisting", Label: "首次检查通知最新版本", Type: "boolean"},
 		},
 		Events: []string{"github.release"},
 		TemplateVariables: []string{

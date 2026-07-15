@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -43,7 +44,61 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	store := &Store{db: db}
+	if err := store.migrate(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+func (s *Store) migrate(ctx context.Context) error {
+	columns := []struct {
+		table      string
+		name       string
+		definition string
+	}{
+		{"monitors", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0"},
+		{"monitors", "deleted_at", "TEXT"},
+		{"rules", "deleted_at", "TEXT"},
+		{"notify_channels", "deleted_at", "TEXT"},
+		{"notification_templates", "deleted_at", "TEXT"},
+	}
+	for _, column := range columns {
+		exists, err := s.columnExists(ctx, column.table, column.name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		query := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", column.table, column.name, column.definition)
+		if _, err := s.db.ExecContext(ctx, query); err != nil {
+			return fmt.Errorf("migrate %s.%s: %w", column.table, column.name, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) columnExists(ctx context.Context, table, column string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) Close() error {
@@ -51,12 +106,12 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) ListMonitors(ctx context.Context) ([]model.Monitor, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, created_at, updated_at FROM monitors ORDER BY id DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, created_at, updated_at FROM monitors WHERE deleted_at IS NULL ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []model.Monitor
+	items := make([]model.Monitor, 0)
 	for rows.Next() {
 		item, err := scanMonitor(rows)
 		if err != nil {
@@ -68,12 +123,12 @@ func (s *Store) ListMonitors(ctx context.Context) ([]model.Monitor, error) {
 }
 
 func (s *Store) ListEnabledMonitors(ctx context.Context) ([]model.Monitor, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, created_at, updated_at FROM monitors WHERE enabled = 1 ORDER BY id ASC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, created_at, updated_at FROM monitors WHERE enabled = 1 AND deleted_at IS NULL ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []model.Monitor
+	items := make([]model.Monitor, 0)
 	for rows.Next() {
 		item, err := scanMonitor(rows)
 		if err != nil {
@@ -85,7 +140,7 @@ func (s *Store) ListEnabledMonitors(ctx context.Context) ([]model.Monitor, error
 }
 
 func (s *Store) GetMonitor(ctx context.Context, id int64) (model.Monitor, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, created_at, updated_at FROM monitors WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, created_at, updated_at FROM monitors WHERE id = ? AND deleted_at IS NULL`, id)
 	return scanMonitor(row)
 }
 
@@ -112,8 +167,17 @@ func (s *Store) UpdateMonitor(ctx context.Context, id int64, input model.Monitor
 		input.IntervalSeconds = 300
 	}
 	config := normalizedJSON(input.Config, "{}")
-	res, err := s.db.ExecContext(ctx, `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, updated_at = ? WHERE id = ?`,
-		strings.TrimSpace(input.Name), input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), nowString(), id)
+	existing, err := s.GetMonitor(ctx, id)
+	if err != nil {
+		return model.Monitor{}, err
+	}
+	resetState := existing.Type != input.Type || !jsonEquivalent(existing.Config, config)
+	query := `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`
+	args := []any{strings.TrimSpace(input.Name), input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), nowString(), id}
+	if resetState {
+		query = `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, state_json = '{}', last_checked_at = NULL, last_status = '', last_message = '', last_error = '', consecutive_failures = 0, updated_at = ? WHERE id = ? AND deleted_at IS NULL`
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return model.Monitor{}, err
 	}
@@ -133,13 +197,25 @@ func (s *Store) UpdateMonitorCheckResult(ctx context.Context, id int64, result m
 		status = "error"
 		lastErr = checkErr.Error()
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE monitors SET state_json = ?, last_checked_at = ?, last_status = ?, last_message = ?, last_error = ?, updated_at = ? WHERE id = ?`,
-		string(state), nowString(), status, message, lastErr, nowString(), id)
+	failureDelta := 0
+	if checkErr != nil {
+		failureDelta = 1
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE monitors SET state_json = ?, last_checked_at = ?, last_status = ?, last_message = ?, last_error = ?, consecutive_failures = CASE WHEN ? = 1 THEN consecutive_failures + 1 ELSE 0 END, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+		string(state), nowString(), status, message, lastErr, failureDelta, nowString(), id)
+	return err
+}
+
+func (s *Store) UpdateMonitorDispatchWarning(ctx context.Context, id int64, warning error) error {
+	if warning == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE monitors SET last_status = 'warning', last_error = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, warning.Error(), nowString(), id)
 	return err
 }
 
 func (s *Store) DeleteMonitor(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM monitors WHERE id = ?`, id)
+	res, err := s.db.ExecContext(ctx, `UPDATE monitors SET enabled = 0, deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, nowString(), nowString(), id)
 	if err != nil {
 		return err
 	}
@@ -151,7 +227,7 @@ func (s *Store) DeleteMonitor(ctx context.Context, id int64) error {
 }
 
 func (s *Store) ListRules(ctx context.Context) ([]model.Rule, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, last_fired_at, created_at, updated_at FROM rules ORDER BY id DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, last_fired_at, created_at, updated_at FROM rules WHERE deleted_at IS NULL ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +236,7 @@ func (s *Store) ListRules(ctx context.Context) ([]model.Rule, error) {
 }
 
 func (s *Store) ListRulesForMonitor(ctx context.Context, monitorID int64) ([]model.Rule, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, last_fired_at, created_at, updated_at FROM rules WHERE monitor_id = ? AND enabled = 1 ORDER BY id ASC`, monitorID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, last_fired_at, created_at, updated_at FROM rules WHERE monitor_id = ? AND enabled = 1 AND deleted_at IS NULL ORDER BY id ASC`, monitorID)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +245,7 @@ func (s *Store) ListRulesForMonitor(ctx context.Context, monitorID int64) ([]mod
 }
 
 func (s *Store) GetRule(ctx context.Context, id int64) (model.Rule, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, last_fired_at, created_at, updated_at FROM rules WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, last_fired_at, created_at, updated_at FROM rules WHERE id = ? AND deleted_at IS NULL`, id)
 	return scanRule(row)
 }
 
@@ -216,7 +292,7 @@ func (s *Store) UpdateRuleFiredAt(ctx context.Context, id int64, firedAt time.Ti
 }
 
 func (s *Store) DeleteRule(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM rules WHERE id = ?`, id)
+	res, err := s.db.ExecContext(ctx, `UPDATE rules SET enabled = 0, deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, nowString(), nowString(), id)
 	if err != nil {
 		return err
 	}
@@ -228,12 +304,12 @@ func (s *Store) DeleteRule(ctx context.Context, id int64) error {
 }
 
 func (s *Store) ListNotifyChannels(ctx context.Context) ([]model.NotifyChannel, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, enabled, config_json, created_at, updated_at FROM notify_channels ORDER BY id DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, enabled, config_json, created_at, updated_at FROM notify_channels WHERE deleted_at IS NULL ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []model.NotifyChannel
+	items := make([]model.NotifyChannel, 0)
 	for rows.Next() {
 		item, err := scanNotifyChannel(rows)
 		if err != nil {
@@ -246,7 +322,7 @@ func (s *Store) ListNotifyChannels(ctx context.Context) ([]model.NotifyChannel, 
 
 func (s *Store) ListNotifyChannelsByIDs(ctx context.Context, ids []int64) ([]model.NotifyChannel, error) {
 	if len(ids) == 0 {
-		return nil, nil
+		return []model.NotifyChannel{}, nil
 	}
 	placeholders := make([]string, 0, len(ids))
 	args := make([]any, 0, len(ids))
@@ -254,13 +330,13 @@ func (s *Store) ListNotifyChannelsByIDs(ctx context.Context, ids []int64) ([]mod
 		placeholders = append(placeholders, "?")
 		args = append(args, id)
 	}
-	query := fmt.Sprintf(`SELECT id, name, type, enabled, config_json, created_at, updated_at FROM notify_channels WHERE enabled = 1 AND id IN (%s) ORDER BY id ASC`, strings.Join(placeholders, ","))
+	query := fmt.Sprintf(`SELECT id, name, type, enabled, config_json, created_at, updated_at FROM notify_channels WHERE enabled = 1 AND deleted_at IS NULL AND id IN (%s) ORDER BY id ASC`, strings.Join(placeholders, ","))
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []model.NotifyChannel
+	items := make([]model.NotifyChannel, 0)
 	for rows.Next() {
 		item, err := scanNotifyChannel(rows)
 		if err != nil {
@@ -272,7 +348,7 @@ func (s *Store) ListNotifyChannelsByIDs(ctx context.Context, ids []int64) ([]mod
 }
 
 func (s *Store) GetNotifyChannel(ctx context.Context, id int64) (model.NotifyChannel, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, type, enabled, config_json, created_at, updated_at FROM notify_channels WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, type, enabled, config_json, created_at, updated_at FROM notify_channels WHERE id = ? AND deleted_at IS NULL`, id)
 	return scanNotifyChannel(row)
 }
 
@@ -293,7 +369,7 @@ func (s *Store) CreateNotifyChannel(ctx context.Context, input model.NotifyChann
 
 func (s *Store) UpdateNotifyChannel(ctx context.Context, id int64, input model.NotifyChannelInput) (model.NotifyChannel, error) {
 	config := normalizedJSON(input.Config, "{}")
-	res, err := s.db.ExecContext(ctx, `UPDATE notify_channels SET name = ?, type = ?, enabled = ?, config_json = ?, updated_at = ? WHERE id = ?`,
+	res, err := s.db.ExecContext(ctx, `UPDATE notify_channels SET name = ?, type = ?, enabled = ?, config_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
 		strings.TrimSpace(input.Name), input.Type, boolInt(input.Enabled), string(config), nowString(), id)
 	if err != nil {
 		return model.NotifyChannel{}, err
@@ -306,7 +382,7 @@ func (s *Store) UpdateNotifyChannel(ctx context.Context, id int64, input model.N
 }
 
 func (s *Store) DeleteNotifyChannel(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM notify_channels WHERE id = ?`, id)
+	res, err := s.db.ExecContext(ctx, `UPDATE notify_channels SET enabled = 0, deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, nowString(), nowString(), id)
 	if err != nil {
 		return err
 	}
@@ -318,12 +394,12 @@ func (s *Store) DeleteNotifyChannel(ctx context.Context, id int64) error {
 }
 
 func (s *Store) ListNotificationTemplates(ctx context.Context) ([]model.NotificationTemplate, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, subject_template, body_template, created_at, updated_at FROM notification_templates ORDER BY id DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, subject_template, body_template, created_at, updated_at FROM notification_templates WHERE deleted_at IS NULL ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []model.NotificationTemplate
+	items := make([]model.NotificationTemplate, 0)
 	for rows.Next() {
 		item, err := scanNotificationTemplate(rows)
 		if err != nil {
@@ -335,7 +411,7 @@ func (s *Store) ListNotificationTemplates(ctx context.Context) ([]model.Notifica
 }
 
 func (s *Store) GetNotificationTemplate(ctx context.Context, id int64) (model.NotificationTemplate, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, subject_template, body_template, created_at, updated_at FROM notification_templates WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, subject_template, body_template, created_at, updated_at FROM notification_templates WHERE id = ? AND deleted_at IS NULL`, id)
 	return scanNotificationTemplate(row)
 }
 
@@ -354,7 +430,7 @@ func (s *Store) CreateNotificationTemplate(ctx context.Context, input model.Noti
 }
 
 func (s *Store) UpdateNotificationTemplate(ctx context.Context, id int64, input model.NotificationTemplateInput) (model.NotificationTemplate, error) {
-	res, err := s.db.ExecContext(ctx, `UPDATE notification_templates SET name = ?, subject_template = ?, body_template = ?, updated_at = ? WHERE id = ?`,
+	res, err := s.db.ExecContext(ctx, `UPDATE notification_templates SET name = ?, subject_template = ?, body_template = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
 		strings.TrimSpace(input.Name), input.SubjectTemplate, input.BodyTemplate, nowString(), id)
 	if err != nil {
 		return model.NotificationTemplate{}, err
@@ -367,7 +443,7 @@ func (s *Store) UpdateNotificationTemplate(ctx context.Context, id int64, input 
 }
 
 func (s *Store) DeleteNotificationTemplate(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM notification_templates WHERE id = ? AND id <> 1`, id)
+	res, err := s.db.ExecContext(ctx, `UPDATE notification_templates SET deleted_at = ?, updated_at = ? WHERE id = ? AND id <> 1 AND deleted_at IS NULL`, nowString(), nowString(), id)
 	if err != nil {
 		return err
 	}
@@ -379,18 +455,30 @@ func (s *Store) DeleteNotificationTemplate(ctx context.Context, id int64) error 
 }
 
 func (s *Store) CreateEvent(ctx context.Context, monitorID int64, event model.EventData) (model.Event, bool, error) {
+	return s.CreateEventForRun(ctx, monitorID, 0, event)
+}
+
+func (s *Store) CreateEventForRun(ctx context.Context, monitorID, checkRunID int64, event model.EventData) (model.Event, bool, error) {
 	payload, err := json.Marshal(event.Payload)
 	if err != nil {
 		return model.Event{}, false, err
 	}
 	now := nowString()
-	res, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO events (monitor_id, type, fingerprint, payload_json, created_at) VALUES (?, ?, ?, ?, ?)`,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.Event{}, false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO events (monitor_id, type, fingerprint, payload_json, created_at) VALUES (?, ?, ?, ?, ?)`,
 		monitorID, event.Type, event.Fingerprint, string(payload), now)
 	if err != nil {
 		return model.Event{}, false, err
 	}
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
+		if err := tx.Commit(); err != nil {
+			return model.Event{}, false, err
+		}
 		existing, err := s.getEventByFingerprint(ctx, monitorID, event.Fingerprint)
 		return existing, false, err
 	}
@@ -398,17 +486,28 @@ func (s *Store) CreateEvent(ctx context.Context, monitorID int64, event model.Ev
 	if err != nil {
 		return model.Event{}, false, err
 	}
+	if checkRunID > 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO event_check_runs (event_id, check_run_id) VALUES (?, ?)`, id, checkRunID); err != nil {
+			return model.Event{}, false, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO event_outbox (event_id, status, attempts, next_attempt_at, created_at, updated_at) VALUES (?, 'pending', 0, ?, ?, ?)`, id, now, now, now); err != nil {
+		return model.Event{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return model.Event{}, false, err
+	}
 	created, err := s.GetEvent(ctx, id)
 	return created, true, err
 }
 
 func (s *Store) GetEvent(ctx context.Context, id int64) (model.Event, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, monitor_id, type, fingerprint, payload_json, created_at FROM events WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT e.id, e.monitor_id, l.check_run_id, e.type, e.fingerprint, e.payload_json, e.created_at FROM events e LEFT JOIN event_check_runs l ON l.event_id = e.id WHERE e.id = ?`, id)
 	return scanEvent(row)
 }
 
 func (s *Store) getEventByFingerprint(ctx context.Context, monitorID int64, fingerprint string) (model.Event, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, monitor_id, type, fingerprint, payload_json, created_at FROM events WHERE monitor_id = ? AND fingerprint = ?`, monitorID, fingerprint)
+	row := s.db.QueryRowContext(ctx, `SELECT e.id, e.monitor_id, l.check_run_id, e.type, e.fingerprint, e.payload_json, e.created_at FROM events e LEFT JOIN event_check_runs l ON l.event_id = e.id WHERE e.monitor_id = ? AND e.fingerprint = ?`, monitorID, fingerprint)
 	return scanEvent(row)
 }
 
@@ -416,12 +515,12 @@ func (s *Store) ListEvents(ctx context.Context, limit int) ([]model.Event, error
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, type, fingerprint, payload_json, created_at FROM events ORDER BY id DESC LIMIT ?`, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT e.id, e.monitor_id, l.check_run_id, e.type, e.fingerprint, e.payload_json, e.created_at FROM events e LEFT JOIN event_check_runs l ON l.event_id = e.id ORDER BY e.id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []model.Event
+	items := make([]model.Event, 0)
 	for rows.Next() {
 		item, err := scanEvent(rows)
 		if err != nil {
@@ -476,7 +575,7 @@ func scanMonitor(row scanner) (model.Monitor, error) {
 	var config, state string
 	var lastChecked sql.NullString
 	var createdAt, updatedAt string
-	err := row.Scan(&item.ID, &item.Name, &item.Type, &enabled, &item.IntervalSeconds, &config, &state, &lastChecked, &item.LastStatus, &item.LastMessage, &item.LastError, &createdAt, &updatedAt)
+	err := row.Scan(&item.ID, &item.Name, &item.Type, &enabled, &item.IntervalSeconds, &config, &state, &lastChecked, &item.LastStatus, &item.LastMessage, &item.LastError, &item.ConsecutiveFailures, &createdAt, &updatedAt)
 	if err != nil {
 		return model.Monitor{}, err
 	}
@@ -490,7 +589,7 @@ func scanMonitor(row scanner) (model.Monitor, error) {
 }
 
 func scanRules(rows *sql.Rows) ([]model.Rule, error) {
-	var items []model.Rule
+	items := make([]model.Rule, 0)
 	for rows.Next() {
 		item, err := scanRule(rows)
 		if err != nil {
@@ -556,12 +655,16 @@ func scanNotificationTemplate(row scanner) (model.NotificationTemplate, error) {
 
 func scanEvent(row scanner) (model.Event, error) {
 	var item model.Event
+	var checkRunID sql.NullInt64
 	var payload, createdAt string
-	err := row.Scan(&item.ID, &item.MonitorID, &item.Type, &item.Fingerprint, &payload, &createdAt)
+	err := row.Scan(&item.ID, &item.MonitorID, &checkRunID, &item.Type, &item.Fingerprint, &payload, &createdAt)
 	if err != nil {
 		return model.Event{}, err
 	}
 	item.Payload = json.RawMessage(defaultJSON(payload, "{}"))
+	if checkRunID.Valid {
+		item.CheckRunID = &checkRunID.Int64
+	}
 	item.CreatedAt = parseTime(createdAt)
 	return item, nil
 }
@@ -602,6 +705,14 @@ func defaultJSON(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func jsonEquivalent(left, right json.RawMessage) bool {
+	var leftValue, rightValue any
+	if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil {
+		return false
+	}
+	return reflect.DeepEqual(leftValue, rightValue)
 }
 
 func boolInt(value bool) int {
