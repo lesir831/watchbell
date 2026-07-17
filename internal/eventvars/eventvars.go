@@ -3,6 +3,7 @@ package eventvars
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -50,7 +51,7 @@ var systemDefinitions = []Definition{
 // globalDefinitions are deliberately short aliases. They provide one template
 // across every monitor type, which is particularly useful for Bark's click URL.
 var globalDefinitions = []Definition{
-	{Key: "url", Label: "跳转地址", Description: "当前事件最适合打开的页面地址；可直接用于 Bark 点击跳转。", ValueType: "url"},
+	{Key: "url", Label: "跳转地址", Description: "当前事件最适合打开的页面地址；可显式用于 Bark 点击跳转，私有或带访问凭据的地址请谨慎外发。", ValueType: "url"},
 	{Key: "title", Label: "标题", Description: "当前事件的人类可读标题。", ValueType: "string"},
 	{Key: "summary", Label: "摘要", Description: "当前事件的简短说明；模块没有独立摘要时可能与正文相同。", ValueType: "string"},
 	{Key: "content", Label: "正文", Description: "当前事件的主要正文内容。", ValueType: "string"},
@@ -250,7 +251,7 @@ func normalizedValues(monitor model.Monitor, payload map[string]any) map[string]
 	}
 	switch monitor.Type {
 	case model.MonitorTypeRSS:
-		values["url"] = firstNonEmpty(stringAt(payload, "rss.link"), stringAt(payload, "rss.sourceLink"), monitorConfigString(monitor, "url"))
+		values["url"] = firstNonEmpty(stringAt(payload, "rss.link"), stringAt(payload, "rss.sourceLink"), safeMonitorConfigURL(monitor, "url"))
 		values["title"] = firstNonEmpty(stringAt(payload, "rss.title"), stringAt(payload, "rss.sourceTitle"), monitor.Name)
 		values["summary"] = stringAt(payload, "rss.summary")
 		values["content"] = stringAt(payload, "rss.content")
@@ -258,13 +259,13 @@ func normalizedValues(monitor model.Monitor, payload map[string]any) map[string]
 		values["publishedAt"] = stringAt(payload, "rss.publishedAt")
 		values["status"] = "published"
 	case model.MonitorTypeTestFlight:
-		values["url"] = firstNonEmpty(stringAt(payload, "testflight.url"), monitorConfigString(monitor, "url"))
+		values["url"] = firstNonEmpty(stringAt(payload, "testflight.url"), safeMonitorConfigURL(monitor, "url"))
 		values["title"] = monitor.Name
 		values["summary"] = stringAt(payload, "testflight.message")
 		values["content"] = stringAt(payload, "testflight.message")
 		values["status"] = stringAt(payload, "testflight.status")
 	case model.MonitorTypeWebpage:
-		values["url"] = firstNonEmpty(stringAt(payload, "webpage.url"), monitorConfigString(monitor, "url"))
+		values["url"] = firstNonEmpty(stringAt(payload, "webpage.url"), safeMonitorConfigURL(monitor, "url"))
 		values["title"] = monitor.Name
 		values["summary"] = stringAt(payload, "webpage.summary")
 		values["content"] = stringAt(payload, "webpage.summary")
@@ -343,6 +344,56 @@ func monitorConfigString(monitor model.Monitor, key string) string {
 		return ""
 	}
 	return fmt.Sprint(value)
+}
+
+// safeMonitorConfigURL is used only for an implicit fallback from monitor
+// configuration. Event-provided links remain untouched because they are part
+// of the persisted event itself. Configuration URLs, on the other hand, may
+// contain credentials intended only for fetching a private source and must not
+// silently become notification click targets.
+func safeMonitorConfigURL(monitor model.Monitor, key string) string {
+	raw := strings.TrimSpace(monitorConfigString(monitor, key))
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
+		return ""
+	}
+	query, err := url.ParseQuery(parsed.RawQuery)
+	if err != nil {
+		return ""
+	}
+	for key := range query {
+		if sensitiveQueryKey(key) {
+			return ""
+		}
+	}
+	return raw
+}
+
+func sensitiveQueryKey(key string) bool {
+	normalized := strings.Map(func(value rune) rune {
+		if value >= 'A' && value <= 'Z' {
+			return value + ('a' - 'A')
+		}
+		if (value >= 'a' && value <= 'z') || (value >= '0' && value <= '9') {
+			return value
+		}
+		return -1
+	}, key)
+	if normalized == "key" || normalized == "sig" || normalized == "auth" || normalized == "jwt" {
+		return true
+	}
+	for _, marker := range []string{
+		"token", "secret", "password", "passwd", "credential", "signature",
+		"apikey", "accesskey", "privatekey", "authorization", "authentication", "sessionid",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func githubRepositoryURL(repository string) string {

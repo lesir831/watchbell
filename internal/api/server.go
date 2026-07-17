@@ -254,9 +254,11 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 		respond(w, r, model.Monitor{}, err)
 		return
 	}
-	if existing.Type == input.Type {
-		input.Config = mergeSecretConfig(existing.Config, input.Config, monitorSecretKeys(input.Type, s.scheduler.Plugins()))
+	if existing.Type != input.Type {
+		writeError(w, r, validationProblem("已创建监控的类型不可修改。", map[string]string{"type": "如需使用其他类型，请新建监控。"}))
+		return
 	}
+	input.Config = mergeSecretConfig(existing.Config, input.Config, monitorSecretKeys(input.Type, s.scheduler.Plugins()))
 	if err := s.validateMonitorInput(r.Context(), input); err != nil {
 		writeError(w, r, err)
 		return

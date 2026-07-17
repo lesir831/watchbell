@@ -337,7 +337,7 @@ TestFlight 有空位时本身就会产生事件。如果只想有事件就通知
 }
 ```
 
-如果你自己部署了 Bark Server，把 `serverUrl` 换成自己的地址即可。`url` 支持通知模板变量，点开推送可直达 RSS 条目或 GitHub Release 页面。
+如果你自己部署了 Bark Server，把 `serverUrl` 换成自己的地址即可。`url` 支持通知模板变量，点开推送可直达 RSS 条目或 GitHub Release 页面。新建渠道默认不填写跳转地址；只有确认事件 URL 不含私有订阅令牌、签名参数或其他凭据时，再显式配置 `${url}`。
 
 ### 邮件
 

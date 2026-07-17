@@ -1,6 +1,7 @@
 package eventvars
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 
@@ -93,6 +94,53 @@ func TestEventDataProtectsReservedAndGlobalVariables(t *testing.T) {
 	if monitorData["name"] != "Protected feed" || eventData["id"] != int64(11) {
 		t.Fatalf("reserved context was overwritten: monitor=%#v event=%#v", monitorData, eventData)
 	}
+}
+
+func TestImplicitMonitorURLFallbackRejectsCredentialBearingURLs(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{name: "ordinary URL", url: "https://example.com/feed.xml", want: "https://example.com/feed.xml"},
+		{name: "benign query", url: "https://example.com/feed.xml?format=rss", want: "https://example.com/feed.xml?format=rss"},
+		{name: "userinfo", url: "https://reader:secret@example.com/feed.xml"},
+		{name: "token query", url: "https://example.com/feed.xml?access_token=secret"},
+		{name: "signature query", url: "https://example.com/feed.xml?X-Signature=secret"},
+		{name: "password query", url: "https://example.com/feed.xml?passwd=secret"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			monitor := model.Monitor{
+				Name: "Private feed", Type: model.MonitorTypeRSS,
+				Config: []byte(`{"url":` + mustJSON(test.url) + `}`),
+			}
+			got := EnrichPayload(monitor, map[string]any{"rss": map[string]any{"title": "Item"}})
+			if got["url"] != test.want {
+				t.Fatalf("url = %#v, want %#v", got["url"], test.want)
+			}
+		})
+	}
+}
+
+func TestPersistedEventURLRemainsAuthoritative(t *testing.T) {
+	monitor := model.Monitor{
+		Name: "Page", Type: model.MonitorTypeWebpage,
+		Config: []byte(`{"url":"https://config.example/page"}`),
+	}
+	eventURL := "https://event.example/page?access_token=event-snapshot"
+	got := EnrichPayload(monitor, map[string]any{"webpage": map[string]any{"url": eventURL}})
+	if got["url"] != eventURL {
+		t.Fatalf("event URL = %#v, want persisted value %#v", got["url"], eventURL)
+	}
+}
+
+func mustJSON(value string) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return string(encoded)
 }
 
 func moduleRoot(monitorType string) string {

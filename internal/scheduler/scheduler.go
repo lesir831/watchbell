@@ -547,23 +547,10 @@ func (s *Scheduler) retryAttempt(ctx context.Context, source model.NotificationA
 	if len(source.Data) > 0 {
 		_ = json.Unmarshal(source.Data, &data)
 	}
-	// Older failed attempts may predate cross-module variables such as ${url}.
-	// Rebuild their event context before rendering the channel configuration so
-	// retries benefit from the current variable contract as well.
-	if source.EventID != nil {
-		if event, eventErr := s.store.GetEvent(ctx, *source.EventID); eventErr == nil {
-			if monitor, monitorErr := s.store.GetMonitorIncludingArchived(ctx, event.MonitorID); monitorErr == nil {
-				var payload map[string]any
-				if json.Unmarshal(event.Payload, &payload) == nil {
-					ruleData := data["rule"]
-					data = eventvars.EventData(monitor, event, payload)
-					if ruleData != nil {
-						data["rule"] = ruleData
-					}
-				}
-			}
-		}
+	if data == nil {
+		data = map[string]any{}
 	}
+	s.backfillRetryGlobalVariables(ctx, source, data)
 	attempt, sendErr := s.sendAndRecord(ctx, channel, notifier.Message{Subject: source.Subject, Body: source.Body, Data: data}, model.NotificationAttemptInput{
 		MonitorID: source.MonitorID, EventID: source.EventID, RuleEvaluationID: source.RuleEvaluationID, ChannelID: source.ChannelID,
 		RetryOfID: int64Ptr(source.ID), ChannelName: channel.Name, ChannelType: channel.Type,
@@ -575,6 +562,81 @@ func (s *Scheduler) retryAttempt(ctx context.Context, source model.NotificationA
 		}
 	}
 	return attempt, sendErr
+}
+
+// backfillRetryGlobalVariables upgrades attempts created before the common
+// event variables existed. The failed attempt's Data is the delivery snapshot:
+// values already stored there must win over both the historical event row and
+// the monitor's current configuration. Only missing global aliases are added.
+func (s *Scheduler) backfillRetryGlobalVariables(ctx context.Context, source model.NotificationAttempt, data map[string]any) {
+	if source.EventID == nil {
+		return
+	}
+	globals := eventvars.VariableCatalog().Globals
+	missingGlobal := false
+	for _, definition := range globals {
+		if _, exists := data[definition.Key]; !exists {
+			missingGlobal = true
+			break
+		}
+	}
+	if !missingGlobal {
+		return
+	}
+	event, err := s.store.GetEvent(ctx, *source.EventID)
+	if err != nil {
+		return
+	}
+	var payload map[string]any
+	if json.Unmarshal(event.Payload, &payload) != nil {
+		return
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	// The persisted attempt may contain an older copy of the module payload.
+	// Overlay it at the top level so those snapshot values drive the aliases.
+	for key, value := range data {
+		payload[key] = value
+	}
+
+	monitor := model.Monitor{}
+	if monitorData, ok := data["monitor"].(map[string]any); ok {
+		monitor.Name, _ = monitorData["name"].(string)
+		monitor.Type, _ = monitorData["type"].(string)
+	}
+	if event.CheckRunID != nil {
+		if run, runErr := s.store.GetCheckRun(ctx, *event.CheckRunID); runErr == nil && run.MonitorID == event.MonitorID {
+			if monitor.Name == "" {
+				monitor.Name = run.MonitorName
+			}
+			if monitor.Type == "" {
+				monitor.Type = run.MonitorType
+			}
+			if json.Valid(run.ConfigSnapshot) {
+				monitor.Config = append(json.RawMessage(nil), run.ConfigSnapshot...)
+			}
+		}
+	}
+	if monitor.Type == "" {
+		// The monitor type selects the module mapping, but deliberately do not
+		// copy its current name or config into the historical snapshot.
+		if current, monitorErr := s.store.GetMonitorIncludingArchived(ctx, event.MonitorID); monitorErr == nil {
+			monitor.Type = current.Type
+		}
+	}
+	if monitor.Type == "" {
+		return
+	}
+	derived := eventvars.EnrichPayload(monitor, payload)
+	for _, definition := range globals {
+		if _, exists := data[definition.Key]; exists {
+			continue
+		}
+		if value, exists := derived[definition.Key]; exists {
+			data[definition.Key] = value
+		}
+	}
 }
 
 func (s *Scheduler) runClaimedNotificationRetry(ctx context.Context, source model.NotificationAttempt) (model.NotificationAttempt, error) {

@@ -26,6 +26,15 @@ export function defaultConditionGroup(field = ''): RuleConditionGroup {
   return { match: 'all', conditions: [defaultCondition(field)] };
 }
 
+function normalizeMatchMode(value: unknown): RuleConditionGroup['match'] {
+  return typeof value === 'string' && value.trim().toLowerCase() === 'any' ? 'any' : 'all';
+}
+
+function normalizeOperator(value: unknown): RuleOperator {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return operatorOptions.some((item) => item.value === normalized) ? normalized as RuleOperator : 'contains';
+}
+
 export function normalizeConditionGroup(value: unknown, fallbackField = ''): RuleConditionGroup {
   if (!value || typeof value !== 'object') return defaultConditionGroup(fallbackField);
   const candidate = value as { match?: unknown; conditions?: unknown };
@@ -34,14 +43,14 @@ export function normalizeConditionGroup(value: unknown, fallbackField = ''): Rul
     if (node && typeof node === 'object' && Array.isArray((node as RuleConditionGroup).conditions)) {
       const group = node as Partial<RuleConditionGroup>;
       const children = (group.conditions ?? []).map(normalizeNode);
-      return { match: group.match === 'any' ? 'any' : 'all', conditions: children.length ? children : [defaultCondition(fallbackField)] };
+      return { match: normalizeMatchMode(group.match), conditions: children.length ? children : [defaultCondition(fallbackField)] };
     }
     const leaf = (node ?? {}) as Partial<RuleConditionLeaf>;
-    const operator = operatorOptions.some((item) => item.value === leaf.operator) ? leaf.operator as RuleOperator : 'contains';
+    const operator = normalizeOperator(leaf.operator);
     return { field: typeof leaf.field === 'string' ? leaf.field : fallbackField, operator, ...(operator === 'exists' ? {} : { value: typeof leaf.value === 'string' ? leaf.value : '' }) };
   };
   return {
-    match: candidate.match === 'any' ? 'any' : 'all',
+    match: normalizeMatchMode(candidate.match),
     conditions: candidate.conditions.map(normalizeNode)
   };
 }
