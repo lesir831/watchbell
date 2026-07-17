@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -309,5 +310,44 @@ func TestEmptyCollectionsUseArrays(t *testing.T) {
 		if string(body) != "[]\n" {
 			t.Fatalf("%s returned %q", path, body)
 		}
+	}
+}
+
+func TestMonitorTypeCannotBeChangedThroughAPI(t *testing.T) {
+	server, db := newTestServer(t)
+	monitor, err := db.CreateMonitor(context.Background(), model.MonitorInput{
+		Name: "Feed", Type: model.MonitorTypeRSS, Enabled: false, IntervalSeconds: 60,
+		Config: json.RawMessage(`{"url":"https://example.com/feed.xml"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(model.MonitorInput{
+		Name: "Feed", Type: model.MonitorTypeWebpage, Enabled: false, IntervalSeconds: 60,
+		Config: json.RawMessage(`{"url":"https://example.com/page"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPut, server.URL+"/api/monitors/"+fmt.Sprint(monitor.ID), bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusUnprocessableEntity {
+		payload, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d body = %s", response.StatusCode, payload)
+	}
+	stored, err := db.GetMonitor(context.Background(), monitor.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Type != model.MonitorTypeRSS {
+		t.Fatalf("monitor type changed to %q", stored.Type)
 	}
 }

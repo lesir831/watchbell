@@ -81,8 +81,18 @@ button, input, textarea { font: inherit; }
 .detail-health-alert { margin-bottom: 20px; }
 
 .condition-builder { margin: -4px 0 22px; padding: 18px; border: 1px solid #dfe6f1; border-radius: 10px; background: #f8faff; }
-.condition-remove { display: flex; align-items: center; }
-.condition-remove.labeled { padding-top: 30px; }
+.condition-builder > .ant-alert { margin-bottom: 14px; }
+.condition-group { padding: 14px; border: 1px solid #dbe3ef; border-left: 3px solid #6c8df4; border-radius: 10px; background: #fff; }
+.condition-group-depth-1 { border-left-color: #7c6ee6; background: #fbfaff; }
+.condition-group-depth-2 { border-left-color: #3ba887; background: #f9fffc; }
+.condition-group-depth-3, .condition-group-depth-4 { border-left-color: #d58b35; background: #fffdf8; }
+.condition-group-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.condition-group-children { display: grid; gap: 10px; }
+.condition-node { position: relative; min-width: 0; padding-right: 38px; }
+.condition-leaf { display: grid; grid-template-columns: minmax(170px, 1.2fr) minmax(140px, .8fr) minmax(180px, 1fr); gap: 8px; }
+.condition-node-delete { position: absolute; top: 1px; right: 0; }
+.condition-node:has(> .condition-group) > .condition-node-delete { top: 10px; right: 4px; }
+.condition-add-actions { margin-top: 12px; }
 .rule-test-row { margin: -6px 0 16px; display: flex; align-items: center; gap: 12px; }
 .rule-test-result { margin-bottom: 20px; }
 .code-input, .detail-json, .message-preview { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
@@ -90,6 +100,13 @@ button, input, textarea { font: inherit; }
 .preview-event-select { width: 100%; margin-top: 8px; }
 .variable-card { margin-top: 22px; background: #f8faff; }
 .copy-tag { cursor: pointer; }
+.help-monitor-select { width: min(520px, 100%); }
+.help-rule-example { max-height: none; margin-bottom: 0; }
+.variable-reference-card > .ant-card-body { padding-top: 18px; }
+.variable-reference-card h4 { margin: 0 0 6px; }
+.variable-section h5 { margin: 4px 0 6px; }
+.variable-type-tag { margin-top: 6px; color: #51617c; font-family: "SFMono-Regular", Consolas, monospace; }
+.variable-live-value { display: inline-block; max-width: 230px; font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; }
 .activity-shell { border: 1px solid #e6ebf3; }
 .activity-shell > .ant-card-body { padding-top: 8px; }
 .detail-json { margin-top: 18px; padding: 16px; overflow: auto; border: 1px solid #e0e6f0; border-radius: 9px; background: #f7f9fc; color: #24324c; font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
@@ -130,8 +147,15 @@ button, input, textarea { font: inherit; }
   .drawer-footer > .ant-space .ant-btn { flex: 1; }
   .drawer-footer > .ant-btn { width: 100%; }
   .condition-builder { padding: 14px; }
+	.condition-group { padding: 11px; }
+	.condition-group-header { align-items: flex-start; flex-direction: column; }
+	.condition-group-children { gap: 12px; }
+	.condition-node { padding: 0 0 40px; }
+	.condition-leaf { grid-template-columns: 1fr; }
+	.condition-node-delete, .condition-node:has(> .condition-group) > .condition-node-delete { top: auto; right: 0; bottom: 0; }
+	.condition-add-actions { width: 100%; }
+	.condition-add-actions .ant-btn { flex: 1; }
   .config-mode-row { align-items: stretch; flex-direction: column; }
-  .condition-remove.labeled { padding-top: 0; }
   .rule-test-row { align-items: flex-start; flex-direction: column; }
   .activity-shell > .ant-card-body { padding: 8px 10px 16px; }
   .activity-shell .ant-tabs-nav-wrap { min-width: 100%; }

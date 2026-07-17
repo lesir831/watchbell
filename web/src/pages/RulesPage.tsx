@@ -19,15 +19,14 @@ import {
   Tag,
   Typography
 } from 'antd';
-import { DeleteOutlined, EditOutlined, ExperimentOutlined, MinusCircleOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
+import { DeleteOutlined, EditOutlined, ExperimentOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
+import ConditionBuilder, { defaultConditionGroup, normalizeConditionGroup, validateConditionGroup } from '../components/ConditionBuilder';
 import { EmptyState, PageError, relativeDate, StatusTag } from '../components/Common';
-import type { Monitor, MonitorPlugin, NotificationTemplate, NotifyChannel, Rule, RuleInput } from '../types';
+import type { Monitor, MonitorPlugin, NotificationTemplate, NotifyChannel, Rule, RuleConditionGroup, RuleInput } from '../types';
 
 const { Text, Title } = Typography;
-
-type ConditionRow = { field: string; operator: string; value?: string };
 
 const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 const clockPattern = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
@@ -118,17 +117,20 @@ function RuleDrawer(props: {
 }) {
   const [form] = Form.useForm();
   const { message } = AntApp.useApp();
+  const [conditionTree, setConditionTree] = useState<RuleConditionGroup>(() => defaultConditionGroup());
   const monitorId = Form.useWatch<number>('monitorId', form);
   const allEvents = Form.useWatch<boolean>('allEvents', form);
   const quietHoursEnabled = Form.useWatch<boolean>(['quietHours', 'enabled'], form);
   const monitor = props.monitors.find((item) => item.id === monitorId);
   const plugin = props.plugins.find((item) => item.id === monitor?.type);
   const defaultTemplateId = props.templates.find((item) => item.isDefault)?.id;
-  const fieldOptions = (plugin?.templateVariables ?? []).map((value) => ({ label: value, value }));
+  const conditionFields = plugin?.templateVariables ?? [];
   const testRule = useMutation({
     mutationFn: async () => {
-      const values = await form.validateFields(['monitorId', 'allEvents', 'match', 'conditions']);
-      const condition = values.allEvents ? {} : { match: values.match, conditions: values.conditions };
+      const values = await form.validateFields(['monitorId', 'allEvents']);
+      const conditionError = values.allEvents ? null : validateConditionGroup(conditionTree);
+      if (conditionError) throw new Error(conditionError);
+      const condition = values.allEvents ? {} : conditionTree;
       return api.testRule({ monitorId: values.monitorId, condition, limit: 20 });
     },
     onError: (error: Error) => message.error(error.message)
@@ -136,22 +138,28 @@ function RuleDrawer(props: {
 
   const setInitial = () => {
     testRule.reset();
-    const condition = props.record?.condition as { match?: string; conditions?: ConditionRow[] } | undefined;
-    const isAllEvents = !condition || Object.keys(condition).length === 0;
+    const condition = props.record?.condition;
+    const storedConditions = (condition as Partial<RuleConditionGroup> | undefined)?.conditions;
+    const isAllEvents = !condition || Object.keys(condition).length === 0 || (Array.isArray(storedConditions) && storedConditions.length === 0);
     const initialMonitor = props.monitors.find((item) => item.id === (props.record?.monitorId ?? props.monitors[0]?.id));
     const initialPlugin = props.plugins.find((item) => item.id === initialMonitor?.type);
+    setConditionTree(normalizeConditionGroup(condition, initialPlugin?.templateVariables[0] ?? ''));
     form.setFieldsValue({
       name: props.record?.name ?? '', monitorId: props.record?.monitorId ?? props.monitors[0]?.id,
       enabled: props.record?.enabled ?? true, cooldownSeconds: props.record?.cooldownSeconds ?? 0,
       notifyChannelIds: props.record?.notifyChannelIds ?? [], templateId: props.record?.templateId ?? defaultTemplateId,
-      allEvents: isAllEvents, match: condition?.match ?? 'all',
-      quietHours: { enabled: false, start: '22:00', end: '08:00', timezone: browserTimezone, ...props.record?.quietHours },
-      conditions: condition?.conditions?.length ? condition.conditions : [{ field: initialPlugin?.templateVariables[0], operator: 'contains', value: '' }]
+      allEvents: isAllEvents,
+      quietHours: { enabled: false, start: '22:00', end: '08:00', timezone: browserTimezone, ...props.record?.quietHours }
     });
   };
   const submit = async () => {
     const values = await form.validateFields();
-    const condition = values.allEvents ? {} : { match: values.match, conditions: values.conditions };
+    const conditionError = values.allEvents ? null : validateConditionGroup(conditionTree);
+    if (conditionError) {
+      message.error(conditionError);
+      return;
+    }
+    const condition = values.allEvents ? {} : conditionTree;
     props.onSave({
       name: values.name.trim(), monitorId: values.monitorId, enabled: values.enabled,
       cooldownSeconds: values.cooldownSeconds ?? 0, notifyChannelIds: values.notifyChannelIds,
@@ -165,14 +173,14 @@ function RuleDrawer(props: {
     });
   };
   return (
-    <Drawer title={props.record ? '编辑规则' : '新建规则'} open={props.open} onClose={props.onClose} width={720} destroyOnClose afterOpenChange={(open) => { if (open) setInitial(); }} footer={<div className="drawer-footer"><Button onClick={props.onClose}>取消</Button><Button type="primary" loading={props.saving} onClick={submit}>保存规则</Button></div>}>
+    <Drawer title={props.record ? '编辑规则' : '新建规则'} open={props.open} onClose={props.onClose} width={920} destroyOnClose afterOpenChange={(open) => { if (open) setInitial(); }} footer={<div className="drawer-footer"><Button onClick={props.onClose}>取消</Button><Button type="primary" loading={props.saving} onClick={submit}>保存规则</Button></div>}>
       <PageError error={props.error} />
       <Form form={form} layout="vertical" requiredMark="optional" onValuesChange={(changed) => {
         testRule.reset();
         if (changed.monitorId && !props.record) {
           const nextMonitor = props.monitors.find((item) => item.id === changed.monitorId);
           const nextPlugin = props.plugins.find((item) => item.id === nextMonitor?.type);
-          form.setFieldValue('conditions', [{ field: nextPlugin?.templateVariables[0], operator: 'contains', value: '' }]);
+          setConditionTree(defaultConditionGroup(nextPlugin?.templateVariables[0] ?? ''));
         }
       }}>
         <Form.Item name="name" label="规则名称" rules={[{ required: true, whitespace: true }]}><Input placeholder="例如：标题包含 TestFlight" /></Form.Item>
@@ -181,22 +189,8 @@ function RuleDrawer(props: {
         <Form.Item name="allEvents" label="匹配所有新事件" valuePropName="checked"><Switch /></Form.Item>
         {!allEvents && (
           <div className="condition-builder">
-            <Form.Item name="match" label="条件关系"><Select options={[{ label: '满足全部条件', value: 'all' }, { label: '满足任一条件', value: 'any' }]} /></Form.Item>
-            <Form.List name="conditions">
-              {(fields, { add, remove }) => (
-                <Space direction="vertical" className="full-width">
-                  {fields.map((field, index) => (
-                    <Row gutter={8} key={field.key} align="top">
-                      <Col xs={24} md={9}><Form.Item {...field} name={[field.name, 'field']} label={index === 0 ? '事件字段' : undefined} rules={[{ required: true }]}><Select showSearch options={fieldOptions} /></Form.Item></Col>
-                      <Col xs={10} md={6}><Form.Item {...field} name={[field.name, 'operator']} label={index === 0 ? '判断方式' : undefined} rules={[{ required: true }]}><Select options={operatorOptions} /></Form.Item></Col>
-                      <Col xs={12} md={8}><Form.Item noStyle shouldUpdate={(previous, current) => previous.conditions?.[index]?.operator !== current.conditions?.[index]?.operator}>{({ getFieldValue }) => getFieldValue(['conditions', index, 'operator']) === 'exists' ? null : <Form.Item {...field} name={[field.name, 'value']} label={index === 0 ? '值' : undefined} rules={[{ required: true }]}><Input /></Form.Item>}</Form.Item></Col>
-                      <Col xs={2} md={1} className={index === 0 ? 'condition-remove labeled' : 'condition-remove'}><Button type="text" danger icon={<MinusCircleOutlined />} disabled={fields.length === 1} onClick={() => remove(field.name)} aria-label="删除条件" /></Col>
-                    </Row>
-                  ))}
-                  <Button type="dashed" block icon={<PlusOutlined />} onClick={() => add({ field: fieldOptions[0]?.value, operator: 'contains', value: '' })}>添加条件</Button>
-                </Space>
-              )}
-            </Form.List>
+            <Alert type="info" showIcon message="支持嵌套条件组" description="条件组可以继续包含 AND / OR 子组；“在最近时间内”使用 2m、30s、1h 等时长。" />
+            <ConditionBuilder value={conditionTree} fields={conditionFields} onChange={(value) => { setConditionTree(value); testRule.reset(); }} />
           </div>
         )}
         <div className="rule-test-row">
@@ -240,8 +234,3 @@ function RuleDrawer(props: {
     </Drawer>
   );
 }
-
-const operatorOptions = [
-  { label: '包含', value: 'contains' }, { label: '不包含', value: 'not_contains' },
-  { label: '等于', value: 'equals' }, { label: '正则表达式', value: 'regex' }, { label: '字段存在', value: 'exists' }
-];

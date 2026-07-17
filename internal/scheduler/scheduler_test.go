@@ -174,6 +174,184 @@ func TestTraceChainAndRetry(t *testing.T) {
 	}
 }
 
+func TestNotificationDataIncludesCrossModuleVariables(t *testing.T) {
+	monitor := model.Monitor{ID: 1, Name: "Feed", Type: model.MonitorTypeRSS, Config: json.RawMessage(`{"url":"https://example.com/feed.xml"}`)}
+	ruleItem := model.Rule{ID: 2, Name: "Keywords"}
+	event := model.Event{ID: 3, Type: "rss.item", Fingerprint: "item-3", CreatedAt: time.Date(2026, time.July, 17, 12, 0, 0, 0, time.UTC)}
+	data := notificationData(monitor, ruleItem, event, map[string]any{"rss": map[string]any{
+		"title": "Version 3", "link": "https://example.com/v3", "publishedAt": "2026-07-17T11:59:00Z",
+	}}, []string{"Version"})
+	if data["url"] != "https://example.com/v3" || data["title"] != "Version 3" || data["publishedAt"] != "2026-07-17T11:59:00Z" {
+		t.Fatalf("missing cross-module variables: %#v", data)
+	}
+	if data["rule"].(map[string]any)["name"] != "Keywords" || data["event"].(map[string]any)["id"] != int64(3) {
+		t.Fatalf("system context changed: %#v", data)
+	}
+}
+
+func TestRetryAttemptPreservesPersistedNotificationSnapshot(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	monitor, err := db.CreateMonitor(ctx, model.MonitorInput{
+		Name: "Original feed", Type: model.MonitorTypeRSS, Enabled: false, IntervalSeconds: 60,
+		Config: json.RawMessage(`{"url":"https://old.example/feed.xml"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, _, err := db.CreateEvent(ctx, monitor.ID, model.EventData{
+		Type: "rss.item", Fingerprint: "database-fingerprint",
+		Payload: map[string]any{"rss": map[string]any{"title": "Database event title"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, err := db.CreateNotifyChannel(ctx, model.NotifyChannelInput{Name: "Retry channel", Type: "trace_channel", Enabled: true, Config: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := json.Marshal(map[string]any{
+		"url":     "https://old.example/item",
+		"title":   "Snapshot global title",
+		"summary": "Snapshot summary",
+		"monitor": map[string]any{"id": monitor.ID, "name": "Original feed", "type": model.MonitorTypeRSS},
+		"event":   map[string]any{"id": event.ID, "type": event.Type, "fingerprint": "snapshot-fingerprint"},
+		"rule":    map[string]any{"id": 42, "name": "Original rule"},
+		"rss":     map[string]any{"title": "Snapshot module title"},
+		"custom":  "keep-me",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextRetry := time.Now().UTC().Add(time.Minute)
+	monitorID, eventID, channelID := monitor.ID, event.ID, channel.ID
+	source, err := db.CreateNotificationAttempt(ctx, model.NotificationAttemptInput{
+		MonitorID: &monitorID, EventID: &eventID, ChannelID: &channelID,
+		ChannelName: channel.Name, ChannelType: channel.Type, Kind: "delivery", Status: "failed",
+		Subject: "Original subject", Body: "Original body", Data: snapshot, Error: "provider unavailable",
+		AttemptNo: 1, NextRetryAt: &nextRetry,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpdateMonitor(ctx, monitor.ID, model.MonitorInput{
+		Name: "Renamed feed", Type: model.MonitorTypeRSS, Enabled: false, IntervalSeconds: 60,
+		Config: json.RawMessage(`{"url":"https://new.example/feed.xml"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	sender := &traceNotifier{}
+	scheduler := New(db, checker.NewRegistry(), notifier.NewRegistry(sender), Options{})
+	if _, err := scheduler.RetryAttempt(ctx, source.ID); err != nil {
+		t.Fatal(err)
+	}
+	messages := sender.sentMessages()
+	if len(messages) != 1 {
+		t.Fatalf("retry sends = %d, want 1", len(messages))
+	}
+	data := messages[0].Data
+	if data["url"] != "https://old.example/item" || data["title"] != "Snapshot global title" || data["summary"] != "Snapshot summary" || data["custom"] != "keep-me" {
+		t.Fatalf("retry replaced persisted top-level values: %#v", data)
+	}
+	monitorData, _ := data["monitor"].(map[string]any)
+	eventData, _ := data["event"].(map[string]any)
+	ruleData, _ := data["rule"].(map[string]any)
+	rssData, _ := data["rss"].(map[string]any)
+	if monitorData["name"] != "Original feed" || eventData["fingerprint"] != "snapshot-fingerprint" || ruleData["name"] != "Original rule" || rssData["title"] != "Snapshot module title" {
+		t.Fatalf("retry replaced persisted structured values: %#v", data)
+	}
+}
+
+func TestRetryAttemptBackfillsMissingGlobalVariablesFromLegacySnapshot(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	monitor, err := db.CreateMonitor(ctx, model.MonitorInput{
+		Name: "Legacy feed", Type: model.MonitorTypeRSS, Enabled: false, IntervalSeconds: 60,
+		Config: json.RawMessage(`{"url":"https://database.example/feed.xml"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := db.CreateCheckRun(ctx, monitor, "manual", monitor.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, _, err := db.CreateEventForRun(ctx, monitor.ID, run.ID, model.EventData{
+		Type: "rss.item", Fingerprint: "legacy-event",
+		Payload: map[string]any{"rss": map[string]any{
+			"title": "Database title",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, err := db.CreateNotifyChannel(ctx, model.NotifyChannelInput{Name: "Legacy retry channel", Type: "trace_channel", Enabled: true, Config: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyData, err := json.Marshal(map[string]any{
+		"monitor": map[string]any{"id": monitor.ID, "name": "Legacy feed", "type": model.MonitorTypeRSS},
+		"event":   map[string]any{"id": event.ID, "type": event.Type, "fingerprint": event.Fingerprint},
+		"rule":    map[string]any{"id": 7, "name": "Legacy rule"},
+		"rss": map[string]any{
+			"title":   "Snapshot title",
+			"summary": "Snapshot summary", "content": "Snapshot content", "author": "Snapshot author",
+			"publishedAt": "2026-07-17T12:00:00Z",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextRetry := time.Now().UTC().Add(time.Minute)
+	monitorID, eventID, channelID := monitor.ID, event.ID, channel.ID
+	source, err := db.CreateNotificationAttempt(ctx, model.NotificationAttemptInput{
+		MonitorID: &monitorID, EventID: &eventID, ChannelID: &channelID,
+		ChannelName: channel.Name, ChannelType: channel.Type, Kind: "delivery", Status: "failed",
+		Subject: "Legacy subject", Body: "Legacy body", Data: legacyData, Error: "provider unavailable",
+		AttemptNo: 1, NextRetryAt: &nextRetry,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpdateMonitor(ctx, monitor.ID, model.MonitorInput{
+		Name: "Changed legacy feed", Type: model.MonitorTypeRSS, Enabled: false, IntervalSeconds: 60,
+		Config: json.RawMessage(`{"url":"https://current.example/feed.xml"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	sender := &traceNotifier{}
+	scheduler := New(db, checker.NewRegistry(), notifier.NewRegistry(sender), Options{})
+	if _, err := scheduler.RetryAttempt(ctx, source.ID); err != nil {
+		t.Fatal(err)
+	}
+	messages := sender.sentMessages()
+	if len(messages) != 1 {
+		t.Fatalf("retry sends = %d, want 1", len(messages))
+	}
+	data := messages[0].Data
+	want := map[string]any{
+		"url": "https://database.example/feed.xml", "title": "Snapshot title", "summary": "Snapshot summary",
+		"content": "Snapshot content", "author": "Snapshot author", "publishedAt": "2026-07-17T12:00:00Z", "status": "published",
+	}
+	for key, value := range want {
+		if data[key] != value {
+			t.Fatalf("backfilled %s = %#v, want %#v; data=%#v", key, data[key], value, data)
+		}
+	}
+}
+
 func TestRetryAttemptIsSingleWinnerAndRejectsSupersededSource(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")

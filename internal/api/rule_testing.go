@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/watchbell/watchbell/internal/eventvars"
 	"github.com/watchbell/watchbell/internal/rule"
 	"github.com/watchbell/watchbell/internal/store"
 )
@@ -63,6 +64,7 @@ func (s *Server) testRule(w http.ResponseWriter, r *http.Request) {
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {
 			continue
 		}
+		payload = eventvars.EnrichPayload(monitor, payload)
 		matchedOK, matched, err := rule.Match(input.Condition, payload)
 		if err != nil {
 			writeError(w, r, err)

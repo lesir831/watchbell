@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mmcdole/gofeed"
+	"github.com/watchbell/watchbell/internal/eventvars"
 	"github.com/watchbell/watchbell/internal/model"
 )
 
@@ -61,7 +62,7 @@ func (c *RSSChecker) Plugin() model.MonitorPlugin {
 			{Key: "includeFullText", Label: "包含完整正文", Type: "boolean"},
 		},
 		Events:            []string{"rss.item"},
-		TemplateVariables: []string{"rss.title", "rss.link", "rss.author", "rss.summary", "rss.content", "rss.publishedAt", "rss.sourceTitle", "rss.sourceLink"},
+		TemplateVariables: eventvars.EventVariableKeys(model.MonitorTypeRSS),
 	}
 }
 

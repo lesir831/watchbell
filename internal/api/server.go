@@ -18,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/watchbell/watchbell/internal/auth"
+	"github.com/watchbell/watchbell/internal/eventvars"
 	"github.com/watchbell/watchbell/internal/model"
 	"github.com/watchbell/watchbell/internal/scheduler"
 	"github.com/watchbell/watchbell/internal/store"
@@ -83,6 +84,7 @@ func (s *Server) Routes() http.Handler {
 func (s *Server) privateRoutes(r chi.Router) {
 	r.Get("/auth/me", s.authMe)
 	r.Get("/plugins", s.listPlugins)
+	r.Get("/help/variables", s.variableCatalog)
 	r.Get("/dashboard", s.dashboard)
 	r.Get("/system/status", s.systemStatus)
 	r.Get("/diagnostics", s.diagnostics)
@@ -94,6 +96,8 @@ func (s *Server) privateRoutes(r chi.Router) {
 	r.Put("/monitors/{id}", s.updateMonitor)
 	r.Delete("/monitors/{id}", s.deleteMonitor)
 	r.Post("/monitors/{id}/check", s.checkMonitor)
+	r.Get("/monitors/{id}/variables", s.latestMonitorVariables)
+	r.Get("/monitors/{id}/variables/{key}", s.latestMonitorVariables)
 
 	r.Get("/rules", s.listRules)
 	r.Post("/rules", s.createRule)
@@ -114,6 +118,8 @@ func (s *Server) privateRoutes(r chi.Router) {
 	r.Post("/templates/preview", s.previewTemplate)
 
 	r.Get("/events", s.listEvents)
+	r.Get("/events/{id}/variables", s.eventVariables)
+	r.Get("/events/{id}/variables/{key}", s.eventVariables)
 	r.Get("/check-runs", s.listCheckRuns)
 	r.Get("/rule-evaluations", s.listRuleEvaluations)
 	r.Get("/notification-attempts", s.listNotificationAttempts)
@@ -248,9 +254,11 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 		respond(w, r, model.Monitor{}, err)
 		return
 	}
-	if existing.Type == input.Type {
-		input.Config = mergeSecretConfig(existing.Config, input.Config, monitorSecretKeys(input.Type, s.scheduler.Plugins()))
+	if existing.Type != input.Type {
+		writeError(w, r, validationProblem("已创建监控的类型不可修改。", map[string]string{"type": "如需使用其他类型，请新建监控。"}))
+		return
 	}
+	input.Config = mergeSecretConfig(existing.Config, input.Config, monitorSecretKeys(input.Type, s.scheduler.Plugins()))
 	if err := s.validateMonitorInput(r.Context(), input); err != nil {
 		writeError(w, r, err)
 		return
@@ -591,17 +599,8 @@ func (s *Server) previewTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 func templatePreviewData(monitor model.Monitor, event model.Event, payload map[string]any) map[string]any {
-	data := map[string]any{
-		"monitor": map[string]any{"id": monitor.ID, "name": monitor.Name, "type": monitor.Type},
-		"rule":    map[string]any{"id": int64(0), "name": "模板预览", "matched": []string{}},
-		"event": map[string]any{
-			"id": event.ID, "type": event.Type, "fingerprint": event.Fingerprint,
-			"time": event.CreatedAt.Format(time.RFC3339Nano),
-		},
-	}
-	for key, value := range payload {
-		data[key] = value
-	}
+	data := eventvars.EventData(monitor, event, payload)
+	data["rule"] = map[string]any{"id": int64(0), "name": "模板预览", "matched": []string{}}
 	return data
 }
 
@@ -960,10 +959,17 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func sampleTemplateData() map[string]any {
 	return map[string]any{
-		"monitor": map[string]any{"name": "Example Monitor", "type": "rss"},
-		"rule":    map[string]any{"name": "Keyword Rule", "matched": []string{"keyword"}},
-		"event":   map[string]any{"type": "rss.item", "time": "2026-07-02T00:00:00Z"},
-		"rss":     map[string]any{"title": "Example RSS Item", "link": "https://example.com/item", "summary": "Example summary"},
+		"url":         "https://example.com/item",
+		"title":       "Example Event",
+		"summary":     "Example summary",
+		"content":     "Example content",
+		"author":      "example",
+		"publishedAt": "2026-07-02T00:00:00Z",
+		"status":      "published",
+		"monitor":     map[string]any{"name": "Example Monitor", "type": "rss"},
+		"rule":        map[string]any{"name": "Keyword Rule", "matched": []string{"keyword"}},
+		"event":       map[string]any{"type": "rss.item", "time": "2026-07-02T00:00:00Z"},
+		"rss":         map[string]any{"title": "Example RSS Item", "link": "https://example.com/item", "summary": "Example summary"},
 		"testflight": map[string]any{
 			"url":     "https://testflight.apple.com/join/example",
 			"status":  "available",

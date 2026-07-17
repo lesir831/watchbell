@@ -33,7 +33,7 @@ const channelSchemas: Record<ChannelType, { name: string; description: string; f
       { key: 'serverUrl', label: '服务地址', type: 'url', description: '默认使用 https://api.day.app' },
       { key: 'deviceKey', label: '设备密钥', type: 'secret', secret: true, required: true },
       { key: 'group', label: '分组', type: 'string' }, { key: 'sound', label: '提示音', type: 'string' },
-      { key: 'icon', label: '图标 URL', type: 'url' }, { key: 'url', label: '点击跳转 URL', type: 'string', description: '支持 ${rss.link}、${github.release.url} 等模板变量' }
+      { key: 'icon', label: '图标 URL', type: 'url' }, { key: 'url', label: '点击跳转 URL', type: 'string', description: '可显式使用跨模块变量 ${url}；该值会发送给 Bark 服务，私有或带访问凭据的 URL 请谨慎使用' }
     ],
     defaults: { serverUrl: 'https://api.day.app', deviceKey: '', group: 'WatchBell', sound: '', icon: '', url: '' }
   },

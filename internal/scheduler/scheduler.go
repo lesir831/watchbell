@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/watchbell/watchbell/internal/checker"
+	"github.com/watchbell/watchbell/internal/eventvars"
 	"github.com/watchbell/watchbell/internal/model"
 	"github.com/watchbell/watchbell/internal/notifier"
 	"github.com/watchbell/watchbell/internal/rule"
@@ -379,6 +380,7 @@ func (s *Scheduler) dispatchEvent(ctx context.Context, monitor model.Monitor, ev
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return err
 	}
+	payload = eventvars.EnrichPayload(monitor, payload)
 	if len(rules) == 0 {
 		_, err := s.store.CreateRuleEvaluation(ctx, event.ID, nil, "没有启用的规则", "skipped", "这个监控没有关联已启用的规则。", nil)
 		return err
@@ -393,7 +395,7 @@ func (s *Scheduler) dispatchEvent(ctx context.Context, monitor model.Monitor, ev
 			}
 			continue
 		}
-		matchedOK, matched, matchErr := rule.Match(item.Condition, payload)
+		matchedOK, matched, matchErr := rule.MatchAt(item.Condition, payload, s.nowUTC())
 		if matchErr != nil {
 			if _, err := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "error", matchErr.Error(), matched); err != nil {
 				return err
@@ -545,6 +547,10 @@ func (s *Scheduler) retryAttempt(ctx context.Context, source model.NotificationA
 	if len(source.Data) > 0 {
 		_ = json.Unmarshal(source.Data, &data)
 	}
+	if data == nil {
+		data = map[string]any{}
+	}
+	s.backfillRetryGlobalVariables(ctx, source, data)
 	attempt, sendErr := s.sendAndRecord(ctx, channel, notifier.Message{Subject: source.Subject, Body: source.Body, Data: data}, model.NotificationAttemptInput{
 		MonitorID: source.MonitorID, EventID: source.EventID, RuleEvaluationID: source.RuleEvaluationID, ChannelID: source.ChannelID,
 		RetryOfID: int64Ptr(source.ID), ChannelName: channel.Name, ChannelType: channel.Type,
@@ -556,6 +562,81 @@ func (s *Scheduler) retryAttempt(ctx context.Context, source model.NotificationA
 		}
 	}
 	return attempt, sendErr
+}
+
+// backfillRetryGlobalVariables upgrades attempts created before the common
+// event variables existed. The failed attempt's Data is the delivery snapshot:
+// values already stored there must win over both the historical event row and
+// the monitor's current configuration. Only missing global aliases are added.
+func (s *Scheduler) backfillRetryGlobalVariables(ctx context.Context, source model.NotificationAttempt, data map[string]any) {
+	if source.EventID == nil {
+		return
+	}
+	globals := eventvars.VariableCatalog().Globals
+	missingGlobal := false
+	for _, definition := range globals {
+		if _, exists := data[definition.Key]; !exists {
+			missingGlobal = true
+			break
+		}
+	}
+	if !missingGlobal {
+		return
+	}
+	event, err := s.store.GetEvent(ctx, *source.EventID)
+	if err != nil {
+		return
+	}
+	var payload map[string]any
+	if json.Unmarshal(event.Payload, &payload) != nil {
+		return
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	// The persisted attempt may contain an older copy of the module payload.
+	// Overlay it at the top level so those snapshot values drive the aliases.
+	for key, value := range data {
+		payload[key] = value
+	}
+
+	monitor := model.Monitor{}
+	if monitorData, ok := data["monitor"].(map[string]any); ok {
+		monitor.Name, _ = monitorData["name"].(string)
+		monitor.Type, _ = monitorData["type"].(string)
+	}
+	if event.CheckRunID != nil {
+		if run, runErr := s.store.GetCheckRun(ctx, *event.CheckRunID); runErr == nil && run.MonitorID == event.MonitorID {
+			if monitor.Name == "" {
+				monitor.Name = run.MonitorName
+			}
+			if monitor.Type == "" {
+				monitor.Type = run.MonitorType
+			}
+			if json.Valid(run.ConfigSnapshot) {
+				monitor.Config = append(json.RawMessage(nil), run.ConfigSnapshot...)
+			}
+		}
+	}
+	if monitor.Type == "" {
+		// The monitor type selects the module mapping, but deliberately do not
+		// copy its current name or config into the historical snapshot.
+		if current, monitorErr := s.store.GetMonitorIncludingArchived(ctx, event.MonitorID); monitorErr == nil {
+			monitor.Type = current.Type
+		}
+	}
+	if monitor.Type == "" {
+		return
+	}
+	derived := eventvars.EnrichPayload(monitor, payload)
+	for _, definition := range globals {
+		if _, exists := data[definition.Key]; exists {
+			continue
+		}
+		if value, exists := derived[definition.Key]; exists {
+			data[definition.Key] = value
+		}
+	}
 }
 
 func (s *Scheduler) runClaimedNotificationRetry(ctx context.Context, source model.NotificationAttempt) (model.NotificationAttempt, error) {
@@ -639,17 +720,8 @@ func (s *Scheduler) templateForRule(ctx context.Context, item model.Rule) (model
 }
 
 func notificationData(monitor model.Monitor, ruleItem model.Rule, event model.Event, payload map[string]any, matched []string) map[string]any {
-	data := map[string]any{
-		"monitor": map[string]any{"id": monitor.ID, "name": monitor.Name, "type": monitor.Type},
-		"rule":    map[string]any{"id": ruleItem.ID, "name": ruleItem.Name, "matched": matched},
-		"event": map[string]any{
-			"id": event.ID, "type": event.Type, "fingerprint": event.Fingerprint,
-			"time": event.CreatedAt.Format(time.RFC3339Nano),
-		},
-	}
-	for key, value := range payload {
-		data[key] = value
-	}
+	data := eventvars.EventData(monitor, event, payload)
+	data["rule"] = map[string]any{"id": ruleItem.ID, "name": ruleItem.Name, "matched": matched}
 	return data
 }
 
