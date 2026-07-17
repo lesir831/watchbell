@@ -33,9 +33,9 @@ const channelSchemas: Record<ChannelType, { name: string; description: string; f
       { key: 'serverUrl', label: '服务地址', type: 'url', description: '默认使用 https://api.day.app' },
       { key: 'deviceKey', label: '设备密钥', type: 'secret', secret: true, required: true },
       { key: 'group', label: '分组', type: 'string' }, { key: 'sound', label: '提示音', type: 'string' },
-      { key: 'icon', label: '图标 URL', type: 'url' }, { key: 'url', label: '点击跳转 URL', type: 'string', description: '支持 ${rss.link}、${github.release.url} 等模板变量' }
+      { key: 'icon', label: '图标 URL', type: 'url' }, { key: 'url', label: '点击跳转 URL', type: 'string', description: '推荐使用跨模块变量 ${url}；也支持 ${rss.link}、${github.release.url} 等模块变量' }
     ],
-    defaults: { serverUrl: 'https://api.day.app', deviceKey: '', group: 'WatchBell', sound: '', icon: '', url: '' }
+    defaults: { serverUrl: 'https://api.day.app', deviceKey: '', group: 'WatchBell', sound: '', icon: '', url: '${url}' }
   },
   email: {
     name: '邮件', description: '通过 SMTP 发送纯文本邮件，支持 STARTTLS 和隐式 TLS。',

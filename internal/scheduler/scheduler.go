@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/watchbell/watchbell/internal/checker"
+	"github.com/watchbell/watchbell/internal/eventvars"
 	"github.com/watchbell/watchbell/internal/model"
 	"github.com/watchbell/watchbell/internal/notifier"
 	"github.com/watchbell/watchbell/internal/rule"
@@ -379,6 +380,7 @@ func (s *Scheduler) dispatchEvent(ctx context.Context, monitor model.Monitor, ev
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return err
 	}
+	payload = eventvars.EnrichPayload(monitor, payload)
 	if len(rules) == 0 {
 		_, err := s.store.CreateRuleEvaluation(ctx, event.ID, nil, "没有启用的规则", "skipped", "这个监控没有关联已启用的规则。", nil)
 		return err
@@ -393,7 +395,7 @@ func (s *Scheduler) dispatchEvent(ctx context.Context, monitor model.Monitor, ev
 			}
 			continue
 		}
-		matchedOK, matched, matchErr := rule.Match(item.Condition, payload)
+		matchedOK, matched, matchErr := rule.MatchAt(item.Condition, payload, s.nowUTC())
 		if matchErr != nil {
 			if _, err := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "error", matchErr.Error(), matched); err != nil {
 				return err
@@ -545,6 +547,23 @@ func (s *Scheduler) retryAttempt(ctx context.Context, source model.NotificationA
 	if len(source.Data) > 0 {
 		_ = json.Unmarshal(source.Data, &data)
 	}
+	// Older failed attempts may predate cross-module variables such as ${url}.
+	// Rebuild their event context before rendering the channel configuration so
+	// retries benefit from the current variable contract as well.
+	if source.EventID != nil {
+		if event, eventErr := s.store.GetEvent(ctx, *source.EventID); eventErr == nil {
+			if monitor, monitorErr := s.store.GetMonitorIncludingArchived(ctx, event.MonitorID); monitorErr == nil {
+				var payload map[string]any
+				if json.Unmarshal(event.Payload, &payload) == nil {
+					ruleData := data["rule"]
+					data = eventvars.EventData(monitor, event, payload)
+					if ruleData != nil {
+						data["rule"] = ruleData
+					}
+				}
+			}
+		}
+	}
 	attempt, sendErr := s.sendAndRecord(ctx, channel, notifier.Message{Subject: source.Subject, Body: source.Body, Data: data}, model.NotificationAttemptInput{
 		MonitorID: source.MonitorID, EventID: source.EventID, RuleEvaluationID: source.RuleEvaluationID, ChannelID: source.ChannelID,
 		RetryOfID: int64Ptr(source.ID), ChannelName: channel.Name, ChannelType: channel.Type,
@@ -639,17 +658,8 @@ func (s *Scheduler) templateForRule(ctx context.Context, item model.Rule) (model
 }
 
 func notificationData(monitor model.Monitor, ruleItem model.Rule, event model.Event, payload map[string]any, matched []string) map[string]any {
-	data := map[string]any{
-		"monitor": map[string]any{"id": monitor.ID, "name": monitor.Name, "type": monitor.Type},
-		"rule":    map[string]any{"id": ruleItem.ID, "name": ruleItem.Name, "matched": matched},
-		"event": map[string]any{
-			"id": event.ID, "type": event.Type, "fingerprint": event.Fingerprint,
-			"time": event.CreatedAt.Format(time.RFC3339Nano),
-		},
-	}
-	for key, value := range payload {
-		data[key] = value
-	}
+	data := eventvars.EventData(monitor, event, payload)
+	data["rule"] = map[string]any{"id": ruleItem.ID, "name": ruleItem.Name, "matched": matched}
 	return data
 }
 

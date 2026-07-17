@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/watchbell/watchbell/internal/eventvars"
 	"github.com/watchbell/watchbell/internal/model"
 	"golang.org/x/net/html"
 )
@@ -58,7 +59,7 @@ func (c *WebpageChecker) Plugin() model.MonitorPlugin {
 			{Key: "ignorePatterns", Label: "忽略模式", Type: "string-list"},
 		},
 		Events:            []string{"webpage.changed"},
-		TemplateVariables: []string{"webpage.url", "webpage.selector", "webpage.oldHash", "webpage.newHash", "webpage.summary"},
+		TemplateVariables: eventvars.EventVariableKeys(model.MonitorTypeWebpage),
 	}
 }
 

@@ -62,6 +62,33 @@ func TestBarkNotifierRendersClickURLFromMessageData(t *testing.T) {
 	}
 }
 
+func TestBarkNotifierUsesCrossModuleURLAlias(t *testing.T) {
+	received := make(chan map[string]string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		received <- body
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	config, err := json.Marshal(BarkConfig{ServerURL: server.URL, DeviceKey: "device-key", URL: "${url}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := NewBarkNotifier().Send(context.Background(), model.NotifyChannel{Config: config}, Message{
+		Subject: "Release", Body: "Version 2", Data: map[string]any{"url": "https://github.com/acme/app/releases/tag/v2"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := (<-received)["url"]; got != "https://github.com/acme/app/releases/tag/v2" {
+		t.Fatalf("global click URL = %q", got)
+	}
+}
+
 func TestBarkNotifierOmitsEmptyRenderedURL(t *testing.T) {
 	received := make(chan map[string]string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

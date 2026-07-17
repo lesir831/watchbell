@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/watchbell/watchbell/internal/eventvars"
 	"github.com/watchbell/watchbell/internal/model"
 )
 
@@ -51,7 +52,7 @@ func (c *TestFlightChecker) Plugin() model.MonitorPlugin {
 			{Key: "timeoutSeconds", Label: "超时时间（秒）", Type: "number"},
 		},
 		Events:            []string{"testflight.available"},
-		TemplateVariables: []string{"testflight.url", "testflight.status", "testflight.message"},
+		TemplateVariables: eventvars.EventVariableKeys(model.MonitorTypeTestFlight),
 	}
 }
 

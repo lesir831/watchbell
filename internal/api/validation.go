@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/watchbell/watchbell/internal/eventvars"
 	"github.com/watchbell/watchbell/internal/model"
 	"github.com/watchbell/watchbell/internal/notifier"
 	"github.com/watchbell/watchbell/internal/rule"
@@ -234,9 +235,25 @@ func validateConditionFields(raw json.RawMessage, monitorType string, plugins []
 			}
 		}
 	}
-	for index, condition := range set.Conditions {
+	validateConditionNodeFields(set.Conditions, "condition.conditions", monitorType, allowed, fields)
+}
+
+func validateConditionNodeFields(conditions []rule.Condition, path, monitorType string, allowed map[string]struct{}, fields map[string]string) {
+	for index, condition := range conditions {
+		nodePath := fmt.Sprintf("%s.%d", path, index)
+		if condition.Conditions != nil || strings.TrimSpace(condition.Match) != "" {
+			validateConditionNodeFields(condition.Conditions, nodePath+".conditions", monitorType, allowed, fields)
+			continue
+		}
 		if _, ok := allowed[condition.Field]; !ok {
-			fields[fmt.Sprintf("condition.conditions.%d.field", index)] = "所选监控不会产生这个事件字段。"
+			fields[nodePath+".field"] = "所选监控不会产生这个事件字段。"
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(condition.Operator), "within_last") {
+			definition, exists := eventvars.EventDefinition(monitorType, condition.Field)
+			if !exists || definition.ValueType != "datetime" {
+				fields[nodePath+".operator"] = "“在最近时间内”只能用于时间字段。"
+			}
 		}
 	}
 }

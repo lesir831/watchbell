@@ -73,7 +73,7 @@ export interface Rule {
   monitorId: number;
   name: string;
   enabled: boolean;
-  condition: Record<string, unknown>;
+  condition: RuleConditionExpression;
   notifyChannelIds: number[];
   templateId?: number;
   cooldownSeconds: number;
@@ -87,11 +87,62 @@ export interface RuleInput {
   monitorId: number;
   name: string;
   enabled: boolean;
-  condition: Record<string, unknown>;
+  condition: RuleConditionExpression;
   notifyChannelIds: number[];
   templateId?: number | null;
   cooldownSeconds: number;
   quietHours: QuietHours;
+}
+
+export type RuleMatchMode = 'all' | 'any';
+export type RuleOperator = 'contains' | 'not_contains' | 'equals' | 'regex' | 'exists' | 'within_last';
+
+export interface RuleConditionLeaf {
+  field: string;
+  operator: RuleOperator;
+  value?: string;
+}
+
+export interface RuleConditionGroup {
+  match: RuleMatchMode;
+  conditions: RuleConditionNode[];
+}
+
+export type RuleConditionNode = RuleConditionLeaf | RuleConditionGroup;
+export type RuleConditionExpression = RuleConditionGroup | Record<string, never>;
+
+export type VariableUsage = 'rule' | 'template' | 'channel';
+
+export interface VariableDefinition {
+  key: string;
+  label: string;
+  description: string;
+  valueType: 'string' | 'url' | 'datetime' | 'number' | 'boolean' | 'array' | 'json';
+  availableIn: VariableUsage[];
+}
+
+export interface VariableModule {
+  id: MonitorType;
+  name: string;
+  variables: VariableDefinition[];
+}
+
+export interface VariableCatalog {
+  system: VariableDefinition[];
+  globals: VariableDefinition[];
+  modules: VariableModule[];
+}
+
+export interface VariableSnapshot {
+  monitorId: number;
+  monitorName: string;
+  monitorType: MonitorType;
+  eventId?: number;
+  eventType?: string;
+  eventCreatedAt?: string;
+  generatedAt: string;
+  values: Record<string, unknown>;
+  valueLinks: Record<string, string>;
 }
 
 export interface QuietHours {

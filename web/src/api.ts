@@ -24,7 +24,9 @@ import type {
   RuleEvaluation,
   RuleInput,
   RuleTestResponse,
-  SystemStatus
+  SystemStatus,
+  VariableCatalog,
+  VariableSnapshot
 } from './types';
 
 export class APIError extends Error {
@@ -93,6 +95,7 @@ export const api = {
   login: (body: LoginInput) => request<CurrentUser>('/api/auth/login', jsonInit('POST', body)),
   logout: () => request<{ status: string }>('/api/auth/logout', jsonInit('POST')),
   listPlugins: () => request<MonitorPlugin[]>('/api/plugins'),
+  variableCatalog: () => request<VariableCatalog>('/api/help/variables'),
   dashboard: () => request<DashboardSummary>('/api/dashboard'),
   systemStatus: () => request<SystemStatus>('/api/system/status'),
   diagnostics: () => request<Record<string, unknown>>('/api/diagnostics'),
@@ -104,6 +107,7 @@ export const api = {
   updateMonitor: (id: number, body: MonitorInput) => request<Monitor>(`/api/monitors/${id}`, jsonInit('PUT', body)),
   deleteMonitor: (id: number) => request<void>(`/api/monitors/${id}`, jsonInit('DELETE')),
   checkMonitor: (id: number) => request<{ status: string; eventCount: number; checkRun?: CheckRun }>(`/api/monitors/${id}/check`, jsonInit('POST')),
+  monitorVariables: (id: number) => request<VariableSnapshot>(`/api/monitors/${id}/variables`),
 
   listRules: () => request<Rule[]>('/api/rules'),
   createRule: (body: RuleInput) => request<Rule>('/api/rules', jsonInit('POST', body)),

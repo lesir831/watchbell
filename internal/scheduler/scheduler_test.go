@@ -174,6 +174,21 @@ func TestTraceChainAndRetry(t *testing.T) {
 	}
 }
 
+func TestNotificationDataIncludesCrossModuleVariables(t *testing.T) {
+	monitor := model.Monitor{ID: 1, Name: "Feed", Type: model.MonitorTypeRSS, Config: json.RawMessage(`{"url":"https://example.com/feed.xml"}`)}
+	ruleItem := model.Rule{ID: 2, Name: "Keywords"}
+	event := model.Event{ID: 3, Type: "rss.item", Fingerprint: "item-3", CreatedAt: time.Date(2026, time.July, 17, 12, 0, 0, 0, time.UTC)}
+	data := notificationData(monitor, ruleItem, event, map[string]any{"rss": map[string]any{
+		"title": "Version 3", "link": "https://example.com/v3", "publishedAt": "2026-07-17T11:59:00Z",
+	}}, []string{"Version"})
+	if data["url"] != "https://example.com/v3" || data["title"] != "Version 3" || data["publishedAt"] != "2026-07-17T11:59:00Z" {
+		t.Fatalf("missing cross-module variables: %#v", data)
+	}
+	if data["rule"].(map[string]any)["name"] != "Keywords" || data["event"].(map[string]any)["id"] != int64(3) {
+		t.Fatalf("system context changed: %#v", data)
+	}
+}
+
 func TestRetryAttemptIsSingleWinnerAndRejectsSupersededSource(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")

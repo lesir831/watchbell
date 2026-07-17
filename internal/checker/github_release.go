@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/watchbell/watchbell/internal/eventvars"
 	"github.com/watchbell/watchbell/internal/model"
 )
 
@@ -94,13 +95,8 @@ func (c *GitHubReleaseChecker) Plugin() model.MonitorPlugin {
 			{Key: "includePrereleases", Label: "包含预发布版本", Type: "boolean"},
 			{Key: "notifyExisting", Label: "首次检查通知最新版本", Type: "boolean"},
 		},
-		Events: []string{"github.release"},
-		TemplateVariables: []string{
-			"github.owner", "github.repo", "github.repository", "github.release.id",
-			"github.release.tagName", "github.release.name", "github.release.body",
-			"github.release.url", "github.release.prerelease", "github.release.publishedAt",
-			"github.release.author", "github.release.assetCount", "github.release.assets",
-		},
+		Events:            []string{"github.release"},
+		TemplateVariables: eventvars.EventVariableKeys(model.MonitorTypeGitHubRelease),
 	}
 }
 

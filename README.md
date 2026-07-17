@@ -277,21 +277,31 @@ TestFlight 检查目前基于公开页面里的文字判断状态。默认识别
 
 ## 规则配置
 
-管理界面可以用下拉框组合规则，并用该监控最近的真实事件试跑。底层条件是以下 JSON 结构，最常用的操作符是 `contains` 和 `regex`。
+管理界面可以递归组合“满足全部（AND）”和“满足任一（OR）”条件组，并用该监控最近的真实事件试跑。旧的单层规则无需迁移；`conditions` 中既可以放字段条件，也可以继续放条件组。例如“标题或正文包含关键词，并且发布时间在最近 2 分钟内”：
 
 ```json
 {
-  "match": "any",
+  "match": "all",
   "conditions": [
     {
-      "field": "rss.title",
-      "operator": "contains",
-      "value": "TestFlight"
+      "match": "any",
+      "conditions": [
+        {
+          "field": "rss.title",
+          "operator": "regex",
+          "value": "送码|兑换码"
+        },
+        {
+          "field": "rss.content",
+          "operator": "regex",
+          "value": "送码|兑换码"
+        }
+      ]
     },
     {
-      "field": "rss.content",
-      "operator": "regex",
-      "value": "空位|名额|测试"
+      "field": "rss.publishedAt",
+      "operator": "within_last",
+      "value": "2m"
     }
   ]
 }
@@ -304,6 +314,7 @@ TestFlight 检查目前基于公开页面里的文字判断状态。默认识别
 - `equals`
 - `regex`
 - `exists`
+- `within_last`：判断 RFC3339 时间是否在最近一段时间内，值使用 `30s`、`2m`、`1h`、`24h` 等时长
 
 TestFlight 有空位时本身就会产生事件。如果只想有事件就通知，可以把规则条件写成空对象：
 
@@ -322,7 +333,7 @@ TestFlight 有空位时本身就会产生事件。如果只想有事件就通知
   "serverUrl": "https://api.day.app",
   "deviceKey": "YOUR_DEVICE_KEY",
   "group": "WatchBell",
-  "url": "${rss.link}"
+  "url": "${url}"
 }
 ```
 
@@ -398,16 +409,36 @@ GET /api/health/ready
 
 模板变量使用 `${...}`。
 
-通用变量：
+跨模块快捷变量（RSS、TestFlight、网页和 GitHub Release 均可使用）：
 
 ```text
+${url}
+${title}
+${summary}
+${content}
+${author}
+${publishedAt}
+${status}
+```
+
+系统上下文变量：
+
+```text
+${monitor.id}
 ${monitor.name}
 ${monitor.type}
+${rule.id}
 ${rule.name}
 ${rule.matched}
+${event.id}
 ${event.type}
+${event.fingerprint}
 ${event.time}
+${message.subject}
+${message.body}
 ```
+
+`message.*` 只在 Webhook 等渠道动态配置中可用。
 
 RSS：
 
@@ -418,6 +449,8 @@ ${rss.author}
 ${rss.summary}
 ${rss.content}
 ${rss.publishedAt}
+${rss.sourceTitle}
+${rss.sourceLink}
 ```
 
 TestFlight：
@@ -432,6 +465,7 @@ ${testflight.message}
 
 ```text
 ${webpage.url}
+${webpage.selector}
 ${webpage.oldHash}
 ${webpage.newHash}
 ${webpage.summary}
@@ -440,7 +474,10 @@ ${webpage.summary}
 GitHub Release：
 
 ```text
+${github.owner}
+${github.repo}
 ${github.repository}
+${github.release.id}
 ${github.release.tagName}
 ${github.release.name}
 ${github.release.body}
@@ -449,6 +486,16 @@ ${github.release.prerelease}
 ${github.release.publishedAt}
 ${github.release.author}
 ${github.release.assetCount}
+${github.release.assets}
+```
+
+网页的“帮助”菜单会显示每个变量的含义、类型和适用位置。选择一个监控后，还可以查看最近事件的实际取值以及每个值的独立 JSON 链接：
+
+```text
+GET /api/monitors/{id}/variables
+GET /api/monitors/{id}/variables/{key}
+GET /api/events/{id}/variables
+GET /api/events/{id}/variables/{key}
 ```
 
 ## CI/CD 与镜像发布

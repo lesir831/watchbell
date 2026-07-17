@@ -87,7 +87,7 @@ func TestTemplatePreviewCanUseRealEvent(t *testing.T) {
 	}
 	body, _ := json.Marshal(map[string]any{
 		"subjectTemplate": "${monitor.name}: ${rss.title}",
-		"bodyTemplate":    "${event.type} ${rss.link}",
+		"bodyTemplate":    "${event.type} ${rss.link} ${url}",
 		"eventId":         event.ID,
 	})
 	response, err := http.Post(server.URL+"/api/templates/preview", "application/json", bytes.NewReader(body))
@@ -102,7 +102,7 @@ func TestTemplatePreviewCanUseRealEvent(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		t.Fatal(err)
 	}
-	if result["subject"] != "Production feed: A real release" || result["body"] != "rss.item https://example.com/release" {
+	if result["subject"] != "Production feed: A real release" || result["body"] != "rss.item https://example.com/release https://example.com/release" {
 		t.Fatalf("unexpected preview: %#v", result)
 	}
 }
