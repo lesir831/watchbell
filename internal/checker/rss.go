@@ -106,7 +106,11 @@ func (c *RSSChecker) Check(ctx context.Context, monitor model.Monitor) (model.Ch
 		}
 	}
 
-	resp, err := c.client.Do(req)
+	client, err := clientForMonitor(c.client, monitor)
+	if err != nil {
+		return model.CheckResult{}, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return model.CheckResult{}, err
 	}

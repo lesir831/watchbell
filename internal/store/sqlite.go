@@ -75,6 +75,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		definition string
 	}{
 		{"monitors", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0"},
+		{"monitors", "proxy_id", "INTEGER REFERENCES proxy_profiles(id)"},
 		{"monitors", "failure_alert_after", "INTEGER NOT NULL DEFAULT 0"},
 		{"monitors", "failure_notify_channel_ids_json", "TEXT NOT NULL DEFAULT '[]'"},
 		{"monitors", "failure_alert_active", "INTEGER NOT NULL DEFAULT 0"},
@@ -122,6 +123,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_notification_attempts_monitor_id ON notification_attempts(monitor_id, created_at DESC)`); err != nil {
 		return fmt.Errorf("index notification attempt monitor: %w", err)
 	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_monitors_proxy_id ON monitors(proxy_id) WHERE proxy_id IS NOT NULL`); err != nil {
+		return fmt.Errorf("index monitor proxy: %w", err)
+	}
 	for _, index := range []struct {
 		name  string
 		query string
@@ -167,7 +171,7 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) ListMonitors(ctx context.Context) ([]model.Monitor, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE deleted_at IS NULL ORDER BY id DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, proxy_id, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE deleted_at IS NULL ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +188,7 @@ func (s *Store) ListMonitors(ctx context.Context) ([]model.Monitor, error) {
 }
 
 func (s *Store) ListEnabledMonitors(ctx context.Context) ([]model.Monitor, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE enabled = 1 AND deleted_at IS NULL ORDER BY id ASC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, type, proxy_id, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE enabled = 1 AND deleted_at IS NULL ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -201,14 +205,14 @@ func (s *Store) ListEnabledMonitors(ctx context.Context) ([]model.Monitor, error
 }
 
 func (s *Store) GetMonitor(ctx context.Context, id int64) (model.Monitor, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE id = ? AND deleted_at IS NULL`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, type, proxy_id, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE id = ? AND deleted_at IS NULL`, id)
 	return scanMonitor(row)
 }
 
 // GetMonitorIncludingArchived is used when rendering immutable history whose
 // originating monitor may have been archived after the event was created.
 func (s *Store) GetMonitorIncludingArchived(ctx context.Context, id int64) (model.Monitor, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, type, proxy_id, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE id = ?`, id)
 	return scanMonitor(row)
 }
 
@@ -223,16 +227,20 @@ func (s *Store) CreateMonitor(ctx context.Context, input model.MonitorInput) (mo
 		return model.Monitor{}, err
 	}
 	name := strings.TrimSpace(input.Name)
-	res, err := s.db.ExecContext(ctx, `INSERT INTO monitors (name, type, enabled, interval_seconds, config_json, state_json, failure_alert_after, failure_notify_channel_ids_json, created_at, updated_at)
-		SELECT ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?
-		WHERE NOT EXISTS (SELECT 1 FROM monitors WHERE name = ? AND type = ? AND deleted_at IS NULL)`,
-		name, input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), now, now, name, input.Type)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO monitors (name, type, proxy_id, enabled, interval_seconds, config_json, state_json, failure_alert_after, failure_notify_channel_ids_json, created_at, updated_at)
+		SELECT ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?
+		WHERE (? IS NULL OR EXISTS (SELECT 1 FROM proxy_profiles WHERE id = ? AND deleted_at IS NULL))
+		AND NOT EXISTS (SELECT 1 FROM monitors WHERE name = ? AND type = ? AND deleted_at IS NULL)`,
+		name, input.Type, input.ProxyID, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), now, now, input.ProxyID, input.ProxyID, name, input.Type)
 	if err != nil {
 		return model.Monitor{}, err
 	}
 	if duplicate, err := insertWasSkipped(res); err != nil {
 		return model.Monitor{}, err
 	} else if duplicate {
+		if err := s.requireActiveProxy(ctx, input.ProxyID); err != nil {
+			return model.Monitor{}, err
+		}
 		return model.Monitor{}, fmt.Errorf("%w: monitor (%s, %s)", ErrDuplicateNaturalKey, input.Type, name)
 	}
 	id, err := res.LastInsertId()
@@ -257,11 +265,11 @@ func (s *Store) UpdateMonitor(ctx context.Context, id int64, input model.Monitor
 	}
 	resetState := existing.Type != input.Type || !jsonEquivalent(existing.Config, config)
 	name := strings.TrimSpace(input.Name)
-	query := `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = CASE WHEN ? = 0 THEN 0 ELSE failure_alert_active END, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM monitors duplicate WHERE duplicate.name = ? AND duplicate.type = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`
-	args := []any{name, input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), input.FailureAlertAfter, nowString(), id, name, input.Type, id}
+	query := `UPDATE monitors SET name = ?, type = ?, proxy_id = ?, enabled = ?, interval_seconds = ?, config_json = ?, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = CASE WHEN ? = 0 THEN 0 ELSE failure_alert_active END, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND (? IS NULL OR EXISTS (SELECT 1 FROM proxy_profiles WHERE id = ? AND deleted_at IS NULL)) AND NOT EXISTS (SELECT 1 FROM monitors duplicate WHERE duplicate.name = ? AND duplicate.type = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`
+	args := []any{name, input.Type, input.ProxyID, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), input.FailureAlertAfter, nowString(), id, input.ProxyID, input.ProxyID, name, input.Type, id}
 	if resetState {
-		query = `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, state_json = '{}', last_checked_at = NULL, last_status = '', last_message = '', last_error = '', consecutive_failures = 0, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = 0, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM monitors duplicate WHERE duplicate.name = ? AND duplicate.type = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`
-		args = []any{name, input.Type, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), nowString(), id, name, input.Type, id}
+		query = `UPDATE monitors SET name = ?, type = ?, proxy_id = ?, enabled = ?, interval_seconds = ?, config_json = ?, state_json = '{}', last_checked_at = NULL, last_status = '', last_message = '', last_error = '', consecutive_failures = 0, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = 0, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND (? IS NULL OR EXISTS (SELECT 1 FROM proxy_profiles WHERE id = ? AND deleted_at IS NULL)) AND NOT EXISTS (SELECT 1 FROM monitors duplicate WHERE duplicate.name = ? AND duplicate.type = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`
+		args = []any{name, input.Type, input.ProxyID, boolInt(input.Enabled), input.IntervalSeconds, string(config), input.FailureAlertAfter, string(channelIDs), nowString(), id, input.ProxyID, input.ProxyID, name, input.Type, id}
 	}
 	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
@@ -274,13 +282,15 @@ func (s *Store) UpdateMonitor(ctx context.Context, id int64, input model.Monitor
 		} else if !exists {
 			return model.Monitor{}, sql.ErrNoRows
 		}
+		if err := s.requireActiveProxy(ctx, input.ProxyID); err != nil {
+			return model.Monitor{}, err
+		}
 		return model.Monitor{}, fmt.Errorf("%w: monitor (%s, %s)", ErrDuplicateNaturalKey, input.Type, name)
 	}
 	return s.GetMonitor(ctx, id)
 }
 
 func (s *Store) UpdateMonitorCheckResult(ctx context.Context, id int64, result model.CheckResult, checkErr error) error {
-	state := normalizedMap(result.State)
 	status := strings.TrimSpace(result.Status)
 	message := strings.TrimSpace(result.Message)
 	lastErr := ""
@@ -292,6 +302,12 @@ func (s *Store) UpdateMonitorCheckResult(ctx context.Context, id int64, result m
 	if checkErr != nil {
 		failureDelta = 1
 	}
+	if checkErr != nil && result.State == nil {
+		_, err := s.db.ExecContext(ctx, `UPDATE monitors SET last_checked_at = ?, last_status = ?, last_message = ?, last_error = ?, consecutive_failures = consecutive_failures + 1, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+			nowString(), status, message, lastErr, nowString(), id)
+		return err
+	}
+	state := normalizedMap(result.State)
 	_, err := s.db.ExecContext(ctx, `UPDATE monitors SET state_json = ?, last_checked_at = ?, last_status = ?, last_message = ?, last_error = ?, consecutive_failures = CASE WHEN ? = 1 THEN consecutive_failures + 1 ELSE 0 END, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
 		string(state), nowString(), status, message, lastErr, failureDelta, nowString(), id)
 	return err
@@ -827,13 +843,17 @@ func scanMonitor(row scanner) (model.Monitor, error) {
 	var item model.Monitor
 	var enabled, failureAlertActive int
 	var config, state, failureChannelIDs string
+	var proxyID sql.NullInt64
 	var lastChecked sql.NullString
 	var createdAt, updatedAt string
-	err := row.Scan(&item.ID, &item.Name, &item.Type, &enabled, &item.IntervalSeconds, &config, &state, &lastChecked, &item.LastStatus, &item.LastMessage, &item.LastError, &item.ConsecutiveFailures, &item.FailureAlertAfter, &failureChannelIDs, &failureAlertActive, &createdAt, &updatedAt)
+	err := row.Scan(&item.ID, &item.Name, &item.Type, &proxyID, &enabled, &item.IntervalSeconds, &config, &state, &lastChecked, &item.LastStatus, &item.LastMessage, &item.LastError, &item.ConsecutiveFailures, &item.FailureAlertAfter, &failureChannelIDs, &failureAlertActive, &createdAt, &updatedAt)
 	if err != nil {
 		return model.Monitor{}, err
 	}
 	item.Enabled = enabled == 1
+	if proxyID.Valid {
+		item.ProxyID = &proxyID.Int64
+	}
 	item.FailureAlertActive = failureAlertActive == 1
 	item.Config = json.RawMessage(defaultJSON(config, "{}"))
 	item.State = json.RawMessage(defaultJSON(state, "{}"))
@@ -1056,7 +1076,7 @@ func insertWasSkipped(result sql.Result) (bool, error) {
 
 func (s *Store) activeRecordExists(ctx context.Context, table string, id int64) (bool, error) {
 	switch table {
-	case "monitors", "rules", "notify_channels", "notification_templates":
+	case "monitors", "rules", "notify_channels", "notification_templates", "proxy_profiles":
 	default:
 		return false, fmt.Errorf("unsupported active record table %q", table)
 	}

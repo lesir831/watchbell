@@ -1,5 +1,6 @@
 export type MonitorType = 'rss' | 'testflight' | 'webpage' | 'github_release';
 export type ChannelType = 'bark' | 'email' | 'webhook';
+export type ProxyType = 'http' | 'https' | 'socks5';
 
 export interface PluginConfigField {
   key: string;
@@ -36,10 +37,44 @@ export interface LoginInput {
   password: string;
 }
 
+export interface SettingsOverview {
+  authEnabled: boolean;
+  username: string;
+}
+
+export interface ChangePasswordInput {
+  currentPassword: string;
+  newPassword: string;
+  confirmPassword: string;
+}
+
+export interface ProxyProfile {
+  id: number;
+  name: string;
+  type: ProxyType;
+  host: string;
+  port: number;
+  username?: string;
+  configuredSecrets?: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProxyProfileInput {
+  name: string;
+  type: ProxyType;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+  clearPassword?: boolean;
+}
+
 export interface Monitor {
   id: number;
   name: string;
   type: MonitorType;
+  proxyId?: number;
   enabled: boolean;
   intervalSeconds: number;
   config: Record<string, unknown>;
@@ -61,6 +96,7 @@ export interface Monitor {
 export interface MonitorInput {
   name: string;
   type: MonitorType;
+  proxyId?: number | null;
   enabled: boolean;
   intervalSeconds: number;
   config: Record<string, unknown>;
@@ -326,6 +362,7 @@ export interface ConfigBackup {
   version: number;
   exportedAt: string;
   includesSecrets: boolean;
+  proxies: Array<Record<string, unknown>>;
   monitors: Array<Record<string, unknown>>;
   rules: Array<Record<string, unknown>>;
   channels: Array<Record<string, unknown>>;
@@ -335,8 +372,8 @@ export interface ConfigBackup {
 export interface ConfigImportReport {
   version: number;
   mode: 'merge';
-  created: { monitors: number; rules: number; channels: number; templates: number };
-  updated: { monitors: number; rules: number; channels: number; templates: number };
+  created: { proxies: number; monitors: number; rules: number; channels: number; templates: number };
+  updated: { proxies: number; monitors: number; rules: number; channels: number; templates: number };
   idMap: Record<string, Record<string, number>>;
   warnings: string[];
 }

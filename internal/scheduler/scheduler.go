@@ -214,7 +214,19 @@ func (s *Scheduler) processMonitor(ctx context.Context, monitor model.Monitor, t
 		return runErr
 	}
 
-	result, checkErr := checkerImpl.Check(ctx, monitor)
+	var result model.CheckResult
+	var checkErr error
+	if monitor.ProxyID != nil {
+		proxyProfile, proxyErr := s.store.GetProxyProfile(ctx, *monitor.ProxyID)
+		if proxyErr != nil {
+			checkErr = fmt.Errorf("configured proxy %d is unavailable: %w", *monitor.ProxyID, proxyErr)
+		} else {
+			monitor.Proxy = &proxyProfile
+		}
+	}
+	if checkErr == nil {
+		result, checkErr = checkerImpl.Check(ctx, monitor)
+	}
 	if updateErr := s.store.UpdateMonitorCheckResult(ctx, monitor.ID, result, checkErr); updateErr != nil {
 		_ = s.store.FinishCheckRun(ctx, run.ID, "error", result.Message, updateErr, 0, started)
 		return updateErr

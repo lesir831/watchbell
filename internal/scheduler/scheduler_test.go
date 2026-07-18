@@ -18,6 +18,16 @@ import (
 
 type traceChecker struct{}
 
+type proxyCaptureChecker struct {
+	seen chan *model.ProxyProfile
+}
+
+func (c *proxyCaptureChecker) Type() string { return "proxy_capture" }
+func (c *proxyCaptureChecker) Check(_ context.Context, monitor model.Monitor) (model.CheckResult, error) {
+	c.seen <- monitor.Proxy
+	return model.CheckResult{Status: "ok", Message: "proxy captured"}, nil
+}
+
 func (traceChecker) Type() string { return "trace_test" }
 func (traceChecker) Plugin() model.MonitorPlugin {
 	return model.MonitorPlugin{
@@ -31,6 +41,36 @@ func TestNeverCheckedMonitorIsImmediatelyDue(t *testing.T) {
 	monitor := model.Monitor{ID: 1, Enabled: true, IntervalSeconds: 300}
 	if !scheduler.isDue(monitor, time.Now().UTC()) {
 		t.Fatal("an enabled monitor without a previous check must be due immediately")
+	}
+}
+
+func TestRunOnceResolvesAssignedProxyProfile(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	profile, err := db.CreateProxyProfile(ctx, model.ProxyProfileInput{
+		Name: "Capture proxy", Type: model.ProxyTypeHTTP, Host: "127.0.0.1", Port: 8080, Username: "user", Password: "secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	monitor, err := db.CreateMonitor(ctx, model.MonitorInput{
+		Name: "Proxy monitor", Type: "proxy_capture", ProxyID: &profile.ID, Enabled: false, IntervalSeconds: 60, Config: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &proxyCaptureChecker{seen: make(chan *model.ProxyProfile, 1)}
+	scheduler := New(db, checker.NewRegistry(capture), notifier.NewRegistry(), Options{})
+	if err := scheduler.RunOnce(ctx, monitor.ID); err != nil {
+		t.Fatal(err)
+	}
+	seen := <-capture.seen
+	if seen == nil || seen.ID != profile.ID || seen.Password != "secret" {
+		t.Fatalf("resolved proxy = %#v", seen)
 	}
 }
 

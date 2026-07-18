@@ -154,7 +154,11 @@ func (c *GitHubReleaseChecker) Check(ctx context.Context, monitor model.Monitor)
 		req.Header.Set("If-None-Match", state.ETag)
 	}
 
-	resp, err := c.client.Do(req)
+	client, err := clientForMonitor(c.client, monitor)
+	if err != nil {
+		return model.CheckResult{}, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return model.CheckResult{}, err
 	}

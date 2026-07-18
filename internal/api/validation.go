@@ -65,6 +65,15 @@ func (s *Server) validateMonitorInputWithChannelLookup(ctx context.Context, inpu
 	if input.FailureAlertAfter > 0 && len(input.FailureNotifyChannelIDs) == 0 {
 		fields["failureNotifyChannelIds"] = "启用故障告警时，请至少选择一个通知渠道。"
 	}
+	if input.ProxyID != nil {
+		if *input.ProxyID <= 0 {
+			fields["proxyId"] = "代理 ID 必须为正整数。"
+		} else if lookupChannels {
+			if _, err := s.store.GetProxyProfile(ctx, *input.ProxyID); err != nil {
+				fields["proxyId"] = "请选择一个现有代理，或使用默认网络设置。"
+			}
+		}
+	}
 	seenChannels := map[int64]struct{}{}
 	for index, id := range input.FailureNotifyChannelIDs {
 		field := fmt.Sprintf("failureNotifyChannelIds.%d", index)

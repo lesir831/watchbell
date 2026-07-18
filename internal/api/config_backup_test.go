@@ -23,8 +23,15 @@ import (
 func TestConfigBackupRoundTripRedactionAndMerge(t *testing.T) {
 	ctx := context.Background()
 	sourceServer, sourceStore := newTestServer(t)
+	proxyProfile, err := sourceStore.CreateProxyProfile(ctx, model.ProxyProfileInput{
+		Name: "Release proxy", Type: model.ProxyTypeHTTP, Host: "proxy.example.com", Port: 8080,
+		Username: "proxy-user", Password: "proxy-secret-password",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	monitor, err := sourceStore.CreateMonitor(ctx, model.MonitorInput{
-		Name: "Releases", Type: model.MonitorTypeGitHubRelease, Enabled: true, IntervalSeconds: 300,
+		Name: "Releases", Type: model.MonitorTypeGitHubRelease, ProxyID: &proxyProfile.ID, Enabled: true, IntervalSeconds: 300,
 		Config: json.RawMessage(`{"repository":"watchbell/project","apiUrl":"https://api.github.com","timeoutSeconds":15,"maxReleases":20,"token":"github-secret-token"}`),
 	})
 	if err != nil {
@@ -38,7 +45,7 @@ func TestConfigBackupRoundTripRedactionAndMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	monitor, err = sourceStore.UpdateMonitor(ctx, monitor.ID, model.MonitorInput{
-		Name: monitor.Name, Type: monitor.Type, Enabled: monitor.Enabled, IntervalSeconds: monitor.IntervalSeconds, Config: monitor.Config,
+		Name: monitor.Name, Type: monitor.Type, ProxyID: monitor.ProxyID, Enabled: monitor.Enabled, IntervalSeconds: monitor.IntervalSeconds, Config: monitor.Config,
 		FailureAlertAfter: 2, FailureNotifyChannelIDs: []int64{channel.ID},
 	})
 	if err != nil {
@@ -73,7 +80,7 @@ func TestConfigBackupRoundTripRedactionAndMerge(t *testing.T) {
 	if !stringsContain(redactedResponse.Header.Get("Content-Disposition"), "watchbell-config-") || redactedResponse.Header.Get("Cache-Control") != "no-store" {
 		t.Fatalf("missing safe download headers: %#v", redactedResponse.Header)
 	}
-	if bytes.Contains(redactedBody, []byte("github-secret-token")) || bytes.Contains(redactedBody, []byte("bark-secret-key")) {
+	if bytes.Contains(redactedBody, []byte("github-secret-token")) || bytes.Contains(redactedBody, []byte("bark-secret-key")) || bytes.Contains(redactedBody, []byte("proxy-secret-password")) {
 		t.Fatalf("default export leaked a secret: %s", redactedBody)
 	}
 	var redactedBackup model.ConfigBackup
@@ -89,6 +96,9 @@ func TestConfigBackupRoundTripRedactionAndMerge(t *testing.T) {
 	if len(redactedBackup.Channels) != 1 || !equalStrings(redactedBackup.Channels[0].RedactedSecrets, []string{"deviceKey"}) {
 		t.Fatalf("channel redaction metadata = %#v", redactedBackup.Channels)
 	}
+	if len(redactedBackup.Proxies) != 1 || !equalStrings(redactedBackup.Proxies[0].RedactedSecrets, []string{"password"}) {
+		t.Fatalf("proxy redaction metadata = %#v", redactedBackup.Proxies)
+	}
 
 	fullResponse, err := http.Get(sourceServer.URL + "/api/config/export?includeSecrets=true")
 	if err != nil {
@@ -99,7 +109,7 @@ func TestConfigBackupRoundTripRedactionAndMerge(t *testing.T) {
 	if fullResponse.StatusCode != http.StatusOK {
 		t.Fatalf("full export status = %d body = %s", fullResponse.StatusCode, fullBody)
 	}
-	if !bytes.Contains(fullBody, []byte("github-secret-token")) || !bytes.Contains(fullBody, []byte("bark-secret-key")) {
+	if !bytes.Contains(fullBody, []byte("github-secret-token")) || !bytes.Contains(fullBody, []byte("bark-secret-key")) || !bytes.Contains(fullBody, []byte("proxy-secret-password")) {
 		t.Fatalf("explicit full export omitted secrets: %s", fullBody)
 	}
 	var fullBackup model.ConfigBackup
@@ -125,7 +135,7 @@ func TestConfigBackupRoundTripRedactionAndMerge(t *testing.T) {
 
 	targetServer, targetStore := newTestServer(t)
 	report := importBackup(t, targetServer.URL, fullBackup, http.StatusOK)
-	if report.Created.Monitors != 1 || report.Created.Channels != 1 || report.Created.Rules != 1 || report.Created.Templates != 1 || report.Updated.Templates != 1 {
+	if report.Created.Proxies != 1 || report.Created.Monitors != 1 || report.Created.Channels != 1 || report.Created.Rules != 1 || report.Created.Templates != 1 || report.Updated.Templates != 1 {
 		t.Fatalf("unexpected initial import report: %#v", report)
 	}
 	importAudits, err := targetStore.ListAuditLogs(ctx, 10)
@@ -133,15 +143,23 @@ func TestConfigBackupRoundTripRedactionAndMerge(t *testing.T) {
 		t.Fatalf("transactional import audit = %#v err=%v", importAudits, err)
 	}
 	targetMonitorID := report.IDMap.Monitors[fmt.Sprint(monitor.ID)]
+	targetProxyID := report.IDMap.Proxies[fmt.Sprint(proxyProfile.ID)]
 	targetChannelID := report.IDMap.Channels[fmt.Sprint(channel.ID)]
 	targetTemplateID := report.IDMap.Templates[fmt.Sprint(template.ID)]
 	targetRuleID := report.IDMap.Rules[fmt.Sprint(ruleItem.ID)]
-	if targetMonitorID == 0 || targetChannelID == 0 || targetTemplateID == 0 || targetRuleID == 0 {
+	if targetProxyID == 0 || targetMonitorID == 0 || targetChannelID == 0 || targetTemplateID == 0 || targetRuleID == 0 {
 		t.Fatalf("incomplete ID remapping: %#v", report.IDMap)
 	}
 	storedMonitor, err := targetStore.GetMonitor(ctx, targetMonitorID)
 	if err != nil || !bytes.Contains(storedMonitor.Config, []byte("github-secret-token")) {
 		t.Fatalf("monitor secret was not restored: item=%#v err=%v", storedMonitor, err)
+	}
+	if storedMonitor.ProxyID == nil || *storedMonitor.ProxyID != targetProxyID {
+		t.Fatalf("monitor proxy reference was not remapped: %#v", storedMonitor.ProxyID)
+	}
+	storedProxy, err := targetStore.GetProxyProfile(ctx, targetProxyID)
+	if err != nil || storedProxy.Password != "proxy-secret-password" {
+		t.Fatalf("proxy password was not restored: item=%#v err=%v", storedProxy, err)
 	}
 	if storedMonitor.FailureAlertAfter != 2 || len(storedMonitor.FailureNotifyChannelIDs) != 1 || storedMonitor.FailureNotifyChannelIDs[0] != targetChannelID {
 		t.Fatalf("monitor failure alert references were not remapped: %#v", storedMonitor)
@@ -166,7 +184,7 @@ func TestConfigBackupRoundTripRedactionAndMerge(t *testing.T) {
 		t.Fatalf("create history event: created=%v err=%v", created, err)
 	}
 	redactedReport := importBackup(t, targetServer.URL, redactedBackup, http.StatusOK)
-	if redactedReport.Updated.Monitors != 1 || redactedReport.Updated.Channels != 1 || redactedReport.Updated.Rules != 1 || len(redactedReport.Warnings) != 2 {
+	if redactedReport.Updated.Proxies != 1 || redactedReport.Updated.Monitors != 1 || redactedReport.Updated.Channels != 1 || redactedReport.Updated.Rules != 1 || len(redactedReport.Warnings) != 3 {
 		t.Fatalf("unexpected redacted merge report: %#v", redactedReport)
 	}
 	if redactedReport.IDMap.Monitors[fmt.Sprint(monitor.ID)] != targetMonitorID || redactedReport.IDMap.Channels[fmt.Sprint(channel.ID)] != targetChannelID {
@@ -177,7 +195,8 @@ func TestConfigBackupRoundTripRedactionAndMerge(t *testing.T) {
 	}
 	storedMonitor, _ = targetStore.GetMonitor(ctx, targetMonitorID)
 	storedChannel, _ = targetStore.GetNotifyChannel(ctx, targetChannelID)
-	if !bytes.Contains(storedMonitor.Config, []byte("github-secret-token")) || !bytes.Contains(storedChannel.Config, []byte("bark-secret-key")) {
+	storedProxy, _ = targetStore.GetProxyProfile(ctx, targetProxyID)
+	if !bytes.Contains(storedMonitor.Config, []byte("github-secret-token")) || !bytes.Contains(storedChannel.Config, []byte("bark-secret-key")) || storedProxy.Password != "proxy-secret-password" {
 		t.Fatal("redacted merge did not preserve target secrets")
 	}
 	monitors, _ := targetStore.ListMonitors(ctx)
@@ -191,8 +210,9 @@ func TestConfigBackupRoundTripRedactionAndMerge(t *testing.T) {
 	importBackup(t, freshServer.URL, redactedBackup, http.StatusUnprocessableEntity)
 	monitors, _ = freshStore.ListMonitors(ctx)
 	channels, _ = freshStore.ListNotifyChannels(ctx)
-	if len(monitors) != 0 || len(channels) != 0 {
-		t.Fatalf("failed redacted restore changed fresh database: monitors=%d channels=%d", len(monitors), len(channels))
+	proxies, _ := freshStore.ListProxyProfiles(ctx)
+	if len(monitors) != 0 || len(channels) != 0 || len(proxies) != 0 {
+		t.Fatalf("failed redacted restore changed fresh database: monitors=%d channels=%d proxies=%d", len(monitors), len(channels), len(proxies))
 	}
 }
 

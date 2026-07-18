@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"github.com/watchbell/watchbell/internal/notifier"
 	"github.com/watchbell/watchbell/internal/scheduler"
 	"github.com/watchbell/watchbell/internal/store"
+	"golang.org/x/term"
 )
 
 var (
@@ -37,6 +39,22 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(hash)
+		return
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "set-password" {
+		if len(os.Args) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: watchbell set-password (the password is read from standard input)")
+			os.Exit(2)
+		}
+		password, err := readConfirmedPassword()
+		if err == nil {
+			err = setPersistedPassword(password)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println("administrator password updated; a running WatchBell server will reload it shortly")
 		return
 	}
 	if len(os.Args) == 2 && os.Args[1] == "version" {
@@ -64,12 +82,20 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.Close()
+	if persistedHash, exists, err := db.GetAuthPasswordHash(ctx); err != nil {
+		logger.Error("load persisted admin password", "error", err)
+		os.Exit(1)
+	} else if exists {
+		cfg.Auth.PasswordHash = persistedHash
+		cfg.Auth.Password = ""
+	}
 
 	authManager, err := auth.NewManager(cfg.Auth, logger)
 	if err != nil {
 		logger.Error("configure auth", "error", err)
 		os.Exit(1)
 	}
+	go watchPersistedPassword(ctx, db, authManager, logger)
 
 	checkers := checker.NewRegistry(
 		checker.NewRSSChecker(),
@@ -125,6 +151,110 @@ func main() {
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("shutdown http server", "error", err)
+	}
+}
+
+func setPersistedPassword(password string) error {
+	if err := auth.ValidatePassword(password); err != nil {
+		return err
+	}
+	passwordHash, err := auth.HashPassword(password)
+	if err != nil {
+		return err
+	}
+	cfg := config.FromEnv()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := store.Open(ctx, cfg.DBPath)
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer db.Close()
+	if err := db.SetAuthPasswordHashAudited(ctx, passwordHash, "cli"); err != nil {
+		return fmt.Errorf("set administrator password: %w", err)
+	}
+	return nil
+}
+
+func readConfirmedPassword() (string, error) {
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		password, err := readHiddenPassword(fd, "New administrator password: ")
+		if err != nil {
+			return "", err
+		}
+		confirmation, err := readHiddenPassword(fd, "Repeat new administrator password: ")
+		if err != nil {
+			return "", err
+		}
+		return validateConfirmedPassword(password, confirmation)
+	}
+
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024), 2048)
+	fmt.Fprint(os.Stderr, "New administrator password: ")
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", fmt.Errorf("read password: %w", err)
+		}
+		return "", errors.New("password input ended unexpectedly")
+	}
+	password := strings.TrimSuffix(scanner.Text(), "\r")
+	fmt.Fprint(os.Stderr, "Repeat new administrator password: ")
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", fmt.Errorf("read password confirmation: %w", err)
+		}
+		return "", errors.New("password confirmation ended unexpectedly")
+	}
+	confirmation := strings.TrimSuffix(scanner.Text(), "\r")
+	return validateConfirmedPassword(password, confirmation)
+}
+
+func readHiddenPassword(fd int, prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	value, err := term.ReadPassword(fd)
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", fmt.Errorf("read password: %w", err)
+	}
+	return strings.TrimSuffix(string(value), "\r"), nil
+}
+
+func validateConfirmedPassword(password, confirmation string) (string, error) {
+	if password != confirmation {
+		return "", errors.New("passwords do not match")
+	}
+	if err := auth.ValidatePassword(password); err != nil {
+		return "", err
+	}
+	return password, nil
+}
+
+func watchPersistedPassword(ctx context.Context, db *store.Store, manager *auth.Manager, logger *slog.Logger) {
+	if manager == nil || !manager.Enabled() {
+		return
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	lastError := ""
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_, err := manager.SyncPasswordHash(func() (string, bool, error) {
+				return db.GetAuthPasswordHash(ctx)
+			})
+			if err != nil {
+				if message := err.Error(); message != lastError {
+					logger.Error("reload persisted administrator password", "error", err)
+					lastError = message
+				}
+				continue
+			}
+			lastError = ""
+		}
 	}
 }
 

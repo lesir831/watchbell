@@ -43,6 +43,45 @@ func (s *Store) importConfigMerge(ctx context.Context, backup model.ConfigBackup
 	}
 	defer tx.Rollback()
 
+	for index, item := range backup.Proxies {
+		id, currentPassword, found, err := findMergeProxy(ctx, tx, item.Name)
+		if err != nil {
+			return report, importLookupError(fmt.Sprintf("backup.proxies.%d", index), "代理", err)
+		}
+		password := item.Password
+		if len(item.RedactedSecrets) > 0 {
+			if !found || currentPassword == "" {
+				return report, &ConfigImportError{
+					Field:   fmt.Sprintf("backup.proxies.%d.redactedSecrets", index),
+					Message: fmt.Sprintf("代理 %q 缺少已脱敏的密码；全新恢复请使用 includeSecrets=true 重新导出。", item.Name),
+				}
+			}
+			password = currentPassword
+			report.Warnings = append(report.Warnings, fmt.Sprintf("代理 %q 保留了目标实例中已有的密码。", item.Name))
+		}
+		normalized := normalizeProxyStorageInput(model.ProxyProfileInput{
+			Name: item.Name, Type: item.Type, Host: item.Host, Port: item.Port,
+			Username: item.Username, Password: password,
+		})
+		if found {
+			_, err = tx.ExecContext(ctx, `UPDATE proxy_profiles SET name = ?, type = ?, host = ?, port = ?, username = ?, password = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+				normalized.Name, normalized.Type, normalized.Host, normalized.Port, normalized.Username, normalized.Password, nowString(), id)
+			report.Updated.Proxies++
+		} else {
+			var result sql.Result
+			result, err = tx.ExecContext(ctx, `INSERT INTO proxy_profiles (name, type, host, port, username, password, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				normalized.Name, normalized.Type, normalized.Host, normalized.Port, normalized.Username, normalized.Password, nowString(), nowString())
+			if err == nil {
+				id, err = result.LastInsertId()
+			}
+			report.Created.Proxies++
+		}
+		if err != nil {
+			return report, fmt.Errorf("import proxy %q: %w", item.Name, err)
+		}
+		report.IDMap.Proxies[sourceIDKey(item.ID)] = id
+	}
+
 	for index, item := range backup.Channels {
 		id, currentConfig, found, err := findMergeChannel(ctx, tx, item.Name, item.Type)
 		if err != nil {
@@ -127,7 +166,7 @@ func (s *Store) importConfigMerge(ctx context.Context, backup model.ConfigBackup
 	}
 
 	for index, item := range backup.Monitors {
-		id, currentConfig, found, err := findMergeMonitor(ctx, tx, item.Name, item.Type)
+		id, currentConfig, _, found, err := findMergeMonitor(ctx, tx, item.Name, item.Type)
 		if err != nil {
 			return report, importLookupError(fmt.Sprintf("backup.monitors.%d", index), "监控", err)
 		}
@@ -160,23 +199,34 @@ func (s *Store) importConfigMerge(ctx context.Context, backup model.ConfigBackup
 		if err != nil {
 			return report, err
 		}
+		var proxyID *int64
+		if item.ProxyID != nil {
+			mapped, exists := report.IDMap.Proxies[sourceIDKey(*item.ProxyID)]
+			if !exists {
+				return report, &ConfigImportError{
+					Field:   fmt.Sprintf("backup.monitors.%d.proxyId", index),
+					Message: fmt.Sprintf("监控 %q 引用了未导入的代理 ID %d。", item.Name, *item.ProxyID),
+				}
+			}
+			proxyID = &mapped
+		}
 
 		if found {
 			if jsonEquivalent(currentConfig, config) {
-				_, err = tx.ExecContext(ctx, `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = CASE WHEN ? = 0 THEN 0 ELSE failure_alert_active END, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
-					strings.TrimSpace(item.Name), item.Type, boolInt(item.Enabled), item.IntervalSeconds, string(config), item.FailureAlertAfter, string(failureChannelJSON), item.FailureAlertAfter, nowString(), id)
+				_, err = tx.ExecContext(ctx, `UPDATE monitors SET name = ?, type = ?, proxy_id = ?, enabled = ?, interval_seconds = ?, config_json = ?, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = CASE WHEN ? = 0 THEN 0 ELSE failure_alert_active END, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+					strings.TrimSpace(item.Name), item.Type, proxyID, boolInt(item.Enabled), item.IntervalSeconds, string(config), item.FailureAlertAfter, string(failureChannelJSON), item.FailureAlertAfter, nowString(), id)
 			} else {
 				// A different checker configuration invalidates only ephemeral
 				// state. The monitor ID and all history rows stay intact.
-				_, err = tx.ExecContext(ctx, `UPDATE monitors SET name = ?, type = ?, enabled = ?, interval_seconds = ?, config_json = ?, state_json = '{}', last_checked_at = NULL, last_status = '', last_message = '', last_error = '', consecutive_failures = 0, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = 0, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
-					strings.TrimSpace(item.Name), item.Type, boolInt(item.Enabled), item.IntervalSeconds, string(config), item.FailureAlertAfter, string(failureChannelJSON), nowString(), id)
+				_, err = tx.ExecContext(ctx, `UPDATE monitors SET name = ?, type = ?, proxy_id = ?, enabled = ?, interval_seconds = ?, config_json = ?, state_json = '{}', last_checked_at = NULL, last_status = '', last_message = '', last_error = '', consecutive_failures = 0, failure_alert_after = ?, failure_notify_channel_ids_json = ?, failure_alert_active = 0, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+					strings.TrimSpace(item.Name), item.Type, proxyID, boolInt(item.Enabled), item.IntervalSeconds, string(config), item.FailureAlertAfter, string(failureChannelJSON), nowString(), id)
 				report.Warnings = append(report.Warnings, fmt.Sprintf("监控 %q 的配置发生变化，已重置检查状态；历史记录保持不变。", item.Name))
 			}
 			report.Updated.Monitors++
 		} else {
 			var result sql.Result
-			result, err = tx.ExecContext(ctx, `INSERT INTO monitors (name, type, enabled, interval_seconds, config_json, state_json, failure_alert_after, failure_notify_channel_ids_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '{}', ?, ?, ?, ?)`,
-				strings.TrimSpace(item.Name), item.Type, boolInt(item.Enabled), item.IntervalSeconds, string(config), item.FailureAlertAfter, string(failureChannelJSON), nowString(), nowString())
+			result, err = tx.ExecContext(ctx, `INSERT INTO monitors (name, type, proxy_id, enabled, interval_seconds, config_json, state_json, failure_alert_after, failure_notify_channel_ids_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?)`,
+				strings.TrimSpace(item.Name), item.Type, proxyID, boolInt(item.Enabled), item.IntervalSeconds, string(config), item.FailureAlertAfter, string(failureChannelJSON), nowString(), nowString())
 			if err == nil {
 				id, err = result.LastInsertId()
 			}
@@ -268,6 +318,7 @@ func newConfigImportReport() model.ConfigImportReport {
 		Version: model.ConfigBackupVersion,
 		Mode:    "merge",
 		IDMap: model.ConfigImportIDMap{
+			Proxies:   map[string]int64{},
 			Monitors:  map[string]int64{},
 			Rules:     map[string]int64{},
 			Channels:  map[string]int64{},
@@ -286,28 +337,57 @@ func importLookupError(field, entity string, err error) error {
 	return fmt.Errorf("lookup %s: %w", entity, err)
 }
 
-func findMergeMonitor(ctx context.Context, tx *sql.Tx, name, monitorType string) (int64, json.RawMessage, bool, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT id, config_json FROM monitors WHERE name = ? AND type = ? AND deleted_at IS NULL ORDER BY id LIMIT 2`, strings.TrimSpace(name), monitorType)
+func findMergeMonitor(ctx context.Context, tx *sql.Tx, name, monitorType string) (int64, json.RawMessage, *int64, bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, config_json, proxy_id FROM monitors WHERE name = ? AND type = ? AND deleted_at IS NULL ORDER BY id LIMIT 2`, strings.TrimSpace(name), monitorType)
 	if err != nil {
-		return 0, nil, false, err
+		return 0, nil, nil, false, err
 	}
 	defer rows.Close()
 	var id int64
 	var config string
+	var proxyID sql.NullInt64
 	count := 0
 	for rows.Next() {
-		if err := rows.Scan(&id, &config); err != nil {
-			return 0, nil, false, err
+		if err := rows.Scan(&id, &config, &proxyID); err != nil {
+			return 0, nil, nil, false, err
 		}
 		count++
 	}
 	if err := rows.Err(); err != nil {
-		return 0, nil, false, err
+		return 0, nil, nil, false, err
 	}
 	if count > 1 {
-		return 0, nil, false, errAmbiguousMergeTarget
+		return 0, nil, nil, false, errAmbiguousMergeTarget
 	}
-	return id, json.RawMessage(config), count == 1, nil
+	var resultProxyID *int64
+	if proxyID.Valid {
+		resultProxyID = &proxyID.Int64
+	}
+	return id, json.RawMessage(config), resultProxyID, count == 1, nil
+}
+
+func findMergeProxy(ctx context.Context, tx *sql.Tx, name string) (int64, string, bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, password FROM proxy_profiles WHERE name = ? AND deleted_at IS NULL ORDER BY id LIMIT 2`, strings.TrimSpace(name))
+	if err != nil {
+		return 0, "", false, err
+	}
+	defer rows.Close()
+	var id int64
+	var password string
+	count := 0
+	for rows.Next() {
+		if err := rows.Scan(&id, &password); err != nil {
+			return 0, "", false, err
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return 0, "", false, err
+	}
+	if count > 1 {
+		return 0, "", false, errAmbiguousMergeTarget
+	}
+	return id, password, count == 1, nil
 }
 
 func findMergeChannel(ctx context.Context, tx *sql.Tx, name, channelType string) (int64, json.RawMessage, bool, error) {

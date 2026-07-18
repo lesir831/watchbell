@@ -33,8 +33,9 @@ const ChannelsPage = lazy(() => import('./pages/ChannelsPage'));
 const TemplatesPage = lazy(() => import('./pages/TemplatesPage'));
 const ActivityPage = lazy(() => import('./pages/ActivityPage'));
 const HelpPage = lazy(() => import('./pages/HelpPage'));
+const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 
-type PageKey = 'dashboard' | 'monitors' | 'monitorDetail' | 'rules' | 'channels' | 'templates' | 'activity' | 'help';
+type PageKey = 'dashboard' | 'monitors' | 'monitorDetail' | 'rules' | 'channels' | 'templates' | 'activity' | 'settings' | 'help';
 type RouteState = { page: PageKey; monitorId?: number };
 
 const { Header, Sider, Content } = Layout;
@@ -47,6 +48,7 @@ const pageItems = [
   { key: 'channels', icon: <MailOutlined />, label: '通知渠道' },
   { key: 'templates', icon: <FileTextOutlined />, label: '通知模板' },
   { key: 'activity', icon: <UnorderedListOutlined />, label: '活动与诊断' },
+  { key: 'settings', icon: <SettingOutlined />, label: '设置' },
   { key: 'help', icon: <QuestionCircleOutlined />, label: '帮助' }
 ];
 
@@ -187,6 +189,7 @@ function Shell(props: { authEnabled: boolean; username: string }) {
             {route.page === 'channels' && <ChannelsPage />}
             {route.page === 'templates' && <TemplatesPage />}
             {route.page === 'activity' && <ActivityPage />}
+            {route.page === 'settings' && <SettingsPage authEnabled={props.authEnabled} username={props.username} />}
             {route.page === 'help' && <HelpPage />}
           </Suspense>
         </Content>
@@ -221,6 +224,6 @@ function routeFromHash(): RouteState {
 
 function titleForRoute(route: RouteState) {
   return {
-    dashboard: '运行概览', monitors: '监控', monitorDetail: `监控详情 #${route.monitorId}`, rules: '规则', channels: '通知渠道', templates: '通知模板', activity: '活动与诊断', help: '变量与使用帮助'
+    dashboard: '运行概览', monitors: '监控', monitorDetail: `监控详情 #${route.monitorId}`, rules: '规则', channels: '通知渠道', templates: '通知模板', activity: '活动与诊断', settings: '设置', help: '变量与使用帮助'
   }[route.page];
 }

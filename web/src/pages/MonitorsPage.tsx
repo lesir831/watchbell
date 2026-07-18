@@ -25,7 +25,7 @@ import { api } from '../api';
 import ConfigFields from '../components/ConfigFields';
 import { AdvancedConfigField, ConfigMode, parseConfigJSON } from '../components/ConfigMode';
 import { EmptyState, formatDate, formatInterval, PageError, relativeDate, StatusTag } from '../components/Common';
-import type { Monitor, MonitorInput, MonitorPlugin, MonitorType, NotifyChannel } from '../types';
+import type { Monitor, MonitorInput, MonitorPlugin, MonitorType, NotifyChannel, ProxyProfile } from '../types';
 
 const { Text, Title } = Typography;
 
@@ -41,7 +41,9 @@ export default function MonitorsPage({ onNavigate }: { onNavigate: (page: string
   const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors, refetchInterval: 20_000 });
   const plugins = useQuery({ queryKey: ['plugins'], queryFn: api.listPlugins });
   const channels = useQuery({ queryKey: ['channels'], queryFn: api.listChannels, refetchInterval: 30_000 });
+  const proxies = useQuery({ queryKey: ['proxies'], queryFn: api.listProxies, refetchInterval: 30_000 });
   const pluginByID = useMemo(() => new Map((plugins.data ?? []).map((item) => [item.id, item])), [plugins.data]);
+  const proxyByID = useMemo(() => new Map((proxies.data ?? []).map((item) => [item.id, item])), [proxies.data]);
 
   const refresh = async () => {
     await Promise.all([
@@ -87,7 +89,7 @@ export default function MonitorsPage({ onNavigate }: { onNavigate: (page: string
   });
   const toggleMutation = useMutation({
     mutationFn: ({ record, enabled }: { record: Monitor; enabled: boolean }) => api.updateMonitor(record.id, {
-      name: record.name, type: record.type, enabled, intervalSeconds: record.intervalSeconds, config: record.config,
+      name: record.name, type: record.type, proxyId: record.proxyId ?? null, enabled, intervalSeconds: record.intervalSeconds, config: record.config,
       failureAlertAfter: record.failureAlertAfter, failureNotifyChannelIds: record.failureNotifyChannelIds
     }),
     onSuccess: async (item) => { await refresh(); message.success(item.enabled ? '监控已启用' : '监控已停用'); },
@@ -95,7 +97,7 @@ export default function MonitorsPage({ onNavigate }: { onNavigate: (page: string
   });
 
   const filtered = (monitors.data ?? []).filter((item) => {
-    const matchesSearch = item.name.toLowerCase().includes(search.toLowerCase()) || item.type.includes(search.toLowerCase());
+    const matchesSearch = item.name.toLowerCase().includes(search.toLowerCase()) || item.type.includes(search.toLowerCase()) || (item.proxyId ? proxyByID.get(item.proxyId)?.name.toLowerCase().includes(search.toLowerCase()) === true : false);
     const matchesStatus = status === 'all' || (status === 'enabled' ? item.enabled : status === 'disabled' ? !item.enabled : item.lastStatus === status);
     return matchesSearch && matchesStatus;
   });
@@ -114,7 +116,7 @@ export default function MonitorsPage({ onNavigate }: { onNavigate: (page: string
 
   return (
     <Space direction="vertical" size={16} className="full-width">
-      <PageError error={(monitors.error || plugins.error || channels.error) as Error | null} onRetry={() => { monitors.refetch(); plugins.refetch(); channels.refetch(); }} />
+      <PageError error={(monitors.error || plugins.error || channels.error || proxies.error) as Error | null} onRetry={() => { monitors.refetch(); plugins.refetch(); channels.refetch(); proxies.refetch(); }} />
       <div className="page-toolbar responsive-toolbar">
         <Space wrap>
           <Input prefix={<SearchOutlined />} allowClear placeholder="搜索名称或类型" value={search} onChange={(event) => setSearch(event.target.value)} />
@@ -133,7 +135,7 @@ export default function MonitorsPage({ onNavigate }: { onNavigate: (page: string
           {filtered.map((item) => (
             <Card key={item.id} className="entity-card">
               <div className="entity-card-head"><div><Title level={5}>{item.name}</Title><Text type="secondary">{pluginByID.get(item.type)?.name ?? item.type}</Text></div><Space direction="vertical" align="end" size={4}><StatusTag status={!item.enabled ? 'disabled' : item.lastStatus} />{item.failureAlertActive && <Tag color="error">故障告警中</Tag>}</Space></div>
-              <div className="entity-meta"><span>检查频率 <strong>{formatInterval(item.intervalSeconds)}</strong></span><span>上次检查 <strong>{relativeDate(item.lastCheckedAt)}</strong></span></div>
+              <div className="entity-meta"><span>检查频率 <strong>{formatInterval(item.intervalSeconds)}</strong></span><span>网络 <strong>{item.proxyId ? proxyByID.get(item.proxyId)?.name ?? `代理 #${item.proxyId}` : '默认网络'}</strong></span><span>上次检查 <strong>{relativeDate(item.lastCheckedAt)}</strong></span></div>
               {(item.lastError || item.lastMessage) && <Alert type={item.lastError ? 'error' : 'info'} showIcon message={item.lastError || item.lastMessage} />}
               <div className="entity-actions">{actions(item)}</div>
             </Card>
@@ -159,6 +161,7 @@ export default function MonitorsPage({ onNavigate }: { onNavigate: (page: string
           columns={[
             { title: '名称', dataIndex: 'name', fixed: 'left', width: 180 },
             { title: '类型', dataIndex: 'type', width: 150, render: (value: MonitorType) => <Tag>{pluginByID.get(value)?.name ?? value}</Tag> },
+            { title: '网络', dataIndex: 'proxyId', width: 130, render: (value: number | undefined) => value ? <Tag color="blue">{proxyByID.get(value)?.name ?? `代理 #${value}`}</Tag> : <Text type="secondary">默认网络</Text> },
             { title: '启用', width: 76, render: (_, record) => <Switch size="small" checked={record.enabled} loading={toggleMutation.isPending && toggleMutation.variables?.record.id === record.id} onChange={(enabled) => toggleMutation.mutate({ record, enabled })} /> },
             { title: '状态', width: 100, render: (_, record) => <StatusTag status={!record.enabled ? 'disabled' : record.lastStatus} /> },
             { title: '连续失败', dataIndex: 'consecutiveFailures', width: 100, render: (value) => value || '—' },
@@ -175,6 +178,7 @@ export default function MonitorsPage({ onNavigate }: { onNavigate: (page: string
         record={editing}
         plugins={plugins.data ?? []}
         channels={channels.data ?? []}
+        proxies={proxies.data ?? []}
         saving={saveMutation.isPending}
         error={saveMutation.error as Error | null}
         onClose={() => { setDrawerOpen(false); saveMutation.reset(); }}
@@ -189,6 +193,7 @@ function MonitorDrawer(props: {
   record: Monitor | null;
   plugins: MonitorPlugin[];
   channels: NotifyChannel[];
+  proxies: ProxyProfile[];
   saving: boolean;
   error: Error | null;
   onClose: () => void;
@@ -210,6 +215,7 @@ function MonitorDrawer(props: {
       type: initialPlugin?.id,
       enabled: props.record?.enabled ?? true,
       intervalSeconds: props.record?.intervalSeconds ?? initialPlugin?.defaultIntervalSeconds ?? 300,
+      proxyId: props.record?.proxyId,
       failureAlertsEnabled: (props.record?.failureAlertAfter ?? 0) > 0,
       failureAlertAfter: props.record?.failureAlertAfter || 3,
       failureNotifyChannelIds: props.record?.failureNotifyChannelIds ?? []
@@ -221,7 +227,7 @@ function MonitorDrawer(props: {
     const values = await form.validateFields();
     const config = advanced ? parseConfigJSON(values.rawConfig) : (form.getFieldValue('config') ?? {});
     props.onSave({
-      name: values.name.trim(), type: values.type, enabled: values.enabled, intervalSeconds: values.intervalSeconds, config,
+      name: values.name.trim(), type: values.type, proxyId: values.proxyId ?? null, enabled: values.enabled, intervalSeconds: values.intervalSeconds, config,
       failureAlertAfter: values.failureAlertsEnabled ? values.failureAlertAfter : 0,
       failureNotifyChannelIds: values.failureAlertsEnabled ? values.failureNotifyChannelIds : []
     }, checkAfter);
@@ -254,6 +260,11 @@ function MonitorDrawer(props: {
           </Form.Item></Col>
         </Row>
         <Form.Item name="enabled" label="启用监控" valuePropName="checked"><Switch /></Form.Item>
+        <Card size="small" title="网络连接" className="form-intro">
+          <Form.Item name="proxyId" label="出站代理" extra={props.proxies.length ? '仅当前监控的 HTTP 请求会经过所选代理；留空沿用部署环境的默认网络设置。' : '请先在“设置 → 网络代理”中添加代理；当前监控将使用默认网络设置。'}>
+            <Select allowClear placeholder="默认网络（沿用环境设置）" options={props.proxies.map((item) => ({ label: `${item.name} · ${item.type.toUpperCase()} · ${item.host}:${item.port}`, value: item.id }))} />
+          </Form.Item>
+        </Card>
         <Card size="small" title="监控自身故障告警" className="form-intro">
           <Form.Item name="failureAlertsEnabled" label="连续检查失败时通知" valuePropName="checked" extra="同一轮故障只告警一次；恢复正常后会再发送一条恢复通知。"><Switch /></Form.Item>
           {failureAlertsEnabled && <Row gutter={16}>

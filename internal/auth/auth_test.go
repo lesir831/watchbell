@@ -160,3 +160,127 @@ func TestExplicitShortSessionSecretIsRejected(t *testing.T) {
 		t.Fatalf("NewManager() error = %v, want minimum session-secret length error", err)
 	}
 }
+
+func TestPlaintextPasswordSessionSurvivesManagerRestart(t *testing.T) {
+	cfg := Config{
+		Enabled: true, Username: "admin", Password: "correct-password",
+		SessionSecret: "01234567890123456789012345678901", SessionTTL: time.Hour,
+	}
+	managerOne, err := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginResponse := httptest.NewRecorder()
+	if err := managerOne.Login(loginResponse, loginRequest("192.0.2.40:4123"), "admin", "correct-password"); err != nil {
+		t.Fatal(err)
+	}
+	cookies := loginResponse.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("login cookies = %#v", cookies)
+	}
+
+	managerTwo, err := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://watchbell.test/api/auth/me", nil)
+	request.AddCookie(cookies[0])
+	response := httptest.NewRecorder()
+	managerTwo.Require(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })).ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("session after restart status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestSyncPasswordHashRevokesExistingSessions(t *testing.T) {
+	manager := newAuthManager(t, nil)
+	loginResponse := httptest.NewRecorder()
+	if err := manager.Login(loginResponse, loginRequest("192.0.2.41:4123"), "admin", "correct-password"); err != nil {
+		t.Fatal(err)
+	}
+	newHash, err := HashPassword("replacement-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := manager.SyncPasswordHash(func() (string, bool, error) { return newHash, true, nil })
+	if err != nil || !changed {
+		t.Fatalf("SyncPasswordHash() = changed %v, err %v", changed, err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://watchbell.test/api/auth/me", nil)
+	request.AddCookie(loginResponse.Result().Cookies()[0])
+	response := httptest.NewRecorder()
+	manager.Require(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })).ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("old session after reload status = %d", response.Code)
+	}
+	if err := manager.Login(httptest.NewRecorder(), loginRequest("192.0.2.42:4123"), "admin", "replacement-password"); err != nil {
+		t.Fatalf("new password login = %v", err)
+	}
+}
+
+func TestPasswordHashSyncCannotRestoreStaleCredentialAfterWebChange(t *testing.T) {
+	manager := newAuthManager(t, nil)
+	durableHash := testPasswordHash
+	loaderStarted := make(chan struct{})
+	releaseLoader := make(chan struct{})
+	syncDone := make(chan error, 1)
+	go func() {
+		_, err := manager.SyncPasswordHash(func() (string, bool, error) {
+			close(loaderStarted)
+			<-releaseLoader
+			return durableHash, true, nil
+		})
+		syncDone <- err
+	}()
+	<-loaderStarted
+
+	changeDone := make(chan error, 1)
+	go func() {
+		request := loginRequest("192.0.2.50:4123")
+		_, err := manager.ChangePassword(request, "correct-password", "replacement-password", func(hash string) error {
+			durableHash = hash
+			return nil
+		})
+		changeDone <- err
+	}()
+	close(releaseLoader)
+	if err := <-syncDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-changeDone; err != nil {
+		t.Fatal(err)
+	}
+	if !VerifyPassword(durableHash, "replacement-password") {
+		t.Fatal("durable credential was not updated")
+	}
+	if err := manager.Login(httptest.NewRecorder(), loginRequest("192.0.2.51:4123"), "admin", "replacement-password"); err != nil {
+		t.Fatalf("replacement password login = %v", err)
+	}
+	if err := manager.Login(httptest.NewRecorder(), loginRequest("192.0.2.52:4123"), "admin", "correct-password"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("stale password login = %v, want ErrInvalidCredentials", err)
+	}
+}
+
+func TestRefreshSessionRejectsVersionReplacedByRecovery(t *testing.T) {
+	manager := newAuthManager(t, nil)
+	request := loginRequest("192.0.2.60:4123")
+	webVersion, err := manager.ChangePassword(request, "correct-password", "web-password-123", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryHash, err := HashPassword("recovery-password-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.SyncPasswordHash(func() (string, bool, error) { return recoveryHash, true, nil }); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	if err := manager.RefreshSession(response, request, webVersion); !errors.Is(err, ErrCredentialChanged) {
+		t.Fatalf("RefreshSession() = %v, want ErrCredentialChanged", err)
+	}
+	if len(response.Result().Cookies()) != 0 {
+		t.Fatalf("stale password change received cookies: %#v", response.Result().Cookies())
+	}
+}

@@ -14,6 +14,10 @@ const (
 	ChannelTypeBark    = "bark"
 	ChannelTypeEmail   = "email"
 	ChannelTypeWebhook = "webhook"
+
+	ProxyTypeHTTP   = "http"
+	ProxyTypeHTTPS  = "https"
+	ProxyTypeSOCKS5 = "socks5"
 )
 
 type PluginConfigField struct {
@@ -41,6 +45,8 @@ type Monitor struct {
 	ID                      int64           `json:"id"`
 	Name                    string          `json:"name"`
 	Type                    string          `json:"type"`
+	ProxyID                 *int64          `json:"proxyId,omitempty"`
+	Proxy                   *ProxyProfile   `json:"-"`
 	Enabled                 bool            `json:"enabled"`
 	IntervalSeconds         int             `json:"intervalSeconds"`
 	Config                  json.RawMessage `json:"config"`
@@ -62,11 +68,38 @@ type Monitor struct {
 type MonitorInput struct {
 	Name                    string          `json:"name"`
 	Type                    string          `json:"type"`
+	ProxyID                 *int64          `json:"proxyId"`
 	Enabled                 bool            `json:"enabled"`
 	IntervalSeconds         int             `json:"intervalSeconds"`
 	Config                  json.RawMessage `json:"config"`
 	FailureAlertAfter       int             `json:"failureAlertAfter"`
 	FailureNotifyChannelIDs []int64         `json:"failureNotifyChannelIds"`
+}
+
+// ProxyProfile is a reusable outbound proxy that can be assigned to one or
+// more monitors. Password is intentionally excluded from API serialization;
+// sanitized responses advertise its presence through ConfiguredSecrets.
+type ProxyProfile struct {
+	ID                int64     `json:"id"`
+	Name              string    `json:"name"`
+	Type              string    `json:"type"`
+	Host              string    `json:"host"`
+	Port              int       `json:"port"`
+	Username          string    `json:"username,omitempty"`
+	Password          string    `json:"-"`
+	ConfiguredSecrets []string  `json:"configuredSecrets,omitempty"`
+	CreatedAt         time.Time `json:"createdAt"`
+	UpdatedAt         time.Time `json:"updatedAt"`
+}
+
+type ProxyProfileInput struct {
+	Name          string `json:"name"`
+	Type          string `json:"type"`
+	Host          string `json:"host"`
+	Port          int    `json:"port"`
+	Username      string `json:"username"`
+	Password      string `json:"password"`
+	ClearPassword bool   `json:"clearPassword,omitempty"`
 }
 
 type Rule struct {

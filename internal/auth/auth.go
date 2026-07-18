@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -32,6 +33,10 @@ const (
 )
 
 var ErrInvalidCredentials = errors.New("invalid username or password")
+var ErrPasswordUnchanged = errors.New("new password must differ from the current password")
+var ErrPasswordTooShort = errors.New("password must contain at least 8 characters")
+var ErrPasswordTooLong = errors.New("password is too long")
+var ErrCredentialChanged = errors.New("credential changed concurrently")
 
 type Config struct {
 	Enabled            bool
@@ -52,6 +57,8 @@ type Manager struct {
 	enabled           bool
 	username          string
 	passwordHash      string
+	credentialVersion string
+	credentialsMu     sync.RWMutex
 	sessionSecret     []byte
 	sessionTTL        time.Duration
 	cookieName        string
@@ -86,6 +93,7 @@ type contextKey struct{}
 type sessionPayload struct {
 	Username  string `json:"u"`
 	ExpiresAt int64  `json:"exp"`
+	Version   string `json:"v"`
 }
 
 func NewManager(cfg Config, logger *slog.Logger) (*Manager, error) {
@@ -114,15 +122,19 @@ func NewManager(cfg Config, logger *slog.Logger) (*Manager, error) {
 		cfg.LoginFailureWindow = defaultFailureWindow
 	}
 	passwordHash := strings.TrimSpace(cfg.PasswordHash)
+	credentialMaterial := "hash:" + passwordHash
 	if passwordHash == "" {
 		if cfg.Password == "" {
 			return nil, fmt.Errorf("auth is enabled; set WATCHBELL_ADMIN_PASSWORD or WATCHBELL_ADMIN_PASSWORD_HASH, or set WATCHBELL_AUTH_DISABLED=true for local-only development")
 		}
+		credentialMaterial = "password:" + cfg.Password
 		hash, err := HashPassword(cfg.Password)
 		if err != nil {
 			return nil, err
 		}
 		passwordHash = hash
+	} else if err := validatePasswordHash(passwordHash); err != nil {
+		return nil, fmt.Errorf("invalid administrator password hash: %w", err)
 	}
 	secret := []byte(cfg.SessionSecret)
 	if len(secret) == 0 {
@@ -138,6 +150,7 @@ func NewManager(cfg Config, logger *slog.Logger) (*Manager, error) {
 		enabled:           true,
 		username:          cfg.Username,
 		passwordHash:      passwordHash,
+		credentialVersion: credentialVersion(secret, credentialMaterial),
 		sessionSecret:     secret,
 		sessionTTL:        cfg.SessionTTL,
 		cookieName:        cfg.CookieName,
@@ -184,18 +197,120 @@ func (m *Manager) Login(w http.ResponseWriter, r *http.Request, username string,
 	if retryAfter := m.loginFailures.retryAfter(client); retryAfter > 0 {
 		return &RateLimitError{RetryAfter: retryAfter}
 	}
-	if username != m.username || !VerifyPassword(m.passwordHash, password) {
+	m.credentialsMu.RLock()
+	valid := username == m.username && VerifyPassword(m.passwordHash, password)
+	if !valid {
+		m.credentialsMu.RUnlock()
 		m.loginFailures.record(client)
 		return ErrInvalidCredentials
 	}
-	m.loginFailures.reset(client)
 	value, err := m.signSession(sessionPayload{
 		Username:  username,
 		ExpiresAt: time.Now().Add(m.sessionTTL).Unix(),
+		Version:   m.credentialVersion,
 	})
+	m.credentialsMu.RUnlock()
 	if err != nil {
 		return err
 	}
+	m.loginFailures.reset(client)
+	m.setSessionCookie(w, r, value)
+	return nil
+}
+
+// ChangePassword verifies the current credential, persists the replacement
+// hash, and only then activates it in memory. The callback lets callers make
+// persistence and audit logging atomic without coupling auth to a database.
+func (m *Manager) ChangePassword(r *http.Request, currentPassword, newPassword string, persist func(string) error) (string, error) {
+	if !m.Enabled() {
+		return "", fmt.Errorf("auth is disabled")
+	}
+	client := loginClientKey(r)
+	if retryAfter := m.loginFailures.retryAfter(client); retryAfter > 0 {
+		return "", &RateLimitError{RetryAfter: retryAfter}
+	}
+	m.credentialsMu.Lock()
+	defer m.credentialsMu.Unlock()
+	if !VerifyPassword(m.passwordHash, currentPassword) {
+		m.loginFailures.record(client)
+		return "", ErrInvalidCredentials
+	}
+	if VerifyPassword(m.passwordHash, newPassword) {
+		return "", ErrPasswordUnchanged
+	}
+	if err := ValidatePassword(newPassword); err != nil {
+		return "", err
+	}
+	passwordHash, err := HashPassword(newPassword)
+	if err != nil {
+		return "", err
+	}
+	if persist != nil {
+		if err := persist(passwordHash); err != nil {
+			return "", err
+		}
+	}
+	m.passwordHash = passwordHash
+	m.credentialVersion = credentialVersion(m.sessionSecret, "hash:"+passwordHash)
+	m.loginFailures.reset(client)
+	return m.credentialVersion, nil
+}
+
+// SyncPasswordHash serializes loading the durable credential with in-process
+// password changes. Keeping the load inside the credential lock prevents a
+// delayed poll from restoring a stale hash after a concurrent web change.
+func (m *Manager) SyncPasswordHash(load func() (string, bool, error)) (bool, error) {
+	if !m.Enabled() || load == nil {
+		return false, nil
+	}
+	m.credentialsMu.Lock()
+	defer m.credentialsMu.Unlock()
+	passwordHash, exists, err := load()
+	if err != nil || !exists {
+		return false, err
+	}
+	return m.reloadPasswordHashLocked(passwordHash)
+}
+
+func (m *Manager) reloadPasswordHashLocked(passwordHash string) (bool, error) {
+	passwordHash = strings.TrimSpace(passwordHash)
+	if err := validatePasswordHash(passwordHash); err != nil {
+		return false, err
+	}
+	if passwordHash == m.passwordHash {
+		return false, nil
+	}
+	m.passwordHash = passwordHash
+	m.credentialVersion = credentialVersion(m.sessionSecret, "hash:"+passwordHash)
+	return true, nil
+}
+
+// RefreshSession issues a cookie only if the expected password version is
+// still current. An out-of-process recovery change must never accidentally
+// grant its new session version to a browser that does not know that password.
+func (m *Manager) RefreshSession(w http.ResponseWriter, r *http.Request, expectedVersion string) error {
+	if !m.Enabled() {
+		return fmt.Errorf("auth is disabled")
+	}
+	m.credentialsMu.RLock()
+	if expectedVersion == "" || expectedVersion != m.credentialVersion {
+		m.credentialsMu.RUnlock()
+		return ErrCredentialChanged
+	}
+	value, err := m.signSession(sessionPayload{
+		Username:  m.username,
+		ExpiresAt: time.Now().Add(m.sessionTTL).Unix(),
+		Version:   m.credentialVersion,
+	})
+	m.credentialsMu.RUnlock()
+	if err != nil {
+		return err
+	}
+	m.setSessionCookie(w, r, value)
+	return nil
+}
+
+func (m *Manager) setSessionCookie(w http.ResponseWriter, r *http.Request, value string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     m.cookieName,
 		Value:    value,
@@ -205,7 +320,6 @@ func (m *Manager) Login(w http.ResponseWriter, r *http.Request, username string,
 		Secure:   m.secureCookie(r),
 		MaxAge:   int(m.sessionTTL.Seconds()),
 	})
-	return nil
 }
 
 func (m *Manager) Logout(w http.ResponseWriter, r *http.Request) {
@@ -421,7 +535,13 @@ func (m *Manager) verifyRequest(r *http.Request) (string, bool) {
 		return "", false
 	}
 	payload, ok := m.verifySession(cookie.Value)
-	if !ok || payload.Username != m.username || time.Now().Unix() > payload.ExpiresAt {
+	if !ok || time.Now().Unix() > payload.ExpiresAt {
+		return "", false
+	}
+	m.credentialsMu.RLock()
+	valid := payload.Username == m.username && payload.Version == m.credentialVersion
+	m.credentialsMu.RUnlock()
+	if !valid {
 		return "", false
 	}
 	return payload.Username, true
@@ -480,25 +600,55 @@ func HashPassword(password string) (string, error) {
 	}, "$"), nil
 }
 
+func ValidatePassword(password string) error {
+	if utf8.RuneCountInString(password) < 8 {
+		return ErrPasswordTooShort
+	}
+	if len(password) > 1024 {
+		return ErrPasswordTooLong
+	}
+	return nil
+}
+
 func VerifyPassword(encoded string, password string) bool {
-	parts := strings.Split(encoded, "$")
-	if len(parts) != 4 || parts[0] != "pbkdf2-sha256" {
-		return false
-	}
-	iterations, err := strconv.Atoi(parts[1])
-	if err != nil || iterations < 100_000 {
-		return false
-	}
-	salt, err := base64.RawURLEncoding.DecodeString(parts[2])
-	if err != nil {
-		return false
-	}
-	expected, err := base64.RawURLEncoding.DecodeString(parts[3])
+	iterations, salt, expected, err := parsePasswordHash(encoded)
 	if err != nil {
 		return false
 	}
 	actual := pbkdf2SHA256([]byte(password), salt, iterations, len(expected))
 	return subtle.ConstantTimeCompare(actual, expected) == 1
+}
+
+func validatePasswordHash(encoded string) error {
+	_, _, _, err := parsePasswordHash(encoded)
+	return err
+}
+
+func parsePasswordHash(encoded string) (int, []byte, []byte, error) {
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 4 || parts[0] != "pbkdf2-sha256" {
+		return 0, nil, nil, errors.New("unsupported password hash format")
+	}
+	iterations, err := strconv.Atoi(parts[1])
+	if err != nil || iterations < 100_000 || iterations > 10_000_000 {
+		return 0, nil, nil, errors.New("invalid PBKDF2 iteration count")
+	}
+	salt, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || len(salt) < 16 || len(salt) > 1024 {
+		return 0, nil, nil, errors.New("invalid password hash salt")
+	}
+	expected, err := base64.RawURLEncoding.DecodeString(parts[3])
+	if err != nil || len(expected) < 32 || len(expected) > 128 {
+		return 0, nil, nil, errors.New("invalid password hash key")
+	}
+	return iterations, salt, expected, nil
+}
+
+func credentialVersion(secret []byte, material string) string {
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte("watchbell-credential-version\x00"))
+	_, _ = mac.Write([]byte(material))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func pbkdf2SHA256(password []byte, salt []byte, iterations int, keyLen int) []byte {

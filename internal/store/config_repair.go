@@ -18,6 +18,12 @@ func (s *Store) repairActiveConfigReferences(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 	now := nowString()
+	if _, err := tx.ExecContext(ctx, `UPDATE monitors SET enabled = 0, last_status = 'error',
+		last_error = 'configured proxy is unavailable; select another proxy before enabling this monitor', updated_at = ?
+		WHERE deleted_at IS NULL AND proxy_id IS NOT NULL
+		AND NOT EXISTS (SELECT 1 FROM proxy_profiles p WHERE p.id = monitors.proxy_id AND p.deleted_at IS NULL)`, now); err != nil {
+		return err
+	}
 
 	if _, err := tx.ExecContext(ctx, `UPDATE rules SET enabled = 0, deleted_at = ?, updated_at = ?
 		WHERE deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM monitors m WHERE m.id = rules.monitor_id AND m.deleted_at IS NULL)`, now, now); err != nil {

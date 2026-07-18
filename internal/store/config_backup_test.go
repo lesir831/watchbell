@@ -47,3 +47,27 @@ func TestConfigImportRejectsDefaultTemplateRenameCollision(t *testing.T) {
 		t.Fatalf("failed import changed template count: %#v err=%v", templates, err)
 	}
 }
+
+func TestConfigImportNormalizesProxyValuesBeforeStorage(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	backup := model.ConfigBackup{
+		Version: model.ConfigBackupVersion, ExportedAt: time.Now().UTC(), IncludesSecrets: true,
+		Proxies: []model.ConfigBackupProxy{{ID: 7, Name: " IPv6 proxy ", Type: " HTTPS ", Host: "[::1]", Port: 8443}},
+	}
+	report, err := db.ImportConfigMerge(ctx, backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := db.GetProxyProfile(ctx, report.IDMap.Proxies["7"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.Name != "IPv6 proxy" || profile.Type != model.ProxyTypeHTTPS || profile.Host != "::1" {
+		t.Fatalf("imported proxy was not normalized: %#v", profile)
+	}
+}

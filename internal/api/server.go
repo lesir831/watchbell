@@ -83,6 +83,12 @@ func (s *Server) Routes() http.Handler {
 
 func (s *Server) privateRoutes(r chi.Router) {
 	r.Get("/auth/me", s.authMe)
+	r.Get("/settings", s.settingsOverview)
+	r.Post("/settings/password", s.changePassword)
+	r.Get("/settings/proxies", s.listProxyProfiles)
+	r.Post("/settings/proxies", s.createProxyProfile)
+	r.Put("/settings/proxies/{id}", s.updateProxyProfile)
+	r.Delete("/settings/proxies/{id}", s.deleteProxyProfile)
 	r.Get("/plugins", s.listPlugins)
 	r.Get("/help/variables", s.variableCatalog)
 	r.Get("/dashboard", s.dashboard)
@@ -932,6 +938,11 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, store.ErrDuplicateNaturalKey) {
 		status = http.StatusConflict
 		code = "duplicate_natural_key"
+	}
+	if errors.Is(err, store.ErrProxyUnavailable) {
+		status = http.StatusUnprocessableEntity
+		code = "validation_failed"
+		fields = map[string]string{"proxyId": "所选代理已不存在或已被归档，请重新选择。"}
 	}
 	writeJSON(w, status, errorPayload(r, err, code, fields, nil))
 }

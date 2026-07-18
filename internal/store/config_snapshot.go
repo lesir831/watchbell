@@ -10,6 +10,7 @@ import (
 // ConfigSnapshot is read from one SQLite transaction so exported references
 // cannot straddle concurrent configuration updates.
 type ConfigSnapshot struct {
+	Proxies   []model.ProxyProfile
 	Monitors  []model.Monitor
 	Rules     []model.Rule
 	Channels  []model.NotifyChannel
@@ -24,7 +25,16 @@ func (s *Store) ReadConfigSnapshot(ctx context.Context) (ConfigSnapshot, error) 
 	defer tx.Rollback()
 
 	var snapshot ConfigSnapshot
-	monitorRows, err := tx.QueryContext(ctx, `SELECT id, name, type, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE deleted_at IS NULL ORDER BY id DESC`)
+	proxyRows, err := tx.QueryContext(ctx, `SELECT id, name, type, host, port, username, password, created_at, updated_at FROM proxy_profiles WHERE deleted_at IS NULL ORDER BY id DESC`)
+	if err != nil {
+		return ConfigSnapshot{}, err
+	}
+	snapshot.Proxies, err = scanSnapshotRows(proxyRows, scanProxyProfile)
+	if err != nil {
+		return ConfigSnapshot{}, err
+	}
+
+	monitorRows, err := tx.QueryContext(ctx, `SELECT id, name, type, proxy_id, enabled, interval_seconds, config_json, state_json, last_checked_at, last_status, last_message, last_error, consecutive_failures, failure_alert_after, failure_notify_channel_ids_json, failure_alert_active, created_at, updated_at FROM monitors WHERE deleted_at IS NULL ORDER BY id DESC`)
 	if err != nil {
 		return ConfigSnapshot{}, err
 	}
@@ -71,6 +81,10 @@ func (s *Store) ReadConfigSnapshot(ctx context.Context) (ConfigSnapshot, error) 
 // active JSON references. Runtime history stays untouched; only the portable
 // configuration view is repaired.
 func normalizeConfigSnapshot(snapshot ConfigSnapshot) ConfigSnapshot {
+	proxyIDs := make(map[int64]struct{}, len(snapshot.Proxies))
+	for _, item := range snapshot.Proxies {
+		proxyIDs[item.ID] = struct{}{}
+	}
 	monitorIDs := make(map[int64]struct{}, len(snapshot.Monitors))
 	for _, item := range snapshot.Monitors {
 		monitorIDs[item.ID] = struct{}{}
@@ -86,6 +100,12 @@ func normalizeConfigSnapshot(snapshot ConfigSnapshot) ConfigSnapshot {
 
 	for index := range snapshot.Monitors {
 		item := &snapshot.Monitors[index]
+		if item.ProxyID != nil {
+			if _, exists := proxyIDs[*item.ProxyID]; !exists {
+				item.ProxyID = nil
+				item.Enabled = false
+			}
+		}
 		item.FailureNotifyChannelIDs = existingSnapshotIDs(item.FailureNotifyChannelIDs, channelIDs)
 		if len(item.FailureNotifyChannelIDs) == 0 {
 			item.FailureAlertAfter = 0

@@ -86,7 +86,11 @@ func (c *WebpageChecker) Check(ctx context.Context, monitor model.Monitor) (mode
 		return model.CheckResult{}, err
 	}
 	req.Header.Set("User-Agent", cfg.UserAgent)
-	resp, err := c.client.Do(req)
+	client, err := clientForMonitor(c.client, monitor)
+	if err != nil {
+		return model.CheckResult{}, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return model.CheckResult{}, err
 	}

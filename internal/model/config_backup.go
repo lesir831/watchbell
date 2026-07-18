@@ -14,16 +14,29 @@ type ConfigBackup struct {
 	Version         int                    `json:"version"`
 	ExportedAt      time.Time              `json:"exportedAt"`
 	IncludesSecrets bool                   `json:"includesSecrets"`
+	Proxies         []ConfigBackupProxy    `json:"proxies"`
 	Monitors        []ConfigBackupMonitor  `json:"monitors"`
 	Rules           []ConfigBackupRule     `json:"rules"`
 	Channels        []ConfigBackupChannel  `json:"channels"`
 	Templates       []ConfigBackupTemplate `json:"templates"`
 }
 
+type ConfigBackupProxy struct {
+	ID              int64    `json:"id"`
+	Name            string   `json:"name"`
+	Type            string   `json:"type"`
+	Host            string   `json:"host"`
+	Port            int      `json:"port"`
+	Username        string   `json:"username,omitempty"`
+	Password        string   `json:"password,omitempty"`
+	RedactedSecrets []string `json:"redactedSecrets,omitempty"`
+}
+
 type ConfigBackupMonitor struct {
 	ID                      int64           `json:"id"`
 	Name                    string          `json:"name"`
 	Type                    string          `json:"type"`
+	ProxyID                 *int64          `json:"proxyId,omitempty"`
 	Enabled                 bool            `json:"enabled"`
 	IntervalSeconds         int             `json:"intervalSeconds"`
 	Config                  json.RawMessage `json:"config"`
@@ -67,6 +80,7 @@ type ConfigImportRequest struct {
 }
 
 type ConfigImportCounts struct {
+	Proxies   int `json:"proxies"`
 	Monitors  int `json:"monitors"`
 	Rules     int `json:"rules"`
 	Channels  int `json:"channels"`
@@ -74,6 +88,7 @@ type ConfigImportCounts struct {
 }
 
 type ConfigImportIDMap struct {
+	Proxies   map[string]int64 `json:"proxies"`
 	Monitors  map[string]int64 `json:"monitors"`
 	Rules     map[string]int64 `json:"rules"`
 	Channels  map[string]int64 `json:"channels"`

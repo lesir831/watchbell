@@ -183,6 +183,18 @@ WATCHBELL_AUTH_DISABLED=true go run ./cmd/watchbell
 
 不要把关闭认证的实例暴露到公网。
 
+## 设置与出站代理
+
+管理界面的“设置”模块包含账户安全和网络代理：
+
+- “账户安全”可以验证当前密码后设置新密码。新密码 hash 会持久化到 SQLite，并在后续启动时优先于 `WATCHBELL_ADMIN_PASSWORD` / `WATCHBELL_ADMIN_PASSWORD_HASH`；修改成功后，其他浏览器中的旧会话会立即失效。
+- 如果忘记网页中设置的密码，可以在使用相同 `WATCHBELL_DB` 的环境中执行 `watchbell set-password`，并按提示从标准输入输入两次新密码（密码不会出现在命令参数和 shell 历史中）。Docker Compose 部署可以执行 `docker compose exec watchbell watchbell set-password`。运行中的 WatchBell 会在约 1 秒内载入新密码并让旧会话失效。
+- “网络代理”支持 HTTP、HTTPS 和 SOCKS5。代理保存后，在新建或编辑监控时通过“网络连接”单独选择；未选择时沿用部署环境的默认网络连接方式，包括可能存在的 `HTTP_PROXY` / `HTTPS_PROXY`。
+- 代理不可用或已被异常移除时，使用它的监控会检查失败，不会自动绕过代理直连。仍被监控引用的代理不能归档。
+- 代理密码不会通过列表或详情 API 回显；编辑时留空保留原值，也可以显式清除。
+
+这里配置的是 RSS、TestFlight、网页和 GitHub Release 检查请求使用的“出站代理”，与 `WATCHBELL_TRUST_PROXY_HEADERS` 所描述的入站反向代理信任边界不是同一项设置。
+
 ## 配置项
 
 | 变量 | 默认值 | 说明 |
@@ -376,7 +388,7 @@ TestFlight 有空位时本身就会产生事件。如果只想有事件就通知
 
 URL、请求头和请求体都支持事件变量。JSON 请求体应使用 `${json:path}` 插入完整 JSON 值，它会正确转义换行、引号和反斜杠；普通 `${path}` 仍适用于 URL、请求头和纯文本正文。`bodyTemplate` 留空时，WatchBell 会生成包含 `subject`、`body` 和 `data` 的安全默认 JSON。此渠道可用来连接 ntfy、Telegram、Discord、飞书、钉钉、企业微信或自己的 HTTP 服务。Webhook URL 和 Headers 都按密钥脱敏，因为很多服务会把 Token 直接放在 URL 中。Webhook 不跟随重定向，会拒绝 `Host`、`Content-Length` 等不安全请求头，并默认阻止回环、内网、link-local、特殊用途和云 metadata 地址。只有当目标是你控制的内部服务时才应开启 `allowPrivate`。
 
-渠道密钥、SMTP 密码和 GitHub token 只保存在后端。编辑时留空表示保留现有值；列表 API 只返回“已配置”标识，不返回明文。
+渠道密钥、SMTP 密码、GitHub token 和出站代理密码只保存在后端。编辑时留空表示保留现有值；列表 API 只返回“已配置”标识，不返回明文。
 
 ## 活动追踪与排查
 
@@ -401,7 +413,7 @@ GET /api/health/ready
 
 ## 配置备份与迁移
 
-在“活动与诊断 > 系统诊断”中可以导出或导入版本化 JSON 配置。默认导出会脱敏；这类备份适合审查或合并回同一实例，但新机恢复需要在明确的风险确认后导出“包含密钥”的完整备份。
+在“活动与诊断 > 系统诊断”中可以导出或导入版本化 JSON 配置。代理配置及监控的代理关联也包含在备份中。默认导出会脱敏渠道密钥、监控令牌和代理密码；这类备份适合审查或合并回同一实例，但新机恢复需要在明确的风险确认后导出“包含密钥”的完整备份。管理员登录密码永远不会进入配置备份。
 
 导入使用 `merge` 语义：按名称和类型更新现有配置，创建缺失配置，重映射规则关联，但不删除目标实例的配置或运行历史。整次导入在一个事务中执行，失败时不会留下部分修改。
 

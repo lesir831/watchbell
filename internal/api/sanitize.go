@@ -8,6 +8,7 @@ import (
 )
 
 func (s *Server) sanitizeMonitor(item model.Monitor) model.Monitor {
+	item.Proxy = nil
 	secretKeys := make([]string, 0)
 	for _, plugin := range s.scheduler.Plugins() {
 		if plugin.ID != item.Type {

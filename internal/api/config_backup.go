@@ -78,16 +78,29 @@ func (s *Server) buildConfigBackup(r *http.Request, includeSecrets bool) (model.
 	if err := validateSnapshotNaturalKeys(snapshot); err != nil {
 		return model.ConfigBackup{}, err
 	}
-	monitors, rules, channels, templates := snapshot.Monitors, snapshot.Rules, snapshot.Channels, snapshot.Templates
+	proxies, monitors, rules, channels, templates := snapshot.Proxies, snapshot.Monitors, snapshot.Rules, snapshot.Channels, snapshot.Templates
 
 	backup := model.ConfigBackup{
 		Version:         model.ConfigBackupVersion,
 		ExportedAt:      time.Now().UTC(),
 		IncludesSecrets: includeSecrets,
+		Proxies:         make([]model.ConfigBackupProxy, 0, len(proxies)),
 		Monitors:        make([]model.ConfigBackupMonitor, 0, len(monitors)),
 		Rules:           make([]model.ConfigBackupRule, 0, len(rules)),
 		Channels:        make([]model.ConfigBackupChannel, 0, len(channels)),
 		Templates:       make([]model.ConfigBackupTemplate, 0, len(templates)),
+	}
+	for _, item := range proxies {
+		password := item.Password
+		var redacted []string
+		if !includeSecrets && password != "" {
+			password = ""
+			redacted = []string{"password"}
+		}
+		backup.Proxies = append(backup.Proxies, model.ConfigBackupProxy{
+			ID: item.ID, Name: item.Name, Type: item.Type, Host: item.Host, Port: item.Port,
+			Username: item.Username, Password: password, RedactedSecrets: redacted,
+		})
 	}
 	for _, item := range monitors {
 		config := item.Config
@@ -96,7 +109,7 @@ func (s *Server) buildConfigBackup(r *http.Request, includeSecrets bool) (model.
 			config, redacted = redactConfig(config, monitorSecretKeys(item.Type, s.scheduler.Plugins()))
 		}
 		backup.Monitors = append(backup.Monitors, model.ConfigBackupMonitor{
-			ID: item.ID, Name: item.Name, Type: item.Type, Enabled: item.Enabled,
+			ID: item.ID, Name: item.Name, Type: item.Type, ProxyID: item.ProxyID, Enabled: item.Enabled,
 			IntervalSeconds: item.IntervalSeconds, Config: config,
 			FailureAlertAfter:       item.FailureAlertAfter,
 			FailureNotifyChannelIDs: append([]int64{}, item.FailureNotifyChannelIDs...),
@@ -143,6 +156,10 @@ func validateSnapshotNaturalKeys(snapshot store.ConfigSnapshot) error {
 		seen[key] = id
 	}
 	monitorKeys := map[string]int64{}
+	proxyKeys := map[string]int64{}
+	for _, item := range snapshot.Proxies {
+		check("proxies", item.ID, strings.TrimSpace(item.Name), "同名代理无法可靠合并", proxyKeys)
+	}
 	for _, item := range snapshot.Monitors {
 		check("monitors", item.ID, item.Type+"\x00"+strings.TrimSpace(item.Name), "同名、同类型监控无法可靠合并", monitorKeys)
 	}
@@ -188,9 +205,27 @@ func (s *Server) validateConfigImport(ctx context.Context, request model.ConfigI
 		fields["backup.exportedAt"] = "缺少有效的导出时间。"
 	}
 	validateBackupCollectionSize("backup.monitors", len(backup.Monitors), fields)
+	validateBackupCollectionSize("backup.proxies", len(backup.Proxies), fields)
 	validateBackupCollectionSize("backup.rules", len(backup.Rules), fields)
 	validateBackupCollectionSize("backup.channels", len(backup.Channels), fields)
 	validateBackupCollectionSize("backup.templates", len(backup.Templates), fields)
+
+	proxyIDs := map[int64]struct{}{}
+	proxyKeys := map[string]struct{}{}
+	for index, item := range backup.Proxies {
+		prefix := fmt.Sprintf("backup.proxies.%d", index)
+		validateSourceID(prefix+".id", item.ID, proxyIDs, fields)
+		validateNaturalKey(prefix+".name", strings.TrimSpace(item.Name), proxyKeys, "备份中存在同名代理。", fields)
+		password := validateBackupProxySecret(prefix, item, backup.IncludesSecrets, fields)
+		input := model.ProxyProfileInput{
+			Name: item.Name, Type: item.Type, Host: item.Host, Port: item.Port,
+			Username: item.Username, Password: password,
+		}
+		normalizeProxyProfileInput(&input)
+		if err := validateProxyProfileInput(input); err != nil {
+			mergeBackupProblem(prefix, err, fields)
+		}
+	}
 
 	monitorTypes := map[int64]string{}
 	monitorIDs := map[int64]struct{}{}
@@ -204,11 +239,16 @@ func (s *Server) validateConfigImport(ctx context.Context, request model.ConfigI
 		secretKeys := monitorSecretKeys(item.Type, s.scheduler.Plugins())
 		config := validateBackupSecrets(prefix, item.Config, item.RedactedSecrets, secretKeys, nil, backup.IncludesSecrets, fields)
 		if err := s.validateMonitorInputWithChannelLookup(ctx, model.MonitorInput{
-			Name: item.Name, Type: item.Type, Enabled: item.Enabled,
+			Name: item.Name, Type: item.Type, ProxyID: item.ProxyID, Enabled: item.Enabled,
 			IntervalSeconds: item.IntervalSeconds, Config: config,
 			FailureAlertAfter: item.FailureAlertAfter, FailureNotifyChannelIDs: item.FailureNotifyChannelIDs,
 		}, false); err != nil {
 			mergeBackupProblem(prefix, err, fields)
+		}
+		if item.ProxyID != nil {
+			if _, exists := proxyIDs[*item.ProxyID]; !exists {
+				fields[prefix+".proxyId"] = fmt.Sprintf("备份中不存在代理 ID %d。", *item.ProxyID)
+			}
 		}
 	}
 
@@ -390,6 +430,33 @@ func backupSecretValidationValues(channelType string) map[string]any {
 		"url":     "https://example.com/watchbell-validation",
 		"headers": map[string]any{"X-WatchBell-Validation": "redacted"},
 	}
+}
+
+func validateBackupProxySecret(prefix string, item model.ConfigBackupProxy, includesSecrets bool, fields map[string]string) string {
+	password := item.Password
+	seen := false
+	for index, key := range item.RedactedSecrets {
+		field := fmt.Sprintf("%s.redactedSecrets.%d", prefix, index)
+		if key != "password" {
+			fields[field] = fmt.Sprintf("%q 不是代理的密钥字段。", key)
+			continue
+		}
+		if seen {
+			fields[field] = "已脱敏字段不能重复。"
+		}
+		seen = true
+		if includesSecrets {
+			fields[field] = "包含密钥的备份不能同时声明已脱敏字段。"
+		}
+		if item.Password != "" {
+			fields[field] = "已脱敏密码不能同时出现在 password 字段中。"
+		}
+		password = "__WATCHBELL_REDACTED_FOR_VALIDATION__"
+	}
+	if !includesSecrets && item.Password != "" {
+		fields[prefix+".password"] = "includesSecrets=false 时不能包含代理密码。"
+	}
+	return password
 }
 
 func mergeBackupProblem(prefix string, err error, fields map[string]string) {

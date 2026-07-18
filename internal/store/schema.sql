@@ -1,9 +1,25 @@
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE IF NOT EXISTS proxy_profiles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL,
+  host TEXT NOT NULL,
+  port INTEGER NOT NULL,
+  username TEXT NOT NULL DEFAULT '',
+  password TEXT NOT NULL DEFAULT '',
+  deleted_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_profiles_active_name ON proxy_profiles(name) WHERE deleted_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS monitors (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   type TEXT NOT NULL,
+  proxy_id INTEGER REFERENCES proxy_profiles(id),
   enabled INTEGER NOT NULL DEFAULT 1,
   interval_seconds INTEGER NOT NULL DEFAULT 300,
   config_json TEXT NOT NULL DEFAULT '{}',
@@ -189,6 +205,12 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_action_created_at ON audit_logs(action, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 
 INSERT OR IGNORE INTO notification_templates (
   id, name, subject_template, body_template, created_at, updated_at
