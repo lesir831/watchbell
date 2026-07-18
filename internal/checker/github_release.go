@@ -67,6 +67,12 @@ type githubReleaseAsset struct {
 	Size        int64  `json:"size"`
 }
 
+type githubReleaseFetchResult struct {
+	Releases    []githubRelease
+	ETag        string
+	NotModified bool
+}
+
 func NewGitHubReleaseChecker() *GitHubReleaseChecker {
 	return &GitHubReleaseChecker{client: &http.Client{}}
 }
@@ -101,16 +107,99 @@ func (c *GitHubReleaseChecker) Plugin() model.MonitorPlugin {
 }
 
 func (c *GitHubReleaseChecker) Check(ctx context.Context, monitor model.Monitor) (model.CheckResult, error) {
+	cfg, owner, repo, source, err := decodeGitHubReleaseConfig(monitor)
+	if err != nil {
+		return model.CheckResult{}, err
+	}
+	state := DecodeState(monitor, githubReleaseState{})
+	if state.Source != "" && state.Source != source {
+		state = githubReleaseState{}
+	}
+	fetched, err := c.fetch(ctx, monitor, cfg, owner, repo, state.ETag)
+	if err != nil {
+		return model.CheckResult{}, err
+	}
+	if fetched.NotModified {
+		return model.CheckResult{Status: "ok", Message: "not modified", State: stateToMap(state)}, nil
+	}
+
+	seen := make(map[int64]struct{}, len(state.SeenReleaseIDs))
+	for _, id := range state.SeenReleaseIDs {
+		seen[id] = struct{}{}
+	}
+	newReleases := make([]githubRelease, 0)
+	if state.Initialized {
+		for _, release := range fetched.Releases {
+			if _, ok := seen[release.ID]; !ok {
+				newReleases = append(newReleases, release)
+			}
+		}
+	} else if cfg.NotifyExisting && len(fetched.Releases) > 0 {
+		newReleases = append(newReleases, fetched.Releases[0])
+	}
+	sort.Slice(newReleases, func(i, j int) bool {
+		return newReleases[i].PublishedAt < newReleases[j].PublishedAt
+	})
+
+	events := make([]model.EventData, 0, len(newReleases))
+	for _, release := range newReleases {
+		events = append(events, githubReleaseEvent(owner, repo, release))
+	}
+	state.Initialized = true
+	state.Source = source
+	state.ETag = fetched.ETag
+	state.SeenReleaseIDs = make([]int64, 0, len(fetched.Releases))
+	for _, release := range fetched.Releases {
+		state.SeenReleaseIDs = append(state.SeenReleaseIDs, release.ID)
+	}
+
+	message := fmt.Sprintf("%d new release(s)", len(events))
+	if len(fetched.Releases) == 0 {
+		message = "no published releases found"
+	}
+	return model.CheckResult{Status: "ok", Message: message, State: stateToMap(state), Events: events}, nil
+}
+
+// Inspect bypasses the stored ETag and returns the first release that survives
+// the monitor's draft/prerelease filters, regardless of whether it was seen.
+func (c *GitHubReleaseChecker) Inspect(ctx context.Context, monitor model.Monitor) (model.Observation, error) {
+	cfg, owner, repo, _, err := decodeGitHubReleaseConfig(monitor)
+	if err != nil {
+		return model.Observation{}, err
+	}
+	fetched, err := c.fetch(ctx, monitor, cfg, owner, repo, "")
+	if err != nil {
+		return model.Observation{}, err
+	}
+	if fetched.NotModified {
+		return model.Observation{}, fmt.Errorf("github releases source returned 304 without a conditional request")
+	}
+	if len(fetched.Releases) == 0 {
+		return model.Observation{
+			Type: "github.release", Message: "no published releases found", Available: false,
+			Payload: map[string]any{"github": map[string]any{
+				"owner": owner, "repo": repo, "repository": owner + "/" + repo,
+			}},
+		}, nil
+	}
+	event := githubReleaseEvent(owner, repo, fetched.Releases[0])
+	return model.Observation{
+		Type: event.Type, Fingerprint: event.Fingerprint, Message: "latest published release",
+		Available: true, Payload: event.Payload,
+	}, nil
+}
+
+func decodeGitHubReleaseConfig(monitor model.Monitor) (GitHubReleaseConfig, string, string, string, error) {
 	cfg, err := DecodeConfig(monitor, GitHubReleaseConfig{
 		APIURL: defaultGitHubAPIURL, APIVersion: defaultGitHubAPIVersion,
 		TimeoutSeconds: 15, MaxReleases: 20,
 	})
 	if err != nil {
-		return model.CheckResult{}, err
+		return GitHubReleaseConfig{}, "", "", "", err
 	}
 	owner, repo, err := parseGitHubRepository(cfg.Repository)
 	if err != nil {
-		return model.CheckResult{}, err
+		return GitHubReleaseConfig{}, "", "", "", err
 	}
 	if cfg.TimeoutSeconds <= 0 {
 		cfg.TimeoutSeconds = 15
@@ -127,22 +216,23 @@ func (c *GitHubReleaseChecker) Check(ctx context.Context, monitor model.Monitor)
 	if strings.TrimSpace(cfg.APIVersion) == "" {
 		cfg.APIVersion = defaultGitHubAPIVersion
 	}
-
-	endpoint, err := githubReleasesURL(cfg.APIURL, owner, repo, cfg.MaxReleases)
-	if err != nil {
-		return model.CheckResult{}, err
+	if _, err := githubReleasesURL(cfg.APIURL, owner, repo, cfg.MaxReleases); err != nil {
+		return GitHubReleaseConfig{}, "", "", "", err
 	}
 	source := fmt.Sprintf("%s|%s/%s|prerelease=%t", strings.TrimRight(cfg.APIURL, "/"), owner, repo, cfg.IncludePrereleases)
-	state := DecodeState(monitor, githubReleaseState{})
-	if state.Source != "" && state.Source != source {
-		state = githubReleaseState{}
-	}
+	return cfg, owner, repo, source, nil
+}
 
+func (c *GitHubReleaseChecker) fetch(ctx context.Context, monitor model.Monitor, cfg GitHubReleaseConfig, owner, repo, etag string) (githubReleaseFetchResult, error) {
+	endpoint, err := githubReleasesURL(cfg.APIURL, owner, repo, cfg.MaxReleases)
+	if err != nil {
+		return githubReleaseFetchResult{}, err
+	}
 	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return model.CheckResult{}, err
+		return githubReleaseFetchResult{}, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", cfg.APIVersion)
@@ -150,37 +240,36 @@ func (c *GitHubReleaseChecker) Check(ctx context.Context, monitor model.Monitor)
 	if token := strings.TrimSpace(cfg.Token); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	if state.ETag != "" {
-		req.Header.Set("If-None-Match", state.ETag)
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
 	}
 
 	client, err := clientForMonitor(c.client, monitor)
 	if err != nil {
-		return model.CheckResult{}, err
+		return githubReleaseFetchResult{}, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return model.CheckResult{}, err
+		return githubReleaseFetchResult{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotModified {
-		return model.CheckResult{Status: "ok", Message: "not modified", State: stateToMap(state)}, nil
+		return githubReleaseFetchResult{NotModified: true}, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return model.CheckResult{}, githubAPIError(resp)
+		return githubReleaseFetchResult{}, githubAPIError(resp)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxGitHubReleaseBytes+1))
 	if err != nil {
-		return model.CheckResult{}, err
+		return githubReleaseFetchResult{}, err
 	}
 	if len(body) > maxGitHubReleaseBytes {
-		return model.CheckResult{}, fmt.Errorf("github releases response exceeds %d bytes", maxGitHubReleaseBytes)
+		return githubReleaseFetchResult{}, fmt.Errorf("github releases response exceeds %d bytes", maxGitHubReleaseBytes)
 	}
 	var releases []githubRelease
 	if err := json.Unmarshal(body, &releases); err != nil {
-		return model.CheckResult{}, fmt.Errorf("decode github releases: %w", err)
+		return githubReleaseFetchResult{}, fmt.Errorf("decode github releases: %w", err)
 	}
-
 	filtered := make([]githubRelease, 0, len(releases))
 	for _, release := range releases {
 		if release.Draft || (!cfg.IncludePrereleases && release.Prerelease) {
@@ -188,42 +277,7 @@ func (c *GitHubReleaseChecker) Check(ctx context.Context, monitor model.Monitor)
 		}
 		filtered = append(filtered, release)
 	}
-
-	seen := make(map[int64]struct{}, len(state.SeenReleaseIDs))
-	for _, id := range state.SeenReleaseIDs {
-		seen[id] = struct{}{}
-	}
-	newReleases := make([]githubRelease, 0)
-	if state.Initialized {
-		for _, release := range filtered {
-			if _, ok := seen[release.ID]; !ok {
-				newReleases = append(newReleases, release)
-			}
-		}
-	} else if cfg.NotifyExisting && len(filtered) > 0 {
-		newReleases = append(newReleases, filtered[0])
-	}
-	sort.Slice(newReleases, func(i, j int) bool {
-		return newReleases[i].PublishedAt < newReleases[j].PublishedAt
-	})
-
-	events := make([]model.EventData, 0, len(newReleases))
-	for _, release := range newReleases {
-		events = append(events, githubReleaseEvent(owner, repo, release))
-	}
-	state.Initialized = true
-	state.Source = source
-	state.ETag = resp.Header.Get("ETag")
-	state.SeenReleaseIDs = make([]int64, 0, len(filtered))
-	for _, release := range filtered {
-		state.SeenReleaseIDs = append(state.SeenReleaseIDs, release.ID)
-	}
-
-	message := fmt.Sprintf("%d new release(s)", len(events))
-	if len(filtered) == 0 {
-		message = "no published releases found"
-	}
-	return model.CheckResult{Status: "ok", Message: message, State: stateToMap(state), Events: events}, nil
+	return githubReleaseFetchResult{Releases: filtered, ETag: resp.Header.Get("ETag")}, nil
 }
 
 func parseGitHubRepository(repository string) (string, string, error) {

@@ -96,6 +96,29 @@ func TestEventDataProtectsReservedAndGlobalVariables(t *testing.T) {
 	}
 }
 
+func TestObservationDataOmitsPersistedEventFieldsAndEmptySampleStatus(t *testing.T) {
+	monitor := model.Monitor{ID: 7, Name: "Feed", Type: model.MonitorTypeRSS}
+	data := ObservationData(monitor, model.Observation{
+		Type: "rss.item", Available: false, Message: "feed contains no items",
+		Payload: map[string]any{"rss": map[string]any{
+			"sourceTitle": "Empty feed", "sourceLink": "https://example.com/empty",
+		}},
+	})
+	flattened := Flatten(data)
+	if _, exists := flattened["event.id"]; exists {
+		t.Fatalf("live observation fabricated event.id: %#v", flattened)
+	}
+	if _, exists := flattened["event.time"]; exists {
+		t.Fatalf("live observation fabricated event.time: %#v", flattened)
+	}
+	if flattened["event.type"] != "rss.item" || flattened["title"] != "Empty feed" || flattened["url"] != "https://example.com/empty" {
+		t.Fatalf("source context missing: %#v", flattened)
+	}
+	if flattened["status"] != "" {
+		t.Fatalf("empty source was presented as a published event: %#v", flattened["status"])
+	}
+}
+
 func TestImplicitMonitorURLFallbackRejectsCredentialBearingURLs(t *testing.T) {
 	tests := []struct {
 		name string

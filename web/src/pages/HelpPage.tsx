@@ -6,6 +6,7 @@ import {
   Descriptions,
   Empty,
   Select,
+  Skeleton,
   Space,
   Table,
   Tabs,
@@ -15,7 +16,7 @@ import {
 import { ApiOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api';
-import { PageError, relativeDate } from '../components/Common';
+import { formatDate, PageError } from '../components/Common';
 import type { VariableDefinition, VariableSnapshot, VariableUsage } from '../types';
 
 const { Paragraph, Text, Title } = Typography;
@@ -29,12 +30,14 @@ const usageLabels: Record<VariableUsage, string> = {
 export default function HelpPage() {
   const [monitorId, setMonitorId] = useState<number>();
   const catalog = useQuery({ queryKey: ['variableCatalog'], queryFn: api.variableCatalog });
-  const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors, refetchInterval: 30_000 });
+  const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors });
   const snapshot = useQuery({
     queryKey: ['monitorVariables', monitorId],
-    queryFn: () => api.monitorVariables(monitorId as number),
+    queryFn: ({ signal }) => api.monitorVariables(monitorId as number, signal),
     enabled: Boolean(monitorId),
-    refetchInterval: 30_000
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false
   });
 
   useEffect(() => {
@@ -42,38 +45,43 @@ export default function HelpPage() {
   }, [monitorId, monitors.data]);
 
   const selectedMonitor = monitors.data?.find((item) => item.id === monitorId);
+  // A failed or in-progress inspection must not present an older cached result
+  // as if it came from the current source request.
+  const liveSnapshot = snapshot.error || snapshot.isFetching ? undefined : snapshot.data;
   const tabs = useMemo(() => {
     if (!catalog.data) return [];
     return [
       {
         key: 'globals',
         label: '跨模块快捷变量',
-        children: <VariableSection title="跨模块快捷变量" description="四类监控均可使用相同变量名；没有对应源字段时返回空字符串。" definitions={catalog.data.globals} snapshot={snapshot.data} />
+        children: <VariableSection title="跨模块快捷变量" description="四类监控均可使用相同变量名；没有对应源字段时返回空字符串。" definitions={catalog.data.globals} snapshot={liveSnapshot} loading={snapshot.isFetching} />
       },
       {
         key: 'system',
         label: '系统上下文',
-        children: <VariableSection title="系统上下文" description="由 WatchBell 在处理事件和发送通知时补充；rule.* 与 message.* 不属于原始事件快照。" definitions={catalog.data.system} snapshot={snapshot.data} />
+        children: <VariableSection title="系统上下文" description="实时检查可展示 monitor.*；由于不会创建事件，event.*、rule.* 与 message.* 可能不提供。" definitions={catalog.data.system} snapshot={liveSnapshot} loading={snapshot.isFetching} />
       },
       ...catalog.data.modules.map((module) => ({
         key: module.id,
         label: module.name,
         children: <VariableSection
           title={`${module.name} 变量`}
-          description={selectedMonitor?.type === module.id ? `当前取值来自监控“${selectedMonitor.name}”的最近事件。` : '选择这个模块的监控后，可以在表格中查看最近事件取值。'}
+          description={selectedMonitor?.type === module.id ? `当前取值来自监控“${selectedMonitor.name}”的本次实时源站检查。` : '选择这个模块的监控后，可以在表格中查看本次源站取值。'}
           definitions={module.variables}
-          snapshot={selectedMonitor?.type === module.id ? snapshot.data : undefined}
+          snapshot={selectedMonitor?.type === module.id ? liveSnapshot : undefined}
+          loading={selectedMonitor?.type === module.id && snapshot.isFetching}
         />
       }))
     ];
-  }, [catalog.data, selectedMonitor, snapshot.data]);
+  }, [catalog.data, liveSnapshot, selectedMonitor, snapshot.isFetching]);
 
-  const error = (catalog.error || monitors.error || snapshot.error) as Error | null;
+  const error = (catalog.error || monitors.error) as Error | null;
   const snapshotURL = monitorId ? `/api/monitors/${monitorId}/variables` : '';
+  const fetchedAt = liveSnapshot?.generatedAt;
 
   return (
     <Space direction="vertical" size={18} className="full-width help-page">
-      <PageError error={error} onRetry={() => { catalog.refetch(); monitors.refetch(); if (monitorId) snapshot.refetch(); }} />
+      <PageError error={error} onRetry={() => { catalog.refetch(); monitors.refetch(); }} />
       <Alert
         type="info"
         showIcon
@@ -98,9 +106,15 @@ export default function HelpPage() {
 }`}</pre>
       </Card>
 
-      <Card title="最近事件实时取值" extra={<Button icon={<ReloadOutlined />} disabled={!monitorId} loading={snapshot.isFetching} onClick={() => snapshot.refetch()}>刷新取值</Button>}>
-        {monitors.data?.length ? (
+      <Card title="实时变量检查" extra={<Button icon={<ReloadOutlined />} disabled={!monitorId} loading={snapshot.isFetching} onClick={() => snapshot.refetch()}>重新检查</Button>}>
+        {monitors.isLoading ? <Skeleton active paragraph={{ rows: 2 }} /> : monitors.data?.length ? (
           <Space direction="vertical" size={16} className="full-width">
+            <Alert
+              type="info"
+              showIcon
+              message="选择监控后会立即访问源站"
+              description="检查会使用监控的当前配置及其指定代理。它只读取变量，不会创建事件或检查记录，不会修改监控状态或去重状态，不会执行规则，也不会发送通知。"
+            />
             <Select
               showSearch
               value={monitorId}
@@ -110,12 +124,16 @@ export default function HelpPage() {
               onChange={setMonitorId}
               options={monitors.data.map((monitor) => ({ label: `${monitor.name} · ${monitor.type}`, value: monitor.id }))}
             />
-            {snapshot.data && (
+            <PageError error={snapshot.error as Error | null} onRetry={() => snapshot.refetch()} />
+            {snapshot.isFetching && <Skeleton active paragraph={{ rows: 3 }} />}
+            {liveSnapshot && (
               <Descriptions bordered size="small" column={{ xs: 1, md: 3 }}>
-                <Descriptions.Item label="监控">{snapshot.data.monitorName}</Descriptions.Item>
-                <Descriptions.Item label="最近事件">{snapshot.data.eventId ? `#${snapshot.data.eventId} · ${snapshot.data.eventType}` : '暂无事件'}</Descriptions.Item>
-                <Descriptions.Item label="事件时间">{snapshot.data.eventCreatedAt ? relativeDate(snapshot.data.eventCreatedAt) : '—'}</Descriptions.Item>
-                <Descriptions.Item label="完整 JSON 链接" span={3}>
+                <Descriptions.Item label="监控">{liveSnapshot.monitorName}</Descriptions.Item>
+                <Descriptions.Item label="观测类型">{liveSnapshot.observationType || '—'}</Descriptions.Item>
+                <Descriptions.Item label="本次抓取时间">{formatDate(fetchedAt)}</Descriptions.Item>
+                <Descriptions.Item label="样本状态">{liveSnapshot.sampleAvailable ? <Tag color="green">已获取</Tag> : <Tag>无可预览内容</Tag>}</Descriptions.Item>
+                <Descriptions.Item label="检查说明" span={2}>{liveSnapshot.message || '检查完成'}</Descriptions.Item>
+                <Descriptions.Item label="完整 JSON 实时链接" span={3}>
                   <Space wrap>
                     <Text code copyable={{ text: snapshotURL }}>{snapshotURL}</Text>
                     <Button size="small" icon={<ApiOutlined />} href={snapshotURL} target="_blank">打开</Button>
@@ -123,21 +141,21 @@ export default function HelpPage() {
                 </Descriptions.Item>
               </Descriptions>
             )}
-            {snapshot.data && !snapshot.data.eventId && <Alert type="warning" showIcon message="这个监控还没有事件" description="运行监控并产生事件后，此处会展示真实变量值；打开帮助页本身不会抓取源站或发送通知。" />}
+            {liveSnapshot && !liveSnapshot.sampleAvailable && <Alert type="warning" showIcon message="源站没有可预览的内容" description={liveSnapshot.message || '本次检查成功，但源站没有返回可用于渲染变量的条目。'} />}
           </Space>
-        ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="创建监控并产生事件后，可以在这里查看变量实时取值。" />}
+        ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="创建监控后，可以在这里即时访问源站并检查变量取值。" />}
       </Card>
 
       <Card className="variable-reference-card">
         <Title level={4}>变量目录</Title>
-        <Paragraph type="secondary">“实时取值”来自所选监控最近一次已持久化事件，并每 30 秒自动刷新。每个可用值都提供独立 JSON 链接。</Paragraph>
+        <Paragraph type="secondary">选择监控后会立即检查一次；之后仅在重新选择、点击“重新检查”或打开实时链接等主动操作时访问源站，不会在后台轮询。每个可用值都提供实时 JSON 链接，链接取值可能与当前表格不同。</Paragraph>
         <Tabs items={tabs} />
       </Card>
     </Space>
   );
 }
 
-function VariableSection(props: { title: string; description: string; definitions: VariableDefinition[]; snapshot?: VariableSnapshot }) {
+function VariableSection(props: { title: string; description: string; definitions: VariableDefinition[]; snapshot?: VariableSnapshot; loading?: boolean }) {
   return (
     <div className="variable-section">
       <Title level={5}>{props.title}</Title>
@@ -146,6 +164,7 @@ function VariableSection(props: { title: string; description: string; definition
         rowKey="key"
         pagination={false}
         dataSource={props.definitions}
+        loading={props.loading}
         scroll={{ x: 900 }}
         columns={[
           {
@@ -161,11 +180,15 @@ function VariableSection(props: { title: string; description: string; definition
             render: (values: VariableUsage[]) => <Space wrap>{values.map((value) => <Tag key={value}>{usageLabels[value]}</Tag>)}</Space>
           },
           {
-            title: '最近取值', width: 260,
-            render: (_, item) => <VariableValue value={props.snapshot?.values[item.key]} />
+            title: '本次取值', width: 260,
+            render: (_, item) => {
+              const hasSnapshot = Boolean(props.snapshot);
+              const hasValue = Boolean(props.snapshot && Object.prototype.hasOwnProperty.call(props.snapshot.values, item.key));
+              return <VariableValue inspected={hasSnapshot} present={hasValue} value={props.snapshot?.values[item.key]} />;
+            }
           },
           {
-            title: '取值链接', width: 110, fixed: 'right',
+            title: '实时链接', width: 110, fixed: 'right',
             render: (_, item) => {
               const hasValue = props.snapshot && Object.prototype.hasOwnProperty.call(props.snapshot.values, item.key);
               const link = hasValue ? props.snapshot?.valueLinks[item.key] : undefined;
@@ -178,9 +201,12 @@ function VariableSection(props: { title: string; description: string; definition
   );
 }
 
-function VariableValue({ value }: { value: unknown }) {
-  if (value === undefined || value === null || value === '') return <Text type="secondary">—</Text>;
-  const text = typeof value === 'string' ? value : JSON.stringify(value);
+function VariableValue({ inspected, present, value }: { inspected: boolean; present: boolean; value: unknown }) {
+  if (!inspected) return <Text type="secondary">尚未检查</Text>;
+  if (!present || value === undefined) return <Tag>未提供</Tag>;
+  if (value === null) return <Text code copyable={{ text: 'null' }}>null</Text>;
+  if (value === '') return <Text code copyable={{ text: '' }}>{'""（空字符串）'}</Text>;
+  const text = typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value));
   const isURL = typeof value === 'string' && /^https?:\/\//i.test(value);
   return (
     <Text ellipsis={{ tooltip: text }} copyable={{ text }} className="variable-live-value">

@@ -27,6 +27,13 @@ func (c *proxyCaptureChecker) Check(_ context.Context, monitor model.Monitor) (m
 	c.seen <- monitor.Proxy
 	return model.CheckResult{Status: "ok", Message: "proxy captured"}, nil
 }
+func (c *proxyCaptureChecker) Inspect(_ context.Context, monitor model.Monitor) (model.Observation, error) {
+	c.seen <- monitor.Proxy
+	return model.Observation{
+		Type: "proxy.current", Fingerprint: "proxy:current", Available: true,
+		Message: "proxy inspected", Payload: map[string]any{"proxy": map[string]any{"current": true}},
+	}, nil
+}
 
 func (traceChecker) Type() string { return "trace_test" }
 func (traceChecker) Plugin() model.MonitorPlugin {
@@ -72,6 +79,94 @@ func TestRunOnceResolvesAssignedProxyProfile(t *testing.T) {
 	if seen == nil || seen.ID != profile.ID || seen.Password != "secret" {
 		t.Fatalf("resolved proxy = %#v", seen)
 	}
+}
+
+func TestInspectMonitorResolvesProxyWithoutPersistingCheckState(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	profile, err := db.CreateProxyProfile(ctx, model.ProxyProfileInput{
+		Name: "Inspect proxy", Type: model.ProxyTypeSOCKS5, Host: "127.0.0.1", Port: 1080, Username: "user", Password: "secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	monitor, err := db.CreateMonitor(ctx, model.MonitorInput{
+		Name: "Inspect monitor", Type: "proxy_capture", ProxyID: &profile.ID, Enabled: false, IntervalSeconds: 60, Config: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateMonitorCheckResult(ctx, monitor.ID, model.CheckResult{
+		Status: "ok", Message: "existing state", State: map[string]any{"seen": true},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.GetMonitor(ctx, monitor.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	capture := &proxyCaptureChecker{seen: make(chan *model.ProxyProfile, 1)}
+	scheduler := New(db, checker.NewRegistry(capture), notifier.NewRegistry(), Options{})
+	observation, err := scheduler.InspectMonitor(ctx, before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := <-capture.seen
+	if seen == nil || seen.ID != profile.ID || seen.Password != "secret" {
+		t.Fatalf("resolved proxy = %#v", seen)
+	}
+	if observation.Type != "proxy.current" || !observation.Available {
+		t.Fatalf("unexpected inspection result: observation=%#v", observation)
+	}
+	after, err := db.GetMonitor(ctx, monitor.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after.State) != string(before.State) || !timePtrEqual(after.LastCheckedAt, before.LastCheckedAt) || after.LastStatus != before.LastStatus || after.UpdatedAt != before.UpdatedAt {
+		t.Fatalf("inspection persisted monitor state: before=%#v after=%#v", before, after)
+	}
+	runs, _ := db.ListCheckRuns(ctx, 10)
+	events, _ := db.ListEvents(ctx, 10)
+	if len(runs) != 0 || len(events) != 0 {
+		t.Fatalf("inspection created tracking rows: runs=%#v events=%#v", runs, events)
+	}
+}
+
+func TestInspectMonitorDoesNotFallBackWhenConfiguredProxyIsMissing(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	missingProxyID := int64(999)
+	capture := &proxyCaptureChecker{seen: make(chan *model.ProxyProfile, 1)}
+	scheduler := New(db, checker.NewRegistry(capture), notifier.NewRegistry(), Options{})
+	_, err = scheduler.InspectMonitor(ctx, model.Monitor{
+		ID: 1, Name: "Missing proxy", Type: capture.Type(), ProxyID: &missingProxyID,
+		// An attached profile must not bypass persisted ProxyID resolution.
+		Proxy: &model.ProxyProfile{ID: missingProxyID, Type: model.ProxyTypeHTTP, Host: "127.0.0.1", Port: 8080},
+	})
+	if !errors.Is(err, store.ErrProxyUnavailable) {
+		t.Fatalf("inspection error = %v, want ErrProxyUnavailable", err)
+	}
+	select {
+	case seen := <-capture.seen:
+		t.Fatalf("inspector ran with missing proxy: %#v", seen)
+	default:
+	}
+}
+
+func timePtrEqual(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Equal(*right)
 }
 
 func (traceChecker) Check(context.Context, model.Monitor) (model.CheckResult, error) {

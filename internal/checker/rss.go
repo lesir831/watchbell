@@ -38,6 +38,13 @@ type rssState struct {
 	Seen         map[string]string `json:"seen,omitempty"`
 }
 
+type rssFetchResult struct {
+	Feed         *gofeed.Feed
+	ETag         string
+	LastModified string
+	NotModified  bool
+}
+
 func NewRSSChecker() *RSSChecker {
 	return &RSSChecker{client: &http.Client{}}
 }
@@ -67,84 +74,35 @@ func (c *RSSChecker) Plugin() model.MonitorPlugin {
 }
 
 func (c *RSSChecker) Check(ctx context.Context, monitor model.Monitor) (model.CheckResult, error) {
-	cfg, err := DecodeConfig(monitor, RSSConfig{
-		UserAgent:      "WatchBell/0.1",
-		TimeoutSeconds: 15,
-		MaxSeenItems:   1000,
-	})
+	cfg, err := decodeRSSConfig(monitor)
 	if err != nil {
 		return model.CheckResult{}, err
-	}
-	if strings.TrimSpace(cfg.URL) == "" {
-		return model.CheckResult{}, fmt.Errorf("rss url is required")
-	}
-	if cfg.TimeoutSeconds <= 0 {
-		cfg.TimeoutSeconds = 15
-	}
-	if cfg.MaxSeenItems <= 0 {
-		cfg.MaxSeenItems = 1000
 	}
 
 	state := DecodeState(monitor, rssState{Seen: map[string]string{}})
 	if state.Seen == nil {
 		state.Seen = map[string]string{}
 	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, cfg.URL, nil)
-	if err != nil {
-		return model.CheckResult{}, err
-	}
-	req.Header.Set("User-Agent", cfg.UserAgent)
+	etag, lastModified := "", ""
 	if !cfg.DisableHTTPHeader {
-		if state.ETag != "" {
-			req.Header.Set("If-None-Match", state.ETag)
-		}
-		if state.LastModified != "" {
-			req.Header.Set("If-Modified-Since", state.LastModified)
-		}
+		etag, lastModified = state.ETag, state.LastModified
 	}
-
-	client, err := clientForMonitor(c.client, monitor)
+	fetched, err := c.fetch(ctx, monitor, cfg, etag, lastModified)
 	if err != nil {
 		return model.CheckResult{}, err
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return model.CheckResult{}, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotModified {
+	if fetched.NotModified {
 		return model.CheckResult{
 			Status:  "ok",
 			Message: "not modified",
 			State:   stateToMap(state),
 		}, nil
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return model.CheckResult{}, fmt.Errorf("rss fetch failed: http %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxFeedBytes+1))
-	if err != nil {
-		return model.CheckResult{}, err
-	}
-	if len(body) > maxFeedBytes {
-		return model.CheckResult{}, fmt.Errorf("rss body exceeds %d bytes", maxFeedBytes)
-	}
-
-	parser := gofeed.NewParser()
-	feed, err := parser.ParseString(string(body))
-	if err != nil {
-		return model.CheckResult{}, err
-	}
 
 	now := time.Now().UTC()
 	events := make([]model.EventData, 0)
-	currentKeys := make([]string, 0, len(feed.Items))
-	for _, item := range feed.Items {
+	currentKeys := make([]string, 0, len(fetched.Feed.Items))
+	for _, item := range fetched.Feed.Items {
 		key := rssItemKey(item)
 		if key == "" {
 			continue
@@ -152,29 +110,14 @@ func (c *RSSChecker) Check(ctx context.Context, monitor model.Monitor) (model.Ch
 		currentKeys = append(currentKeys, key)
 		_, seen := state.Seen[key]
 		if !seen && (state.Initialized || cfg.NotifyExisting) {
-			events = append(events, model.EventData{
-				Type:        "rss.item",
-				Fingerprint: key,
-				Payload: map[string]any{
-					"rss": map[string]any{
-						"title":       item.Title,
-						"link":        item.Link,
-						"author":      authorName(item),
-						"summary":     item.Description,
-						"content":     contentForItem(item, cfg.IncludeFullText),
-						"publishedAt": publishedAt(item),
-						"sourceTitle": feed.Title,
-						"sourceLink":  feed.Link,
-					},
-				},
-			})
+			events = append(events, rssItemEvent(fetched.Feed, item, cfg.IncludeFullText))
 		}
 		state.Seen[key] = now.Format(time.RFC3339Nano)
 	}
 
 	state.Initialized = true
-	state.ETag = resp.Header.Get("ETag")
-	state.LastModified = resp.Header.Get("Last-Modified")
+	state.ETag = fetched.ETag
+	state.LastModified = fetched.LastModified
 	trimRSSSeen(&state, currentKeys, cfg.MaxSeenItems)
 
 	return model.CheckResult{
@@ -183,6 +126,126 @@ func (c *RSSChecker) Check(ctx context.Context, monitor model.Monitor) (model.Ch
 		State:   stateToMap(state),
 		Events:  events,
 	}, nil
+}
+
+// Inspect always downloads and parses the feed instead of using the monitor's
+// conditional-request state. The first valid item is the feed's current item;
+// no returned state is applied to the monitor.
+func (c *RSSChecker) Inspect(ctx context.Context, monitor model.Monitor) (model.Observation, error) {
+	cfg, err := decodeRSSConfig(monitor)
+	if err != nil {
+		return model.Observation{}, err
+	}
+	fetched, err := c.fetch(ctx, monitor, cfg, "", "")
+	if err != nil {
+		return model.Observation{}, err
+	}
+	if fetched.NotModified {
+		return model.Observation{}, fmt.Errorf("rss source returned 304 without a conditional request")
+	}
+	for _, item := range fetched.Feed.Items {
+		if rssItemKey(item) == "" {
+			continue
+		}
+		event := rssItemEvent(fetched.Feed, item, cfg.IncludeFullText)
+		return model.Observation{
+			Type: event.Type, Fingerprint: event.Fingerprint, Message: "latest feed item",
+			Available: true, Payload: event.Payload,
+		}, nil
+	}
+	return model.Observation{
+		Type: "rss.item", Message: "feed contains no items", Available: false,
+		Payload: map[string]any{"rss": map[string]any{
+			"sourceTitle": fetched.Feed.Title,
+			"sourceLink":  fetched.Feed.Link,
+		}},
+	}, nil
+}
+
+func decodeRSSConfig(monitor model.Monitor) (RSSConfig, error) {
+	cfg, err := DecodeConfig(monitor, RSSConfig{
+		UserAgent:      "WatchBell/0.1",
+		TimeoutSeconds: 15,
+		MaxSeenItems:   1000,
+	})
+	if err != nil {
+		return RSSConfig{}, err
+	}
+	if strings.TrimSpace(cfg.URL) == "" {
+		return RSSConfig{}, fmt.Errorf("rss url is required")
+	}
+	if cfg.TimeoutSeconds <= 0 {
+		cfg.TimeoutSeconds = 15
+	}
+	if cfg.MaxSeenItems <= 0 {
+		cfg.MaxSeenItems = 1000
+	}
+	return cfg, nil
+}
+
+func (c *RSSChecker) fetch(ctx context.Context, monitor model.Monitor, cfg RSSConfig, etag, lastModified string) (rssFetchResult, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, cfg.URL, nil)
+	if err != nil {
+		return rssFetchResult{}, err
+	}
+	req.Header.Set("User-Agent", cfg.UserAgent)
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+	if lastModified != "" {
+		req.Header.Set("If-Modified-Since", lastModified)
+	}
+
+	client, err := clientForMonitor(c.client, monitor)
+	if err != nil {
+		return rssFetchResult{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return rssFetchResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotModified {
+		return rssFetchResult{NotModified: true}, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return rssFetchResult{}, fmt.Errorf("rss fetch failed: http %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxFeedBytes+1))
+	if err != nil {
+		return rssFetchResult{}, err
+	}
+	if len(body) > maxFeedBytes {
+		return rssFetchResult{}, fmt.Errorf("rss body exceeds %d bytes", maxFeedBytes)
+	}
+	feed, err := gofeed.NewParser().ParseString(string(body))
+	if err != nil {
+		return rssFetchResult{}, err
+	}
+	return rssFetchResult{
+		Feed: feed, ETag: resp.Header.Get("ETag"), LastModified: resp.Header.Get("Last-Modified"),
+	}, nil
+}
+
+func rssItemEvent(feed *gofeed.Feed, item *gofeed.Item, includeFullText bool) model.EventData {
+	return model.EventData{
+		Type: "rss.item", Fingerprint: rssItemKey(item),
+		Payload: map[string]any{
+			"rss": map[string]any{
+				"title":       item.Title,
+				"link":        item.Link,
+				"author":      authorName(item),
+				"summary":     item.Description,
+				"content":     contentForItem(item, includeFullText),
+				"publishedAt": publishedAt(item),
+				"sourceTitle": feed.Title,
+				"sourceLink":  feed.Link,
+			},
+		},
+	}
 }
 
 func rssItemKey(item *gofeed.Item) string {

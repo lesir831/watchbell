@@ -14,6 +14,13 @@ type Checker interface {
 	Check(ctx context.Context, monitor model.Monitor) (model.CheckResult, error)
 }
 
+// Inspector retrieves the current source values without advancing monitor
+// state or applying event-generation and deduplication rules. It is optional so
+// third-party and test checkers that only support scheduled checks keep working.
+type Inspector interface {
+	Inspect(ctx context.Context, monitor model.Monitor) (model.Observation, error)
+}
+
 type DescribedChecker interface {
 	Checker
 	Plugin() model.MonitorPlugin

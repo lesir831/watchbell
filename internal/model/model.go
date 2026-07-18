@@ -185,6 +185,18 @@ type EventData struct {
 	Payload     map[string]any `json:"payload"`
 }
 
+// Observation is a live, read-only view of a monitor's source. Unlike an
+// EventData value it has not been persisted, deduplicated, or dispatched.
+// Available reports whether the source currently exposes the concrete object
+// represented by Type (for example an RSS item or a GitHub release).
+type Observation struct {
+	Type        string         `json:"type"`
+	Fingerprint string         `json:"fingerprint,omitempty"`
+	Message     string         `json:"message,omitempty"`
+	Available   bool           `json:"available"`
+	Payload     map[string]any `json:"payload"`
+}
+
 type CheckResult struct {
 	Status  string         `json:"status"`
 	Message string         `json:"message"`

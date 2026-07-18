@@ -31,6 +31,11 @@ type testFlightState struct {
 	LastStatus  string `json:"lastStatus,omitempty"`
 }
 
+type testFlightSnapshot struct {
+	Status  string
+	Message string
+}
+
 func NewTestFlightChecker() *TestFlightChecker {
 	return &TestFlightChecker{client: &http.Client{}}
 }
@@ -57,6 +62,53 @@ func (c *TestFlightChecker) Plugin() model.MonitorPlugin {
 }
 
 func (c *TestFlightChecker) Check(ctx context.Context, monitor model.Monitor) (model.CheckResult, error) {
+	cfg, err := decodeTestFlightConfig(monitor)
+	if err != nil {
+		return model.CheckResult{}, err
+	}
+	state := DecodeState(monitor, testFlightState{})
+	snapshot, err := c.fetch(ctx, monitor, cfg)
+	if err != nil {
+		return model.CheckResult{}, err
+	}
+
+	events := []model.EventData{}
+	if snapshot.Status == "available" && state.LastStatus != "available" {
+		events = append(events, model.EventData{
+			Type:        "testflight.available",
+			Fingerprint: fmt.Sprintf("testflight:available:%d", time.Now().UTC().Unix()),
+			Payload:     testFlightPayload(cfg.URL, snapshot),
+		})
+	}
+
+	state.Initialized = true
+	state.LastStatus = snapshot.Status
+	return model.CheckResult{
+		Status:  snapshot.Status,
+		Message: snapshot.Message,
+		State:   stateToMap(state),
+		Events:  events,
+	}, nil
+}
+
+// Inspect returns the currently classified page even when it is full or
+// unknown, states for which the regular checker deliberately creates no event.
+func (c *TestFlightChecker) Inspect(ctx context.Context, monitor model.Monitor) (model.Observation, error) {
+	cfg, err := decodeTestFlightConfig(monitor)
+	if err != nil {
+		return model.Observation{}, err
+	}
+	snapshot, err := c.fetch(ctx, monitor, cfg)
+	if err != nil {
+		return model.Observation{}, err
+	}
+	return model.Observation{
+		Type: "testflight.status", Fingerprint: "testflight:status:" + snapshot.Status,
+		Message: snapshot.Message, Available: true, Payload: testFlightPayload(cfg.URL, snapshot),
+	}, nil
+}
+
+func decodeTestFlightConfig(monitor model.Monitor) (TestFlightConfig, error) {
 	cfg, err := DecodeConfig(monitor, TestFlightConfig{
 		UserAgent:      "WatchBell/0.1",
 		TimeoutSeconds: 15,
@@ -75,10 +127,10 @@ func (c *TestFlightChecker) Check(ctx context.Context, monitor model.Monitor) (m
 		},
 	})
 	if err != nil {
-		return model.CheckResult{}, err
+		return TestFlightConfig{}, err
 	}
 	if strings.TrimSpace(cfg.URL) == "" {
-		return model.CheckResult{}, fmt.Errorf("testflight url is required")
+		return TestFlightConfig{}, fmt.Errorf("testflight url is required")
 	}
 	if cfg.TimeoutSeconds <= 0 {
 		cfg.TimeoutSeconds = 15
@@ -100,70 +152,55 @@ func (c *TestFlightChecker) Check(ctx context.Context, monitor model.Monitor) (m
 			"not accepting any new testers",
 		}
 	}
-	state := DecodeState(monitor, testFlightState{})
+	return cfg, nil
+}
 
+func (c *TestFlightChecker) fetch(ctx context.Context, monitor model.Monitor, cfg TestFlightConfig) (testFlightSnapshot, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, cfg.URL, nil)
 	if err != nil {
-		return model.CheckResult{}, err
+		return testFlightSnapshot{}, err
 	}
 	req.Header.Set("User-Agent", cfg.UserAgent)
 	client, err := clientForMonitor(c.client, monitor)
 	if err != nil {
-		return model.CheckResult{}, err
+		return testFlightSnapshot{}, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return model.CheckResult{}, err
+		return testFlightSnapshot{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return model.CheckResult{}, fmt.Errorf("testflight fetch failed: http %d", resp.StatusCode)
+		return testFlightSnapshot{}, fmt.Errorf("testflight fetch failed: http %d", resp.StatusCode)
 	}
-
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTestFlightBytes+1))
 	if err != nil {
-		return model.CheckResult{}, err
+		return testFlightSnapshot{}, err
 	}
 	if len(body) > maxTestFlightBytes {
-		return model.CheckResult{}, fmt.Errorf("testflight body exceeds %d bytes", maxTestFlightBytes)
+		return testFlightSnapshot{}, fmt.Errorf("testflight body exceeds %d bytes", maxTestFlightBytes)
 	}
 
 	text := strings.ToLower(string(body))
-	status := "unknown"
-	message := "unable to classify page"
+	snapshot := testFlightSnapshot{Status: "unknown", Message: "unable to classify page"}
 	if containsAny(text, cfg.FullPatterns) {
-		status = "full"
-		message = "testflight beta is full"
+		snapshot.Status = "full"
+		snapshot.Message = "testflight beta is full"
 	} else if containsAny(text, cfg.AvailablePatterns) {
-		status = "available"
-		message = "testflight beta has available slots"
+		snapshot.Status = "available"
+		snapshot.Message = "testflight beta has available slots"
 	}
+	return snapshot, nil
+}
 
-	events := []model.EventData{}
-	if status == "available" && state.LastStatus != "available" {
-		events = append(events, model.EventData{
-			Type:        "testflight.available",
-			Fingerprint: fmt.Sprintf("testflight:available:%d", time.Now().UTC().Unix()),
-			Payload: map[string]any{
-				"testflight": map[string]any{
-					"url":     cfg.URL,
-					"status":  status,
-					"message": message,
-				},
-			},
-		})
+func testFlightPayload(url string, snapshot testFlightSnapshot) map[string]any {
+	return map[string]any{
+		"testflight": map[string]any{
+			"url": url, "status": snapshot.Status, "message": snapshot.Message,
+		},
 	}
-
-	state.Initialized = true
-	state.LastStatus = status
-	return model.CheckResult{
-		Status:  status,
-		Message: message,
-		State:   stateToMap(state),
-		Events:  events,
-	}, nil
 }
 
 func containsAny(text string, patterns []string) bool {

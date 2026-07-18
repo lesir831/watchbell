@@ -35,6 +35,11 @@ type webpageState struct {
 	LastHash    string `json:"lastHash,omitempty"`
 }
 
+type webpageSnapshot struct {
+	Text string
+	Hash string
+}
+
 func NewWebpageChecker() *WebpageChecker {
 	return &WebpageChecker{client: &http.Client{}}
 }
@@ -64,85 +69,127 @@ func (c *WebpageChecker) Plugin() model.MonitorPlugin {
 }
 
 func (c *WebpageChecker) Check(ctx context.Context, monitor model.Monitor) (model.CheckResult, error) {
-	cfg, err := DecodeConfig(monitor, WebpageConfig{
-		UserAgent:      "WatchBell/0.1",
-		TimeoutSeconds: 15,
-	})
+	cfg, err := decodeWebpageConfig(monitor)
 	if err != nil {
 		return model.CheckResult{}, err
-	}
-	if strings.TrimSpace(cfg.URL) == "" {
-		return model.CheckResult{}, fmt.Errorf("webpage url is required")
-	}
-	if cfg.TimeoutSeconds <= 0 {
-		cfg.TimeoutSeconds = 15
 	}
 	state := DecodeState(monitor, webpageState{})
-
-	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, cfg.URL, nil)
+	snapshot, err := c.fetch(ctx, monitor, cfg)
 	if err != nil {
 		return model.CheckResult{}, err
 	}
-	req.Header.Set("User-Agent", cfg.UserAgent)
-	client, err := clientForMonitor(c.client, monitor)
-	if err != nil {
-		return model.CheckResult{}, err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return model.CheckResult{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return model.CheckResult{}, fmt.Errorf("webpage fetch failed: http %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxWebpageBytes+1))
-	if err != nil {
-		return model.CheckResult{}, err
-	}
-	if len(body) > maxWebpageBytes {
-		return model.CheckResult{}, fmt.Errorf("webpage body exceeds %d bytes", maxWebpageBytes)
-	}
-
-	text := string(body)
-	if strings.TrimSpace(cfg.Selector) != "" {
-		selected, err := selectText(text, cfg.Selector)
-		if err != nil {
-			return model.CheckResult{}, err
-		}
-		text = selected
-	}
-	text = normalizeWebpageText(text, cfg.IgnorePatterns)
-	sum := sha256.Sum256([]byte(text))
-	hash := hex.EncodeToString(sum[:])
 
 	events := []model.EventData{}
-	if state.Initialized && state.LastHash != "" && state.LastHash != hash {
+	if state.Initialized && state.LastHash != "" && state.LastHash != snapshot.Hash {
 		events = append(events, model.EventData{
 			Type:        "webpage.changed",
-			Fingerprint: fmt.Sprintf("webpage:changed:%d:%s", time.Now().UTC().Unix(), hash[:12]),
-			Payload: map[string]any{
-				"webpage": map[string]any{
-					"url":      cfg.URL,
-					"selector": cfg.Selector,
-					"oldHash":  state.LastHash,
-					"newHash":  hash,
-					"summary":  snippet(text, 400),
-				},
-			},
+			Fingerprint: fmt.Sprintf("webpage:changed:%d:%s", time.Now().UTC().Unix(), snapshot.Hash[:12]),
+			Payload:     webpagePayload(cfg, state.LastHash, snapshot, ""),
 		})
 	}
 
 	state.Initialized = true
-	state.LastHash = hash
+	state.LastHash = snapshot.Hash
 	return model.CheckResult{
 		Status:  "ok",
 		Message: "webpage checked",
 		State:   stateToMap(state),
 		Events:  events,
 	}, nil
+}
+
+// Inspect returns the current normalized page and compares it with the stored
+// hash without applying the newly observed hash to monitor state.
+func (c *WebpageChecker) Inspect(ctx context.Context, monitor model.Monitor) (model.Observation, error) {
+	cfg, err := decodeWebpageConfig(monitor)
+	if err != nil {
+		return model.Observation{}, err
+	}
+	state := DecodeState(monitor, webpageState{})
+	snapshot, err := c.fetch(ctx, monitor, cfg)
+	if err != nil {
+		return model.Observation{}, err
+	}
+	status := "initialized"
+	if state.LastHash != "" {
+		status = "unchanged"
+		if state.LastHash != snapshot.Hash {
+			status = "changed"
+		}
+	}
+	return model.Observation{
+		Type: "webpage.snapshot", Fingerprint: "webpage:snapshot:" + snapshot.Hash,
+		Message: "webpage fetched", Available: true,
+		Payload: webpagePayload(cfg, state.LastHash, snapshot, status),
+	}, nil
+}
+
+func decodeWebpageConfig(monitor model.Monitor) (WebpageConfig, error) {
+	cfg, err := DecodeConfig(monitor, WebpageConfig{
+		UserAgent:      "WatchBell/0.1",
+		TimeoutSeconds: 15,
+	})
+	if err != nil {
+		return WebpageConfig{}, err
+	}
+	if strings.TrimSpace(cfg.URL) == "" {
+		return WebpageConfig{}, fmt.Errorf("webpage url is required")
+	}
+	if cfg.TimeoutSeconds <= 0 {
+		cfg.TimeoutSeconds = 15
+	}
+	return cfg, nil
+}
+
+func (c *WebpageChecker) fetch(ctx context.Context, monitor model.Monitor, cfg WebpageConfig) (webpageSnapshot, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, cfg.URL, nil)
+	if err != nil {
+		return webpageSnapshot{}, err
+	}
+	req.Header.Set("User-Agent", cfg.UserAgent)
+	client, err := clientForMonitor(c.client, monitor)
+	if err != nil {
+		return webpageSnapshot{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return webpageSnapshot{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return webpageSnapshot{}, fmt.Errorf("webpage fetch failed: http %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxWebpageBytes+1))
+	if err != nil {
+		return webpageSnapshot{}, err
+	}
+	if len(body) > maxWebpageBytes {
+		return webpageSnapshot{}, fmt.Errorf("webpage body exceeds %d bytes", maxWebpageBytes)
+	}
+
+	text := string(body)
+	if strings.TrimSpace(cfg.Selector) != "" {
+		text, err = selectText(text, cfg.Selector)
+		if err != nil {
+			return webpageSnapshot{}, err
+		}
+	}
+	text = normalizeWebpageText(text, cfg.IgnorePatterns)
+	sum := sha256.Sum256([]byte(text))
+	return webpageSnapshot{Text: text, Hash: hex.EncodeToString(sum[:])}, nil
+}
+
+func webpagePayload(cfg WebpageConfig, oldHash string, snapshot webpageSnapshot, status string) map[string]any {
+	values := map[string]any{
+		"url": cfg.URL, "selector": cfg.Selector, "oldHash": oldHash,
+		"newHash": snapshot.Hash, "summary": snippet(snapshot.Text, 400),
+	}
+	if status != "" {
+		values["status"] = status
+	}
+	return map[string]any{"webpage": values}
 }
 
 func selectText(input string, selector string) (string, error) {

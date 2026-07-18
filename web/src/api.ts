@@ -117,7 +117,7 @@ export const api = {
   updateMonitor: (id: number, body: MonitorInput) => request<Monitor>(`/api/monitors/${id}`, jsonInit('PUT', body)),
   deleteMonitor: (id: number) => request<void>(`/api/monitors/${id}`, jsonInit('DELETE')),
   checkMonitor: (id: number) => request<{ status: string; eventCount: number; checkRun?: CheckRun }>(`/api/monitors/${id}/check`, jsonInit('POST')),
-  monitorVariables: (id: number) => request<VariableSnapshot>(`/api/monitors/${id}/variables`),
+  monitorVariables: (id: number, signal?: AbortSignal) => request<VariableSnapshot>(`/api/monitors/${id}/variables`, { signal }),
 
   listRules: () => request<Rule[]>('/api/rules'),
   createRule: (body: RuleInput) => request<Rule>('/api/rules', jsonInit('POST', body)),

@@ -22,6 +22,9 @@ const maxDeliveryAttempts = 3
 
 var ErrAlreadyRunning = errors.New("monitor is already running")
 var (
+	// ErrInspectionUnsupported is returned when a monitor checker cannot expose
+	// a current, non-persistent observation for variable diagnostics.
+	ErrInspectionUnsupported = errors.New("monitor does not support live variable inspection")
 	// ErrRetryNotFailed is returned when the requested row is not a failed
 	// attempt. API callers can expose it as an unprocessable retry request.
 	ErrRetryNotFailed = errors.New("only failed notification attempts can be retried")
@@ -137,6 +140,30 @@ func (s *Scheduler) RunOnce(ctx context.Context, monitorID int64) error {
 	return s.processMonitor(ctx, monitor, "manual")
 }
 
+// InspectMonitor fetches the monitor source and returns its current
+// observation without creating a check run, mutating monitor state, creating
+// events, evaluating rules, or dispatching notifications. It deliberately does
+// not participate in the scheduler's in-flight lock: diagnostics may run next
+// to a scheduled check, and neither path shares checker state.
+func (s *Scheduler) InspectMonitor(ctx context.Context, monitor model.Monitor) (model.Observation, error) {
+	// Only a proxy resolved from the persisted ProxyID may be used. Never trust
+	// or retain a caller-attached profile on this read-only path.
+	monitor.Proxy = nil
+	checkerImpl, ok := s.checkers[monitor.Type]
+	if !ok {
+		return model.Observation{}, fmt.Errorf("%w: unsupported monitor type %q", ErrInspectionUnsupported, monitor.Type)
+	}
+	inspector, ok := checkerImpl.(checker.Inspector)
+	if !ok {
+		return model.Observation{}, fmt.Errorf("%w: monitor type %q", ErrInspectionUnsupported, monitor.Type)
+	}
+	resolved, err := s.monitorWithProxy(ctx, monitor)
+	if err != nil {
+		return model.Observation{}, err
+	}
+	return inspector.Inspect(ctx, resolved)
+}
+
 func (s *Scheduler) TestChannel(ctx context.Context, channelID int64) (model.NotificationAttempt, error) {
 	channel, err := s.store.GetNotifyChannel(ctx, channelID)
 	if err != nil {
@@ -215,16 +242,9 @@ func (s *Scheduler) processMonitor(ctx context.Context, monitor model.Monitor, t
 	}
 
 	var result model.CheckResult
-	var checkErr error
-	if monitor.ProxyID != nil {
-		proxyProfile, proxyErr := s.store.GetProxyProfile(ctx, *monitor.ProxyID)
-		if proxyErr != nil {
-			checkErr = fmt.Errorf("configured proxy %d is unavailable: %w", *monitor.ProxyID, proxyErr)
-		} else {
-			monitor.Proxy = &proxyProfile
-		}
-	}
+	resolvedMonitor, checkErr := s.monitorWithProxy(ctx, monitor)
 	if checkErr == nil {
+		monitor = resolvedMonitor
 		result, checkErr = checkerImpl.Check(ctx, monitor)
 	}
 	if updateErr := s.store.UpdateMonitorCheckResult(ctx, monitor.ID, result, checkErr); updateErr != nil {
@@ -267,6 +287,21 @@ func (s *Scheduler) processMonitor(ctx context.Context, monitor model.Monitor, t
 		return err
 	}
 	return dispatchErr
+}
+
+func (s *Scheduler) monitorWithProxy(ctx context.Context, monitor model.Monitor) (model.Monitor, error) {
+	if monitor.ProxyID == nil {
+		return monitor, nil
+	}
+	proxyProfile, err := s.store.GetProxyProfile(ctx, *monitor.ProxyID)
+	if err != nil {
+		if store.IsNotFound(err) {
+			return monitor, fmt.Errorf("%w: configured proxy %d", store.ErrProxyUnavailable, *monitor.ProxyID)
+		}
+		return monitor, fmt.Errorf("configured proxy %d is unavailable: %w", *monitor.ProxyID, err)
+	}
+	monitor.Proxy = &proxyProfile
+	return monitor, nil
 }
 
 func (s *Scheduler) handleMonitorHealthTransition(ctx context.Context, previous model.Monitor, result model.CheckResult, checkErr error) error {

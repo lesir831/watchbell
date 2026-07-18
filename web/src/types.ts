@@ -173,6 +173,10 @@ export interface VariableSnapshot {
   monitorId: number;
   monitorName: string;
   monitorType: MonitorType;
+  source: 'live' | 'event';
+  observationType?: string;
+  sampleAvailable: boolean;
+  message?: string;
   eventId?: number;
   eventType?: string;
   eventCreatedAt?: string;

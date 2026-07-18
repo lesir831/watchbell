@@ -40,10 +40,10 @@ var systemDefinitions = []Definition{
 	{Key: "rule.id", Label: "规则 ID", Description: "发送通知时命中的规则 ID；查看事件快照时不可用。", ValueType: "number"},
 	{Key: "rule.name", Label: "规则名称", Description: "发送通知时命中的规则名称；查看事件快照时不可用。", ValueType: "string"},
 	{Key: "rule.matched", Label: "命中值", Description: "规则判断中命中的条件值列表。", ValueType: "array"},
-	{Key: "event.id", Label: "事件 ID", Description: "WatchBell 内部事件 ID。", ValueType: "number"},
-	{Key: "event.type", Label: "事件类型", Description: "事件类型，例如 rss.item。", ValueType: "string"},
-	{Key: "event.fingerprint", Label: "事件指纹", Description: "用于事件去重的稳定标识。", ValueType: "string"},
-	{Key: "event.time", Label: "事件时间", Description: "WatchBell 创建事件的 RFC3339 时间。", ValueType: "datetime"},
+	{Key: "event.id", Label: "事件 ID", Description: "WatchBell 内部持久化事件 ID；实时变量检查不会创建事件，因此不可用。", ValueType: "number"},
+	{Key: "event.type", Label: "事件类型", Description: "事件或当前观测对应的类型，例如 rss.item。", ValueType: "string"},
+	{Key: "event.fingerprint", Label: "事件指纹", Description: "持久化事件中用于去重；实时检查显示当前观测的只读标识，不代表已经创建事件。", ValueType: "string"},
+	{Key: "event.time", Label: "事件时间", Description: "WatchBell 创建持久化事件的 RFC3339 时间；实时变量检查中不可用。", ValueType: "datetime"},
 	{Key: "message.subject", Label: "通知标题", Description: "渲染完成后的通知标题，仅用于 Webhook 等渠道动态配置。", ValueType: "string"},
 	{Key: "message.body", Label: "通知正文", Description: "渲染完成后的通知正文，仅用于 Webhook 等渠道动态配置。", ValueType: "string"},
 }
@@ -73,7 +73,7 @@ var moduleDefinitions = map[string][]Definition{
 	},
 	model.MonitorTypeTestFlight: {
 		{Key: "testflight.url", Label: "邀请地址", Description: "公开 TestFlight 邀请页面地址。", ValueType: "url"},
-		{Key: "testflight.status", Label: "名额状态", Description: "识别到的状态，事件产生时通常为 available。", ValueType: "string"},
+		{Key: "testflight.status", Label: "名额状态", Description: "识别到的当前状态，例如 available、full 或 unknown。", ValueType: "string"},
 		{Key: "testflight.message", Label: "状态说明", Description: "对当前 TestFlight 状态的文字说明。", ValueType: "string"},
 	},
 	model.MonitorTypeWebpage: {
@@ -216,6 +216,26 @@ func EventData(monitor model.Monitor, event model.Event, payload map[string]any)
 	return data
 }
 
+// ObservationData builds the event-like context used by live variable
+// diagnostics. An observation is deliberately not assigned an event ID or
+// event time because inspecting a source does not persist an event.
+func ObservationData(monitor model.Monitor, observation model.Observation) map[string]any {
+	data := map[string]any{}
+	for key, value := range EnrichPayload(monitor, observation.Payload) {
+		data[key] = value
+	}
+	if !observation.Available {
+		// Source-level context remains useful when a feed/repository is empty,
+		// but no concrete item exists from which to derive an event status.
+		data["status"] = ""
+	}
+	data["monitor"] = map[string]any{"id": monitor.ID, "name": monitor.Name, "type": monitor.Type}
+	data["event"] = map[string]any{
+		"type": observation.Type, "fingerprint": observation.Fingerprint,
+	}
+	return data
+}
+
 func Flatten(data map[string]any) map[string]any {
 	result := map[string]any{}
 	var visit func(string, any)
@@ -269,7 +289,7 @@ func normalizedValues(monitor model.Monitor, payload map[string]any) map[string]
 		values["title"] = monitor.Name
 		values["summary"] = stringAt(payload, "webpage.summary")
 		values["content"] = stringAt(payload, "webpage.summary")
-		values["status"] = "changed"
+		values["status"] = firstNonEmpty(stringAt(payload, "webpage.status"), "changed")
 	case model.MonitorTypeGitHubRelease:
 		repository := firstNonEmpty(stringAt(payload, "github.repository"), monitorConfigString(monitor, "repository"))
 		values["url"] = firstNonEmpty(stringAt(payload, "github.release.url"), githubRepositoryURL(repository))

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -12,19 +13,24 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/watchbell/watchbell/internal/eventvars"
 	"github.com/watchbell/watchbell/internal/model"
+	"github.com/watchbell/watchbell/internal/scheduler"
 	"github.com/watchbell/watchbell/internal/store"
 )
 
 type variableSnapshotResponse struct {
-	MonitorID      int64             `json:"monitorId"`
-	MonitorName    string            `json:"monitorName"`
-	MonitorType    string            `json:"monitorType"`
-	EventID        *int64            `json:"eventId,omitempty"`
-	EventType      string            `json:"eventType,omitempty"`
-	EventCreatedAt *time.Time        `json:"eventCreatedAt,omitempty"`
-	GeneratedAt    time.Time         `json:"generatedAt"`
-	Values         map[string]any    `json:"values"`
-	ValueLinks     map[string]string `json:"valueLinks"`
+	MonitorID       int64             `json:"monitorId"`
+	MonitorName     string            `json:"monitorName"`
+	MonitorType     string            `json:"monitorType"`
+	EventID         *int64            `json:"eventId,omitempty"`
+	EventType       string            `json:"eventType,omitempty"`
+	EventCreatedAt  *time.Time        `json:"eventCreatedAt,omitempty"`
+	Source          string            `json:"source"`
+	ObservationType string            `json:"observationType,omitempty"`
+	SampleAvailable bool              `json:"sampleAvailable"`
+	Message         string            `json:"message,omitempty"`
+	GeneratedAt     time.Time         `json:"generatedAt"`
+	Values          map[string]any    `json:"values"`
+	ValueLinks      map[string]string `json:"valueLinks"`
 }
 
 func (s *Server) variableCatalog(w http.ResponseWriter, r *http.Request) {
@@ -33,6 +39,7 @@ func (s *Server) variableCatalog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) latestMonitorVariables(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	monitorID, ok := pathID(w, r)
 	if !ok {
 		return
@@ -42,24 +49,27 @@ func (s *Server) latestMonitorVariables(w http.ResponseWriter, r *http.Request) 
 		writeError(w, r, err)
 		return
 	}
-	page, err := s.store.ListEventsPage(r.Context(), store.EventFilter{
-		PageRequest: store.PageRequest{Page: 1, PageSize: 1}, MonitorID: monitor.ID,
-	})
-	if err != nil {
-		writeError(w, r, err)
+	key := strings.TrimSpace(chi.URLParam(r, "key"))
+	if key != "" && !snapshotVariableKey(monitor.Type, key) {
+		writeError(w, r, validationProblem("实时检查不提供这个变量。", map[string]string{"key": "这个变量不适用于所选监控的实时检查。"}))
 		return
 	}
-	var event *model.Event
-	if len(page.Items) > 0 {
-		event = &page.Items[0]
-		historicalMonitor, contextErr := s.eventVariableMonitor(r.Context(), monitor, *event)
-		if contextErr != nil {
-			writeError(w, r, contextErr)
-			return
+	observation, err := s.scheduler.InspectMonitor(r.Context(), monitor)
+	if err != nil {
+		if errors.Is(err, store.ErrProxyUnavailable) {
+			writeError(w, r, err)
+		} else {
+			status := http.StatusBadGateway
+			code := "monitor_inspection_failed"
+			if errors.Is(err, scheduler.ErrInspectionUnsupported) {
+				status = http.StatusUnprocessableEntity
+				code = "monitor_inspection_unsupported"
+			}
+			writeError(w, r, &problemError{Status: status, Code: code, Message: err.Error()})
 		}
-		monitor = historicalMonitor
+		return
 	}
-	s.writeVariableSnapshot(w, r, monitor, event, chi.URLParam(r, "key"), fmt.Sprintf("/api/monitors/%d/variables", monitor.ID))
+	s.writeLiveVariableSnapshot(w, r, monitor, observation, key, fmt.Sprintf("/api/monitors/%d/variables", monitor.ID))
 }
 
 func (s *Server) eventVariables(w http.ResponseWriter, r *http.Request) {
@@ -155,6 +165,7 @@ func (s *Server) writeVariableSnapshot(w http.ResponseWriter, r *http.Request, m
 	}
 	response := variableSnapshotResponse{
 		MonitorID: monitor.ID, MonitorName: monitor.Name, MonitorType: monitor.Type,
+		Source: "event", SampleAvailable: event != nil,
 		GeneratedAt: time.Now().UTC(), Values: values, ValueLinks: variableValueLinks(basePath, monitor.Type),
 	}
 	if event != nil {
@@ -176,12 +187,34 @@ func (s *Server) writeVariableSnapshot(w http.ResponseWriter, r *http.Request, m
 		}
 	}
 
+	s.writeVariableSnapshotResponse(w, r, response, key, "最近事件没有这个变量的实时取值。")
+}
+
+func (s *Server) writeLiveVariableSnapshot(w http.ResponseWriter, r *http.Request, monitor model.Monitor, observation model.Observation, key, basePath string) {
+	w.Header().Set("Cache-Control", "no-store")
+	flattened := eventvars.Flatten(eventvars.ObservationData(monitor, observation))
+	values := map[string]any{}
+	for _, variableKey := range eventvars.SnapshotKeys(monitor.Type) {
+		if value, exists := flattened[variableKey]; exists {
+			values[variableKey] = value
+		}
+	}
+	response := variableSnapshotResponse{
+		MonitorID: monitor.ID, MonitorName: monitor.Name, MonitorType: monitor.Type,
+		Source: "live", ObservationType: observation.Type, SampleAvailable: observation.Available,
+		Message: observation.Message, GeneratedAt: time.Now().UTC(), Values: values,
+		ValueLinks: variableValueLinks(basePath, monitor.Type),
+	}
+	s.writeVariableSnapshotResponse(w, r, response, key, "本次实时抓取没有这个变量的取值。")
+}
+
+func (s *Server) writeVariableSnapshotResponse(w http.ResponseWriter, r *http.Request, response variableSnapshotResponse, key, unavailableMessage string) {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		writeJSON(w, http.StatusOK, response)
 		return
 	}
-	if !eventvars.DocumentedKey(monitor.Type, key) {
+	if !eventvars.DocumentedKey(response.MonitorType, key) {
 		writeError(w, r, validationProblem("变量不存在。", map[string]string{"key": "这个变量不适用于所选监控。"}))
 		return
 	}
@@ -189,13 +222,14 @@ func (s *Server) writeVariableSnapshot(w http.ResponseWriter, r *http.Request, m
 	if !exists {
 		writeError(w, r, &problemError{
 			Status: http.StatusNotFound, Code: "variable_value_unavailable",
-			Message: "最近事件没有这个变量的实时取值。", Fields: map[string]string{"key": key},
+			Message: unavailableMessage, Fields: map[string]string{"key": key},
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"monitorId": monitor.ID, "eventId": response.EventID, "key": key,
-		"value": value, "generatedAt": response.GeneratedAt,
+		"monitorId": response.MonitorID, "eventId": response.EventID, "source": response.Source,
+		"observationType": response.ObservationType, "key": key, "value": value,
+		"generatedAt": response.GeneratedAt,
 	})
 }
 
@@ -205,4 +239,13 @@ func variableValueLinks(basePath, monitorType string) map[string]string {
 		result[key] = basePath + "/" + url.PathEscape(key)
 	}
 	return result
+}
+
+func snapshotVariableKey(monitorType, key string) bool {
+	for _, candidate := range eventvars.SnapshotKeys(monitorType) {
+		if candidate == key {
+			return true
+		}
+	}
+	return false
 }

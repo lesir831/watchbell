@@ -501,7 +501,7 @@ ${github.release.assetCount}
 ${github.release.assets}
 ```
 
-网页的“帮助”菜单会显示每个变量的含义、类型和适用位置。选择一个监控后，还可以查看最近事件的实际取值以及每个值的独立 JSON 链接：
+网页的“帮助”菜单会显示每个变量的含义、类型和适用位置。选择一个监控后，WatchBell 会立即按当前配置（包括指定代理）读取一次源站，并用当前观测渲染变量；RSS 使用订阅源中的最新条目。这个诊断检查不会创建检查记录或事件，不会修改监控与去重状态，不会执行规则或发送通知。每个值还提供会重新实时抓取的独立 JSON 链接：
 
 ```text
 GET /api/monitors/{id}/variables
@@ -509,6 +509,8 @@ GET /api/monitors/{id}/variables/{key}
 GET /api/events/{id}/variables
 GET /api/events/{id}/variables/{key}
 ```
+
+`/api/monitors/{id}/variables...` 返回当前源站观测；`/api/events/{id}/variables...` 始终返回对应持久化事件的历史快照。
 
 ## CI/CD 与镜像发布
 
