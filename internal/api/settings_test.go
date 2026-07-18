@@ -164,6 +164,21 @@ func TestPasswordChangePersistsAndInvalidatesPreviousSession(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("refreshed session status=%d", response.StatusCode)
 	}
+	if len(response.Cookies()) != 0 {
+		t.Fatalf("ordinary authenticated request refreshed idle session: %#v", response.Cookies())
+	}
+	request, _ = http.NewRequest(http.MethodPost, server.URL+"/api/auth/touch", nil)
+	request.Header.Set("Content-Type", "application/json")
+	request.AddCookie(newCookie)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || len(response.Cookies()) != 1 {
+		t.Fatalf("session touch status=%d cookies=%#v", response.StatusCode, response.Cookies())
+	}
 
 	persisted, exists, err := db.GetAuthPasswordHash(ctx)
 	if err != nil || !exists || !auth.VerifyPassword(persisted, "new-password-123") || auth.VerifyPassword(persisted, "correct-password") {
@@ -223,6 +238,56 @@ func TestPasswordChangeCurrentCredentialIsRateLimited(t *testing.T) {
 		if response.StatusCode != want {
 			t.Fatalf("attempt %d status = %d, want %d", attempt, response.StatusCode, want)
 		}
+	}
+}
+
+func TestRuntimeSettingsAndNetworkCheckEndpoints(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	defaults := store.RuntimeSettings{
+		SessionTTL:       8 * time.Hour,
+		HistoryRetention: store.UniformHistoryRetention(90*24*time.Hour, 500),
+	}
+	sched := scheduler.New(db, checker.NewRegistry(), notifier.NewRegistry(), scheduler.Options{})
+	apiServer := NewServer(db, sched, "", slog.New(slog.NewTextHandler(io.Discard, nil)), nil, WithRuntimeDefaults(defaults))
+	apiServer.networkCheck = func(context.Context) NetworkCheckReport {
+		return NetworkCheckReport{Status: "ok", GeneratedAt: time.Now().UTC(), Checks: []NetworkCheckItem{{Name: "DNS", Status: "ok", DurationMS: 2, Detail: "resolved"}}}
+	}
+	handler := apiServer.Routes()
+
+	update := httptest.NewRequest(http.MethodPut, "http://watchbell.test/api/settings/runtime", bytes.NewBufferString(`{"sessionTimeoutHours":24,"historyRetentionDays":30}`))
+	update.Header.Set("Content-Type", "application/json")
+	updateResponse := httptest.NewRecorder()
+	handler.ServeHTTP(updateResponse, update)
+	if updateResponse.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", updateResponse.Code, updateResponse.Body.String())
+	}
+	settings, err := db.GetRuntimeSettings(ctx, defaults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.SessionTTL != 24*time.Hour || settings.HistoryRetention.EventAge != 30*24*time.Hour || settings.HistoryRetention.AuditLogAge != 30*24*time.Hour {
+		t.Fatalf("persisted runtime settings = %#v", settings)
+	}
+
+	invalid := httptest.NewRequest(http.MethodPut, "http://watchbell.test/api/settings/runtime", bytes.NewBufferString(`{"sessionTimeoutHours":2,"historyRetentionDays":7}`))
+	invalid.Header.Set("Content-Type", "application/json")
+	invalidResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidResponse, invalid)
+	if invalidResponse.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid settings status=%d body=%s", invalidResponse.Code, invalidResponse.Body.String())
+	}
+
+	networkRequest := httptest.NewRequest(http.MethodPost, "http://watchbell.test/api/settings/network-check", bytes.NewReader(nil))
+	networkRequest.Header.Set("Content-Type", "application/json")
+	networkResponse := httptest.NewRecorder()
+	handler.ServeHTTP(networkResponse, networkRequest)
+	if networkResponse.Code != http.StatusOK || !strings.Contains(networkResponse.Body.String(), `"name":"DNS"`) {
+		t.Fatalf("network check status=%d body=%s", networkResponse.Code, networkResponse.Body.String())
 	}
 }
 

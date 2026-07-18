@@ -2,8 +2,6 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   Button,
-  Card,
-  Descriptions,
   Empty,
   Select,
   Skeleton,
@@ -13,10 +11,10 @@ import {
   Tag,
   Typography
 } from 'antd';
-import { ApiOutlined, ReloadOutlined } from '@ant-design/icons';
+import { ApiOutlined, ArrowRightOutlined, CodeOutlined, CopyOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api';
-import { formatDate, PageError } from '../components/Common';
+import { formatDate, PageError, PageHeader } from '../components/Common';
 import type { VariableDefinition, VariableSnapshot, VariableUsage } from '../types';
 
 const { Paragraph, Text, Title } = Typography;
@@ -80,18 +78,48 @@ export default function HelpPage() {
   const fetchedAt = liveSnapshot?.generatedAt;
 
   return (
-    <Space direction="vertical" size={18} className="full-width help-page">
-      <PageError error={error} onRetry={() => { catalog.refetch(); monitors.refetch(); }} />
-      <Alert
-        type="info"
-        showIcon
-        message="变量语法"
-        description={<span>通知模板和渠道配置使用 <Text code>{'${path}'}</Text>；Webhook JSON 正文插入完整值时使用 <Text code>{'${json:path}'}</Text>。规则编辑器中直接选择同名字段。</span>}
+    <div className="design-page help-page">
+      <PageHeader
+        eyebrow="变量与规则工作台"
+        title="帮助"
+        description="直接检查监控源的实时变量，核对规则字段，并确认模板与渠道中的正确写法。"
+        actions={<Button icon={<SearchOutlined />} onClick={() => document.getElementById('helpInspect')?.scrollIntoView({ behavior: 'smooth' })}>检查实时变量</Button>}
       />
+      <PageError error={error} onRetry={() => { catalog.refetch(); monitors.refetch(); }} />
+      <div className="help-layout">
+        <nav className="help-index" aria-label="帮助目录">
+          {[['helpInspect', '实时变量检查'], ['helpCatalog', '变量目录'], ['helpRules', '嵌套规则示例'], ['helpBoundaries', '使用边界']].map(([id, label]) => <button key={id} type="button" onClick={() => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' })}>{label}<ArrowRightOutlined /></button>)}
+        </nav>
+        <div className="help-sections">
+          <div className="help-syntax-banner"><span className="type-mark"><CodeOutlined /></span><div><strong>变量语法</strong><p>通知模板和渠道配置使用 <code>{'${path}'}</code>；Webhook JSON 需要保留原始值类型时使用 <code>{'${json:path}'}</code>。规则编辑器无需手写模板语法，直接选择同名字段。</p></div></div>
 
-      <Card title="嵌套规则示例">
-        <Paragraph>下面的规则表示：标题或正文包含“送码/兑换码”，并且源内容发布时间在最近 2 分钟内。网页规则编辑器可以直接创建同样的嵌套结构。</Paragraph>
-        <pre className="detail-json help-rule-example">{`{
+          <section className="help-section" id="helpInspect">
+            <header className="help-section-head"><div><h2>实时变量检查</h2><p>选择一个现有监控，读取当前源数据，并查看本次可用变量。</p></div><Button icon={<ReloadOutlined />} disabled={!monitorId} loading={snapshot.isFetching} onClick={() => snapshot.refetch()}>重新检查</Button></header>
+            <div className="help-section-body">
+              {monitors.isLoading ? <Skeleton active paragraph={{ rows: 2 }} /> : monitors.data?.length ? (
+                <>
+                  <div className="help-inspect-note"><ApiOutlined /><span>这是一项只读检查：会使用该监控当前配置与指定代理访问数据源，但不会创建事件或检查记录，不会执行规则、发送通知，也不会修改去重状态。</span></div>
+                  <div className="help-monitor-picker"><label>检查目标<Select showSearch value={monitorId} className="help-monitor-select" placeholder="选择监控" optionFilterProp="label" onChange={setMonitorId} options={monitors.data.map((monitor) => ({ label: `${monitor.name} · ${monitor.type}`, value: monitor.id }))} /></label><Button icon={<CopyOutlined />} disabled={!snapshotURL} onClick={() => navigator.clipboard.writeText(snapshotURL)}>复制接口路径</Button></div>
+                  <PageError error={snapshot.error as Error | null} onRetry={() => snapshot.refetch()} />
+                  {snapshot.isFetching && <Skeleton active paragraph={{ rows: 3 }} />}
+                  {liveSnapshot && <>
+                    <dl className="help-snapshot"><div><dt>监控</dt><dd>{liveSnapshot.monitorName}</dd></div><div><dt>观测类型</dt><dd>{liveSnapshot.observationType || '—'}</dd></div><div><dt>获取时间</dt><dd>{formatDate(fetchedAt)}</dd></div><div><dt>样本状态</dt><dd>{liveSnapshot.sampleAvailable ? <Tag color="green">已读取</Tag> : <Tag>无内容</Tag>}</dd></div></dl>
+                    <div className="help-snapshot-foot"><div><span>{liveSnapshot.message || '检查完成'}</span><code>{snapshotURL}</code></div><Button size="small" icon={<ApiOutlined />} href={snapshotURL} target="_blank">打开实时 JSON</Button></div>
+                  </>}
+                  {liveSnapshot && !liveSnapshot.sampleAvailable && <Alert type="warning" showIcon message="源站没有可预览的内容" description={liveSnapshot.message || '本次检查成功，但源站没有返回可用于渲染变量的条目。'} />}
+                </>
+              ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="创建监控后，可以在这里即时访问源站并检查变量取值。" />}
+            </div>
+          </section>
+
+          <section className="help-section" id="helpCatalog">
+            <header><h2>变量目录</h2><p>选择监控后会主动检查一次；表格中的“本次取值”来自上方只读快照。</p></header>
+            <Tabs className="help-catalog-tabs" items={tabs} />
+          </section>
+
+          <section className="help-section" id="helpRules">
+            <header><h2>嵌套规则示例</h2><p>要求最近两分钟发布，并且标题或正文包含目标关键词。</p></header>
+            <div className="help-code-layout"><div className="help-rule-code"><pre>{`{
   "match": "all",
   "conditions": [
     {
@@ -103,55 +131,16 @@ export default function HelpPage() {
     },
     { "field": "rss.publishedAt", "operator": "within_last", "value": "2m" }
   ]
-}`}</pre>
-      </Card>
+}`}</pre></div><div className="help-rule-notes"><div><strong>外层：全部满足</strong><span>关键词条件与发布时间条件必须同时成立。</span></div><div><strong>内层：任一满足</strong><span>标题或正文只需有一处匹配正则表达式。</span></div><div><strong>时间字段有约束</strong><span>只有可解析时间才能用于“最近时间内”判断。</span></div></div></div>
+          </section>
 
-      <Card title="实时变量检查" extra={<Button icon={<ReloadOutlined />} disabled={!monitorId} loading={snapshot.isFetching} onClick={() => snapshot.refetch()}>重新检查</Button>}>
-        {monitors.isLoading ? <Skeleton active paragraph={{ rows: 2 }} /> : monitors.data?.length ? (
-          <Space direction="vertical" size={16} className="full-width">
-            <Alert
-              type="info"
-              showIcon
-              message="选择监控后会立即访问源站"
-              description="检查会使用监控的当前配置及其指定代理。它只读取变量，不会创建事件或检查记录，不会修改监控状态或去重状态，不会执行规则，也不会发送通知。"
-            />
-            <Select
-              showSearch
-              value={monitorId}
-              className="help-monitor-select"
-              placeholder="选择监控"
-              optionFilterProp="label"
-              onChange={setMonitorId}
-              options={monitors.data.map((monitor) => ({ label: `${monitor.name} · ${monitor.type}`, value: monitor.id }))}
-            />
-            <PageError error={snapshot.error as Error | null} onRetry={() => snapshot.refetch()} />
-            {snapshot.isFetching && <Skeleton active paragraph={{ rows: 3 }} />}
-            {liveSnapshot && (
-              <Descriptions bordered size="small" column={{ xs: 1, md: 3 }}>
-                <Descriptions.Item label="监控">{liveSnapshot.monitorName}</Descriptions.Item>
-                <Descriptions.Item label="观测类型">{liveSnapshot.observationType || '—'}</Descriptions.Item>
-                <Descriptions.Item label="本次抓取时间">{formatDate(fetchedAt)}</Descriptions.Item>
-                <Descriptions.Item label="样本状态">{liveSnapshot.sampleAvailable ? <Tag color="green">已获取</Tag> : <Tag>无可预览内容</Tag>}</Descriptions.Item>
-                <Descriptions.Item label="检查说明" span={2}>{liveSnapshot.message || '检查完成'}</Descriptions.Item>
-                <Descriptions.Item label="完整 JSON 实时链接" span={3}>
-                  <Space wrap>
-                    <Text code copyable={{ text: snapshotURL }}>{snapshotURL}</Text>
-                    <Button size="small" icon={<ApiOutlined />} href={snapshotURL} target="_blank">打开</Button>
-                  </Space>
-                </Descriptions.Item>
-              </Descriptions>
-            )}
-            {liveSnapshot && !liveSnapshot.sampleAvailable && <Alert type="warning" showIcon message="源站没有可预览的内容" description={liveSnapshot.message || '本次检查成功，但源站没有返回可用于渲染变量的条目。'} />}
-          </Space>
-        ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="创建监控后，可以在这里即时访问源站并检查变量取值。" />}
-      </Card>
-
-      <Card className="variable-reference-card">
-        <Title level={4}>变量目录</Title>
-        <Paragraph type="secondary">选择监控后会立即检查一次；之后仅在重新选择、点击“重新检查”或打开实时链接等主动操作时访问源站，不会在后台轮询。每个可用值都提供实时 JSON 链接，链接取值可能与当前表格不同。</Paragraph>
-        <Tabs items={tabs} />
-      </Card>
-    </Space>
+          <section className="help-section" id="helpBoundaries">
+            <header><h2>使用边界</h2><p>理解实时快照与持久化事件之间的区别，避免误判。</p></header>
+            <div className="help-boundary-grid"><article><strong>没有后台轮询</strong><p>只有选择监控、点击重新检查或打开实时链接时才会请求源站。</p></article><article><strong>空值是有效结果</strong><p>变量可能缺失、为空或为 null，表示当前阶段没有该字段。</p></article><article><strong>事件字段可能不可用</strong><p>实时检查不会创建事件，因此 event.id、event.time 等字段可能为空。</p></article></div>
+          </section>
+        </div>
+      </div>
+    </div>
   );
 }
 

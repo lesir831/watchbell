@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { Alert, Button, Empty, Result, Space, Tag, Typography } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import type { APIError } from '../api';
@@ -7,7 +8,20 @@ const { Text } = Typography;
 export function StatusTag({ status }: { status?: string }) {
   const value = status || 'pending';
   const color = statusColor(value);
-  return <Tag color={color}>{statusLabel(value)}</Tag>;
+  return <Tag className={`status-chip status-${statusTone(value)}`} color={color}><span className="status-dot" />{statusLabel(value)}</Tag>;
+}
+
+export function PageHeader(props: { eyebrow: ReactNode; title: ReactNode; description: ReactNode; actions?: ReactNode }) {
+  return (
+    <header className="page-head">
+      <div className="page-head-copy">
+        <div className="page-eyebrow">{props.eyebrow}</div>
+        <h1 className="page-title">{props.title}</h1>
+        <p className="page-subtitle">{props.description}</p>
+      </div>
+      {props.actions && <div className="page-actions">{props.actions}</div>}
+    </header>
+  );
 }
 
 export function PageError({ error, onRetry }: { error?: Error | null; onRetry?: () => void }) {
@@ -73,6 +87,13 @@ function statusColor(status: string) {
   if (['warning', 'full', 'skipped'].includes(status)) return 'orange';
   if (['running', 'pending', 'scheduled', 'manual'].includes(status)) return 'blue';
   return 'default';
+}
+
+function statusTone(status: string) {
+  if (['ok', 'available', 'sent', 'matched', 'ready'].includes(status)) return 'success';
+  if (['error', 'failed', 'not_ready'].includes(status)) return 'danger';
+  if (['warning', 'full', 'skipped'].includes(status)) return 'warning';
+  return 'neutral';
 }
 
 function statusLabel(status: string) {

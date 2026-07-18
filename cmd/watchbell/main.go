@@ -82,6 +82,21 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.Close()
+	retention := config.RetentionFromEnv()
+	runtimeDefaults := store.RuntimeSettings{
+		SessionTTL: cfg.Auth.SessionTTL,
+		HistoryRetention: store.HistoryRetentionPolicy{
+			EventAge: retention.EventAge, CheckRunAge: retention.CheckRunAge,
+			NotificationAttemptAge: retention.NotificationAttemptAge,
+			AuditLogAge:            retention.AuditLogAge, BatchSize: retention.BatchSize,
+		},
+	}
+	runtimeSettings, err := db.GetRuntimeSettings(ctx, runtimeDefaults)
+	if err != nil {
+		logger.Error("load runtime settings", "error", err)
+		os.Exit(1)
+	}
+	cfg.Auth.SessionTTL = runtimeSettings.SessionTTL
 	if persistedHash, exists, err := db.GetAuthPasswordHash(ctx); err != nil {
 		logger.Error("load persisted admin password", "error", err)
 		os.Exit(1)
@@ -116,14 +131,11 @@ func main() {
 	})
 	go sched.Start(ctx)
 
-	retention := config.RetentionFromEnv()
 	historyWorker := maintenance.NewHistoryWorker(db, maintenance.HistoryOptions{
-		Policy: store.HistoryRetentionPolicy{
-			EventAge:               retention.EventAge,
-			CheckRunAge:            retention.CheckRunAge,
-			NotificationAttemptAge: retention.NotificationAttemptAge,
-			AuditLogAge:            retention.AuditLogAge,
-			BatchSize:              retention.BatchSize,
+		Policy: runtimeSettings.HistoryRetention,
+		PolicyProvider: func(ctx context.Context) (store.HistoryRetentionPolicy, error) {
+			current, err := db.GetRuntimeSettings(ctx, runtimeDefaults)
+			return current.HistoryRetention, err
 		},
 		Interval: retention.CleanupInterval,
 		Logger:   logger,
@@ -132,7 +144,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           api.NewServer(db, sched, cfg.WebDir, logger, authManager).Routes(),
+		Handler:           api.NewServer(db, sched, cfg.WebDir, logger, authManager, api.WithRuntimeDefaults(runtimeDefaults)).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,

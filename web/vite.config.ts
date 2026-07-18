@@ -6,7 +6,14 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': 'http://127.0.0.1:8080'
+      '/api': {
+        target: 'http://127.0.0.1:8080',
+        changeOrigin: true,
+        headers: {
+          Origin: 'http://127.0.0.1:8080',
+          'Sec-Fetch-Site': 'same-origin'
+        }
+      }
     }
   }
 });

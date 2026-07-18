@@ -32,6 +32,7 @@ var (
 	// has a successor. Retrying it again would duplicate delivery.
 	ErrRetryConflict          = errors.New("notification attempt is already being retried or has been superseded")
 	ErrRetryTargetUnavailable = errors.New("notification retry target is unavailable")
+	ErrChannelDisabled        = errors.New("notification channel is disabled")
 )
 
 type Options struct {
@@ -179,6 +180,23 @@ func (s *Scheduler) TestChannel(ctx context.Context, channelID int64) (model.Not
 	return s.sendAndRecord(ctx, channel, message, model.NotificationAttemptInput{
 		ChannelID: int64Ptr(channel.ID), ChannelName: channel.Name, ChannelType: channel.Type,
 		Kind: "test", AttemptNo: 1,
+	})
+}
+
+// SendPreview delivers an already-rendered template preview through the same
+// notifier and attempt-recording path as normal notifications. Preview rows
+// remain distinguishable through Kind and never create legacy delivery logs.
+func (s *Scheduler) SendPreview(ctx context.Context, channelID int64, message notifier.Message, monitorID, eventID *int64) (model.NotificationAttempt, error) {
+	channel, err := s.store.GetNotifyChannel(ctx, channelID)
+	if err != nil {
+		return model.NotificationAttempt{}, err
+	}
+	if !channel.Enabled {
+		return model.NotificationAttempt{}, ErrChannelDisabled
+	}
+	return s.sendAndRecord(ctx, channel, message, model.NotificationAttemptInput{
+		MonitorID: monitorID, EventID: eventID, ChannelID: int64Ptr(channel.ID),
+		ChannelName: channel.Name, ChannelType: channel.Type, Kind: "preview", AttemptNo: 1,
 	})
 }
 

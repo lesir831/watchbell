@@ -219,6 +219,52 @@ func TestSyncPasswordHashRevokesExistingSessions(t *testing.T) {
 	}
 }
 
+func TestSessionTTLChangeRevokesOldPolicyAndRefreshesIdleSession(t *testing.T) {
+	manager := newAuthManager(t, nil)
+	loginResponse := httptest.NewRecorder()
+	if err := manager.Login(loginResponse, loginRequest("192.0.2.43:4123"), "admin", "correct-password"); err != nil {
+		t.Fatal(err)
+	}
+	oldCookie := loginResponse.Result().Cookies()[0]
+	if oldCookie.MaxAge != int(time.Hour/time.Second) {
+		t.Fatalf("initial MaxAge = %d", oldCookie.MaxAge)
+	}
+	if err := manager.SetSessionTTL(8 * time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	oldRequest := httptest.NewRequest(http.MethodGet, "http://watchbell.test/api/auth/me", nil)
+	oldRequest.AddCookie(oldCookie)
+	oldResponse := httptest.NewRecorder()
+	manager.Require(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })).ServeHTTP(oldResponse, oldRequest)
+	if oldResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("old-policy session status = %d", oldResponse.Code)
+	}
+
+	newLogin := httptest.NewRecorder()
+	if err := manager.Login(newLogin, loginRequest("192.0.2.44:4123"), "admin", "correct-password"); err != nil {
+		t.Fatal(err)
+	}
+	newCookie := newLogin.Result().Cookies()[0]
+	request := httptest.NewRequest(http.MethodGet, "http://watchbell.test/api/auth/me", nil)
+	request.AddCookie(newCookie)
+	response := httptest.NewRecorder()
+	manager.Require(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })).ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("new-policy session status = %d", response.Code)
+	}
+	if cookies := response.Result().Cookies(); len(cookies) != 0 {
+		t.Fatalf("background authenticated request unexpectedly refreshed session: %#v", cookies)
+	}
+	refreshResponse := httptest.NewRecorder()
+	if err := manager.RefreshCurrentSession(refreshResponse, request); err != nil {
+		t.Fatal(err)
+	}
+	cookies := refreshResponse.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].MaxAge != int((8*time.Hour)/time.Second) {
+		t.Fatalf("refreshed idle cookie = %#v", cookies)
+	}
+}
+
 func TestPasswordHashSyncCannotRestoreStaleCredentialAfterWebChange(t *testing.T) {
 	manager := newAuthManager(t, nil)
 	durableHash := testPasswordHash

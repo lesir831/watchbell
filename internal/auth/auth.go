@@ -91,9 +91,10 @@ type failureLimiter struct {
 type contextKey struct{}
 
 type sessionPayload struct {
-	Username  string `json:"u"`
-	ExpiresAt int64  `json:"exp"`
-	Version   string `json:"v"`
+	Username   string `json:"u"`
+	ExpiresAt  int64  `json:"exp"`
+	Version    string `json:"v"`
+	TTLSeconds int64  `json:"ttl"`
 }
 
 func NewManager(cfg Config, logger *slog.Logger) (*Manager, error) {
@@ -178,6 +179,31 @@ func (m *Manager) Username() string {
 	return m.username
 }
 
+func (m *Manager) SessionTTL() time.Duration {
+	if m == nil {
+		return 0
+	}
+	m.credentialsMu.RLock()
+	defer m.credentialsMu.RUnlock()
+	return m.sessionTTL
+}
+
+// SetSessionTTL applies the idle-session policy immediately. Session payloads
+// include the policy duration, so changing it invalidates other sessions that
+// were issued under the previous policy.
+func (m *Manager) SetSessionTTL(ttl time.Duration) error {
+	if ttl <= 0 {
+		return fmt.Errorf("session TTL must be positive")
+	}
+	if !m.Enabled() {
+		return nil
+	}
+	m.credentialsMu.Lock()
+	m.sessionTTL = ttl
+	m.credentialsMu.Unlock()
+	return nil
+}
+
 func (m *Manager) TrustProxyHeaders() bool {
 	return m != nil && m.trustProxyHeaders
 }
@@ -204,17 +230,19 @@ func (m *Manager) Login(w http.ResponseWriter, r *http.Request, username string,
 		m.loginFailures.record(client)
 		return ErrInvalidCredentials
 	}
+	ttl := m.sessionTTL
 	value, err := m.signSession(sessionPayload{
-		Username:  username,
-		ExpiresAt: time.Now().Add(m.sessionTTL).Unix(),
-		Version:   m.credentialVersion,
+		Username:   username,
+		ExpiresAt:  time.Now().Add(ttl).Unix(),
+		Version:    m.credentialVersion,
+		TTLSeconds: int64(ttl / time.Second),
 	})
 	m.credentialsMu.RUnlock()
 	if err != nil {
 		return err
 	}
 	m.loginFailures.reset(client)
-	m.setSessionCookie(w, r, value)
+	m.setSessionCookie(w, r, value, ttl)
 	return nil
 }
 
@@ -297,20 +325,58 @@ func (m *Manager) RefreshSession(w http.ResponseWriter, r *http.Request, expecte
 		m.credentialsMu.RUnlock()
 		return ErrCredentialChanged
 	}
+	ttl := m.sessionTTL
 	value, err := m.signSession(sessionPayload{
-		Username:  m.username,
-		ExpiresAt: time.Now().Add(m.sessionTTL).Unix(),
-		Version:   m.credentialVersion,
+		Username:   m.username,
+		ExpiresAt:  time.Now().Add(ttl).Unix(),
+		Version:    m.credentialVersion,
+		TTLSeconds: int64(ttl / time.Second),
 	})
 	m.credentialsMu.RUnlock()
 	if err != nil {
 		return err
 	}
-	m.setSessionCookie(w, r, value)
+	m.setSessionCookie(w, r, value, ttl)
 	return nil
 }
 
-func (m *Manager) setSessionCookie(w http.ResponseWriter, r *http.Request, value string) {
+// RefreshCurrentSession reissues the authenticated request's cookie using the
+// current idle timeout. It is used after a policy change so the browser that
+// made the change remains signed in while sessions using the old policy stop.
+func (m *Manager) RefreshCurrentSession(w http.ResponseWriter, r *http.Request) error {
+	if !m.Enabled() {
+		return nil
+	}
+	username, ok := m.User(r)
+	if !ok {
+		return ErrInvalidCredentials
+	}
+	return m.issueSession(w, r, username)
+}
+
+func (m *Manager) issueSession(w http.ResponseWriter, r *http.Request, username string) error {
+	m.credentialsMu.RLock()
+	if username != m.username {
+		m.credentialsMu.RUnlock()
+		return ErrInvalidCredentials
+	}
+	ttl := m.sessionTTL
+	value, err := m.signSession(sessionPayload{
+		Username:   username,
+		ExpiresAt:  time.Now().Add(ttl).Unix(),
+		Version:    m.credentialVersion,
+		TTLSeconds: int64(ttl / time.Second),
+	})
+	m.credentialsMu.RUnlock()
+	if err != nil {
+		return err
+	}
+	m.setSessionCookie(w, r, value, ttl)
+	return nil
+}
+
+func (m *Manager) setSessionCookie(w http.ResponseWriter, r *http.Request, value string, ttl time.Duration) {
+	m.removePendingSessionCookie(w)
 	http.SetCookie(w, &http.Cookie{
 		Name:     m.cookieName,
 		Value:    value,
@@ -318,14 +384,29 @@ func (m *Manager) setSessionCookie(w http.ResponseWriter, r *http.Request, value
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		Secure:   m.secureCookie(r),
-		MaxAge:   int(m.sessionTTL.Seconds()),
+		MaxAge:   int(ttl.Seconds()),
 	})
+}
+
+func (m *Manager) removePendingSessionCookie(w http.ResponseWriter) {
+	if m == nil || w == nil {
+		return
+	}
+	values := w.Header().Values("Set-Cookie")
+	w.Header().Del("Set-Cookie")
+	prefix := m.cookieName + "="
+	for _, value := range values {
+		if !strings.HasPrefix(value, prefix) {
+			w.Header().Add("Set-Cookie", value)
+		}
+	}
 }
 
 func (m *Manager) Logout(w http.ResponseWriter, r *http.Request) {
 	if m == nil {
 		return
 	}
+	m.removePendingSessionCookie(w)
 	http.SetCookie(w, &http.Cookie{
 		Name:     m.cookieName,
 		Value:    "",
@@ -539,7 +620,8 @@ func (m *Manager) verifyRequest(r *http.Request) (string, bool) {
 		return "", false
 	}
 	m.credentialsMu.RLock()
-	valid := payload.Username == m.username && payload.Version == m.credentialVersion
+	valid := payload.Username == m.username && payload.Version == m.credentialVersion &&
+		payload.TTLSeconds == int64(m.sessionTTL/time.Second)
 	m.credentialsMu.RUnlock()
 	if !valid {
 		return "", false

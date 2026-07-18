@@ -40,6 +40,26 @@ export interface LoginInput {
 export interface SettingsOverview {
   authEnabled: boolean;
   username: string;
+  sessionTimeoutHours: number;
+  historyRetentionDays: number;
+}
+
+export interface RuntimeSettingsInput {
+  sessionTimeoutHours: number;
+  historyRetentionDays: number;
+}
+
+export interface NetworkCheckItem {
+  name: string;
+  status: 'ok' | 'failed';
+  durationMs: number;
+  detail: string;
+}
+
+export interface NetworkCheckReport {
+  status: 'ok' | 'degraded';
+  generatedAt: string;
+  checks: NetworkCheckItem[];
 }
 
 export interface ChangePasswordInput {

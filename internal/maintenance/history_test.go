@@ -10,20 +10,45 @@ import (
 )
 
 type fakeHistoryCleaner struct {
-	mu     sync.Mutex
-	calls  int
-	called chan struct{}
+	mu         sync.Mutex
+	calls      int
+	lastPolicy store.HistoryRetentionPolicy
+	called     chan struct{}
 }
 
-func (cleaner *fakeHistoryCleaner) CleanupHistory(context.Context, store.HistoryRetentionPolicy, time.Time) (store.HistoryCleanupResult, error) {
+func (cleaner *fakeHistoryCleaner) CleanupHistory(_ context.Context, policy store.HistoryRetentionPolicy, _ time.Time) (store.HistoryCleanupResult, error) {
 	cleaner.mu.Lock()
 	cleaner.calls++
+	cleaner.lastPolicy = policy
 	cleaner.mu.Unlock()
 	select {
 	case cleaner.called <- struct{}{}:
 	default:
 	}
 	return store.HistoryCleanupResult{}, nil
+}
+
+func TestHistoryWorkerLoadsCurrentPolicyFromProvider(t *testing.T) {
+	cleaner := &fakeHistoryCleaner{called: make(chan struct{}, 1)}
+	want := store.UniformHistoryRetention(30*24*time.Hour, 25)
+	worker := NewHistoryWorker(cleaner, HistoryOptions{
+		PolicyProvider: func(context.Context) (store.HistoryRetentionPolicy, error) { return want, nil },
+		Interval:       time.Hour,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go worker.Run(ctx)
+	select {
+	case <-cleaner.called:
+	case <-time.After(time.Second):
+		t.Fatal("history worker did not use provider immediately")
+	}
+	cleaner.mu.Lock()
+	got := cleaner.lastPolicy
+	cleaner.mu.Unlock()
+	if got.EventAge != want.EventAge || got.BatchSize != want.BatchSize {
+		t.Fatalf("provider policy = %#v, want %#v", got, want)
+	}
 }
 
 func TestHistoryWorkerRunsImmediatelyAndStopsWithContext(t *testing.T) {

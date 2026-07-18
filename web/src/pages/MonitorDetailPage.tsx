@@ -1,12 +1,11 @@
 import { useState } from 'react';
-import { Alert, App as AntApp, Button, Card, Col, Descriptions, Row, Space, Statistic, Table, Tabs, Tag, Typography } from 'antd';
+import { Alert, App as AntApp, Button, Card, Space, Table, Tabs, Tag } from 'antd';
 import { ArrowLeftOutlined, PlayCircleOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
-import { formatDate, formatDuration, formatInterval, jsonText, PageError, relativeDate, StatusTag } from '../components/Common';
+import { formatDuration, formatInterval, jsonText, PageError, relativeDate, StatusTag } from '../components/Common';
 import type { CheckRun, EventRecord, NotificationAttempt, Rule } from '../types';
 
-const { Text, Title } = Typography;
 type PageState = { page: number; pageSize: number };
 type PageMeta = PageState & { total: number };
 
@@ -47,32 +46,23 @@ export default function MonitorDetailPage({ monitorId, onNavigate }: { monitorId
   }
 
   return (
-    <Space direction="vertical" size={16} className="full-width">
-      <div className="page-toolbar responsive-toolbar">
-        <Button icon={<ArrowLeftOutlined />} onClick={() => onNavigate('monitors')}>返回监控列表</Button>
-        <Button type="primary" icon={<PlayCircleOutlined />} loading={check.isPending} onClick={() => check.mutate()}>立即检查</Button>
-      </div>
+    <div className="design-page">
+      <div className="detail-topline"><Button icon={<ArrowLeftOutlined />} onClick={() => onNavigate('monitors')}>返回监控</Button></div>
       <PageError error={error as Error | null} onRetry={() => { monitors.refetch(); rules.refetch(); channels.refetch(); runs.refetch(); events.refetch(); attempts.refetch(); failedAttempts.refetch(); }} />
       {monitor && <>
-        <Card>
-          <div className="detail-heading"><div><Title level={3}>{monitor.name}</Title><Space><Tag>{monitor.type}</Tag><StatusTag status={!monitor.enabled ? 'disabled' : monitor.lastStatus} /></Space></div><Text type="secondary">下次检查：{monitor.enabled ? relativeDate(monitor.nextCheckAt) : '已停用'}</Text></div>
-          {(monitor.lastError || monitor.lastMessage) && <Alert className="detail-health-alert" type={monitor.lastError ? 'error' : 'info'} showIcon message={monitor.lastError || monitor.lastMessage} />}
-          {monitor.failureAlertActive && <Alert className="detail-health-alert" type="error" showIcon message="已发送监控故障告警" description="恢复正常后会向所选渠道发送恢复通知，并关闭本轮故障状态。" />}
-          <Descriptions column={{ xs: 1, sm: 2, lg: 4 }} size="small">
-            <Descriptions.Item label="检查频率">{formatInterval(monitor.intervalSeconds)}</Descriptions.Item>
-            <Descriptions.Item label="上次检查">{formatDate(monitor.lastCheckedAt)}</Descriptions.Item>
-            <Descriptions.Item label="连续失败">{monitor.consecutiveFailures}</Descriptions.Item>
-            <Descriptions.Item label="故障告警">{monitor.failureAlertAfter > 0 ? `${monitor.failureAlertAfter} 次失败触发${monitor.failureAlertActive ? ' · 告警中' : ''}` : '关闭'}</Descriptions.Item>
-            <Descriptions.Item label="创建时间">{formatDate(monitor.createdAt)}</Descriptions.Item>
-          </Descriptions>
-        </Card>
-        <Row gutter={[16, 16]}>
-          <Col xs={12} lg={6}><Card><Statistic title="关联规则" value={monitorRules.length} /></Card></Col>
-          <Col xs={12} lg={6}><Card><Statistic title="检查记录" value={runs.data?.total ?? 0} /></Card></Col>
-          <Col xs={12} lg={6}><Card><Statistic title="事件记录" value={events.data?.total ?? 0} /></Card></Col>
-          <Col xs={12} lg={6}><Card><Statistic title="发送失败" value={failedAttempts.data?.total ?? 0} /></Card></Col>
-        </Row>
-        <Card>
+        <section className="detail-hero">
+          <div><div className="page-eyebrow">{monitor.type}</div><h1>{monitor.name}</h1><div className="detail-meta"><StatusTag status={!monitor.enabled ? 'disabled' : monitor.lastStatus} /><span className="detail-chip">每 {formatInterval(monitor.intervalSeconds)}</span><span className="detail-chip">{monitor.proxyId ? `代理 #${monitor.proxyId}` : '默认网络'}</span></div></div>
+          <div className="detail-next"><span>下次检查</span><strong>{monitor.enabled ? relativeDate(monitor.nextCheckAt) : '已停用'}</strong><Button className="design-dark" icon={<PlayCircleOutlined />} loading={check.isPending} disabled={!monitor.enabled} onClick={() => check.mutate()}>立即检查</Button></div>
+        </section>
+        {(monitor.lastError || monitor.lastMessage) && <Alert className="detail-health-alert" type={monitor.lastError ? 'error' : 'info'} showIcon message={monitor.lastError || monitor.lastMessage} />}
+        {monitor.failureAlertActive && <Alert className="detail-health-alert" type="error" showIcon message="已发送监控故障告警" description="恢复正常后会向所选渠道发送恢复通知，并关闭本轮故障状态。" />}
+        <div className="detail-stats">
+          <div><span>最近结果</span><strong>{monitor.lastError ? '检查失败' : monitor.lastMessage || '未发现新事件'}</strong></div>
+          <div><span>连续失败</span><strong className="number">{monitor.consecutiveFailures} 次</strong></div>
+          <div><span>关联规则</span><strong className="number">{monitorRules.length}</strong></div>
+          <div><span>通知失败</span><strong className="number">{failedAttempts.data?.total ?? 0}</strong></div>
+        </div>
+        <section className="tabs-panel">
           <Tabs items={[
             { key: 'runs', label: `检查 ${runs.data?.total ?? 0}`, children: <Runs data={monitorRuns} page={{ ...runsPaging, total: runs.data?.total ?? 0 }} loading={runs.isFetching} onPage={(page, pageSize) => setRunsPaging({ page, pageSize })} /> },
             { key: 'events', label: `事件 ${events.data?.total ?? 0}`, children: <Events data={monitorEvents} page={{ ...eventsPaging, total: events.data?.total ?? 0 }} loading={events.isFetching} onPage={(page, pageSize) => setEventsPaging({ page, pageSize })} /> },
@@ -80,9 +70,9 @@ export default function MonitorDetailPage({ monitorId, onNavigate }: { monitorId
             { key: 'attempts', label: `通知 ${attempts.data?.total ?? 0}`, children: <Attempts data={monitorAttempts} page={{ ...attemptsPaging, total: attempts.data?.total ?? 0 }} loading={attempts.isFetching} onPage={(page, pageSize) => setAttemptsPaging({ page, pageSize })} /> },
             { key: 'config', label: '配置', children: <pre className="detail-json">{jsonText(monitor.config)}</pre> }
           ]} />
-        </Card>
+        </section>
       </>}
-    </Space>
+    </div>
   );
 }
 

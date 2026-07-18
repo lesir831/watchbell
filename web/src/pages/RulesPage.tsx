@@ -3,11 +3,9 @@ import {
   Alert,
   App as AntApp,
   Button,
-  Card,
   Col,
   Drawer,
   Form,
-  Grid,
   Input,
   InputNumber,
   Popconfirm,
@@ -15,36 +13,36 @@ import {
   Select,
   Space,
   Switch,
-  Table,
   Tag,
   Typography
 } from 'antd';
-import { DeleteOutlined, EditOutlined, ExperimentOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
+import { BranchesOutlined, DeleteOutlined, EditOutlined, ExperimentOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
 import ConditionBuilder, { defaultConditionGroup, normalizeConditionGroup, validateConditionGroup } from '../components/ConditionBuilder';
-import { EmptyState, PageError, relativeDate, StatusTag } from '../components/Common';
+import { EmptyState, PageError, PageHeader, relativeDate } from '../components/Common';
 import type { Monitor, MonitorPlugin, NotificationTemplate, NotifyChannel, Rule, RuleConditionGroup, RuleInput } from '../types';
 
-const { Text, Title } = Typography;
+const { Text } = Typography;
 
 const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 const clockPattern = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 
 export default function RulesPage() {
-  const mobile = !Grid.useBreakpoint().md;
   const queryClient = useQueryClient();
   const { message } = AntApp.useApp();
   const [editing, setEditing] = useState<Rule | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [search, setSearch] = useState('');
+  const [status, setStatus] = useState<'all' | 'enabled' | 'disabled'>('all');
   const rules = useQuery({ queryKey: ['rules'], queryFn: api.listRules, refetchInterval: 30_000 });
   const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors, refetchInterval: 30_000 });
   const channels = useQuery({ queryKey: ['channels'], queryFn: api.listChannels, refetchInterval: 30_000 });
   const templates = useQuery({ queryKey: ['templates'], queryFn: api.listTemplates, refetchInterval: 30_000 });
   const plugins = useQuery({ queryKey: ['plugins'], queryFn: api.listPlugins });
   const monitorByID = useMemo(() => new Map((monitors.data ?? []).map((item) => [item.id, item])), [monitors.data]);
-  const channelByID = useMemo(() => new Map((channels.data ?? []).map((item) => [item.id, item])), [channels.data]);
+  const templateByID = useMemo(() => new Map((templates.data ?? []).map((item) => [item.id, item])), [templates.data]);
+  const pluginByID = useMemo(() => new Map((plugins.data ?? []).map((item) => [item.id, item])), [plugins.data]);
 
   const refresh = async () => Promise.all([
     queryClient.invalidateQueries({ queryKey: ['rules'] }),
@@ -60,55 +58,85 @@ export default function RulesPage() {
     onSuccess: async () => { await refresh(); message.success('规则已归档，历史判断记录仍会保留'); },
     onError: (error: Error) => message.error(error.message)
   });
-  const filtered = (rules.data ?? []).filter((item) => item.name.toLowerCase().includes(search.toLowerCase()));
+  const toggleMutation = useMutation({
+    mutationFn: ({ record, enabled }: { record: Rule; enabled: boolean }) => api.updateRule(record.id, {
+      monitorId: record.monitorId, name: record.name, enabled, condition: record.condition,
+      notifyChannelIds: record.notifyChannelIds, templateId: record.templateId ?? null,
+      cooldownSeconds: record.cooldownSeconds, quietHours: record.quietHours
+    }),
+    onSuccess: async (item) => { await refresh(); message.success(item.enabled ? '规则已启用' : '规则已停用'); },
+    onError: (error: Error) => message.error(error.message)
+  });
+  const testMutation = useMutation({
+    mutationFn: (record: Rule) => api.testRule({ monitorId: record.monitorId, condition: record.condition, limit: 20 }),
+    onSuccess: (result) => message.success(`测试 ${result.tested} 条事件，命中 ${result.matched} 条`),
+    onError: (error: Error) => message.error(error.message)
+  });
+  const normalizedSearch = search.trim().toLowerCase();
+  const filtered = (rules.data ?? []).filter((item) => {
+    const monitorName = monitorByID.get(item.monitorId)?.name ?? '';
+    return (status === 'all' || (status === 'enabled' ? item.enabled : !item.enabled))
+      && `${item.name} ${monitorName}`.toLowerCase().includes(normalizedSearch);
+  });
   const canCreate = Boolean(monitors.data?.length && channels.data?.some((item) => item.enabled));
   const openNew = () => { setEditing(null); setDrawerOpen(true); };
-  const actions = (record: Rule) => (
-    <Space>
-      <Button icon={<EditOutlined />} onClick={() => { setEditing(record); setDrawerOpen(true); }}>编辑</Button>
-      <Popconfirm title="归档这条规则？" description="既有规则判断与通知历史会继续保留。" onConfirm={() => deleteMutation.mutate(record.id)}><Button danger icon={<DeleteOutlined />} aria-label={`归档 ${record.name}`} /></Popconfirm>
-    </Space>
-  );
-
   return (
-    <Space direction="vertical" size={16} className="full-width">
+    <div className="design-page">
+      <PageHeader
+        eyebrow="判断与路由"
+        title="规则"
+        description="把监控事件变成明确条件，再指定模板和通知渠道。测试结果在保存前即可预览。"
+        actions={<Button className="design-primary" type="primary" icon={<PlusOutlined />} disabled={!canCreate} onClick={openNew}>新建规则</Button>}
+      />
       <PageError error={(rules.error || monitors.error || channels.error || templates.error || plugins.error) as Error | null} onRetry={() => { rules.refetch(); monitors.refetch(); channels.refetch(); templates.refetch(); plugins.refetch(); }} />
       {!canCreate && <Alert type="warning" showIcon message="创建规则前需要至少一个监控和一个已启用通知渠道" description="规则负责把监控产生的事件发送到指定渠道；停用渠道不会接收通知。" />}
-      <div className="page-toolbar responsive-toolbar">
-        <Input prefix={<SearchOutlined />} allowClear placeholder="搜索规则" value={search} onChange={(event) => setSearch(event.target.value)} style={{ maxWidth: 320 }} />
-        <Button type="primary" icon={<PlusOutlined />} disabled={!canCreate} onClick={openNew}>新建规则</Button>
+      <div className="design-toolbar">
+        <div className="filter-group" role="group" aria-label="规则状态筛选">
+          {[['all', '全部'], ['enabled', '已启用'], ['disabled', '已停用']].map(([value, label]) => <button key={value} type="button" className={`filter-button ${status === value ? 'active' : ''}`} onClick={() => setStatus(value as typeof status)}>{label}</button>)}
+        </div>
+        <label className="search-box"><SearchOutlined /><span className="sr-only">搜索规则</span><input type="search" placeholder="搜索规则或监控" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
       </div>
       {filtered.length === 0 && !rules.isLoading ? (
-        <Card><EmptyState title={rules.data?.length ? '没有符合条件的规则' : '还没有触发规则'} description="用可视化条件决定哪些事件需要通知。" action={canCreate && !rules.data?.length ? <Button type="primary" onClick={openNew}>创建第一条规则</Button> : undefined} /></Card>
-      ) : mobile ? (
-        <div className="mobile-card-list">{filtered.map((item) => (
-          <Card key={item.id} className="entity-card">
-            <div className="entity-card-head"><div><Title level={5}>{item.name}</Title><Text type="secondary">{monitorByID.get(item.monitorId)?.name ?? `监控 #${item.monitorId}`}</Text></div><StatusTag status={item.enabled ? 'ok' : 'disabled'} /></div>
-            <div className="tag-row">{item.notifyChannelIds.map((id) => <Tag key={id}>{channelByID.get(id)?.name ?? `渠道 #${id}`}</Tag>)}</div>
-            <Text type="secondary">上次触发：{relativeDate(item.lastFiredAt)}</Text>
-            <div className="entity-actions">{actions(item)}</div>
-          </Card>
-        ))}</div>
+        <div className="empty-panel"><EmptyState title={rules.data?.length ? '没有符合条件的规则' : '还没有触发规则'} description="用可视化条件决定哪些事件需要通知。" action={canCreate && !rules.data?.length ? <Button type="primary" onClick={openNew}>创建第一条规则</Button> : undefined} /></div>
       ) : (
-        <Table<Rule>
-          rowKey="id" loading={rules.isLoading} dataSource={filtered} scroll={{ x: 900 }} pagination={{ pageSize: 12, showSizeChanger: false }}
-          columns={[
-            { title: '名称', dataIndex: 'name', width: 190 },
-            { title: '监控', dataIndex: 'monitorId', width: 180, render: (id) => monitorByID.get(id)?.name ?? `#${id}` },
-            { title: '状态', dataIndex: 'enabled', width: 90, render: (value) => <StatusTag status={value ? 'ok' : 'disabled'} /> },
-            { title: '通知渠道', dataIndex: 'notifyChannelIds', render: (ids: number[]) => <Space wrap>{ids.map((id) => <Tag key={id}>{channelByID.get(id)?.name ?? `#${id}`}</Tag>)}</Space> },
-            { title: '上次触发', dataIndex: 'lastFiredAt', width: 130, render: relativeDate },
-            { title: '操作', width: 190, render: (_, record) => actions(record) }
-          ]}
-        />
+        <div className="collection-grid">
+          {filtered.map((item) => {
+            const monitor = monitorByID.get(item.monitorId);
+            const eventLabel = pluginByID.get(monitor?.type ?? 'rss')?.events?.[0] ?? monitor?.type ?? '全部事件';
+            return <article key={item.id} className="resource-card">
+              <div className="resource-card-head">
+                <div className="resource-card-title"><span className="type-mark"><BranchesOutlined /></span><div><h2>{item.name}</h2><p>{monitor?.name ?? `监控 #${item.monitorId}`}</p></div></div>
+                <Switch checked={item.enabled} loading={toggleMutation.isPending && toggleMutation.variables?.record.id === item.id} aria-label={`${item.enabled ? '停用' : '启用'} ${item.name}`} onChange={(enabled) => toggleMutation.mutate({ record: item, enabled })} />
+              </div>
+              <p className="resource-description">{conditionSummary(item)}，命中后通过 {item.notifyChannelIds.length} 个渠道发送通知。</p>
+              <div className="resource-meta">
+                <div><span>事件</span><strong className="number">{eventLabel}</strong></div>
+                <div><span>最近匹配</span><strong>{relativeDate(item.lastFiredAt)}</strong></div>
+                <div><span>模板</span><strong>{item.templateId ? templateByID.get(item.templateId)?.name ?? `模板 #${item.templateId}` : '系统默认'}</strong></div>
+                <div><span>渠道</span><strong>{item.notifyChannelIds.length} 个</strong></div>
+              </div>
+              <div className="resource-actions">
+                <Button className="mini-action" icon={<ExperimentOutlined />} loading={testMutation.isPending && testMutation.variables?.id === item.id} onClick={() => testMutation.mutate(item)}>测试规则</Button>
+                <Button className="mini-action" icon={<EditOutlined />} onClick={() => { setEditing(item); setDrawerOpen(true); }}>编辑</Button>
+                <Popconfirm title="归档这条规则？" description="既有规则判断与通知历史会继续保留。" onConfirm={() => deleteMutation.mutate(item.id)}><Button className="mini-action icon-only" danger icon={<DeleteOutlined />} aria-label={`归档 ${item.name}`} /></Popconfirm>
+              </div>
+            </article>;
+          })}
+        </div>
       )}
       <RuleDrawer
         open={drawerOpen} record={editing} monitors={monitors.data ?? []} channels={channels.data ?? []}
         templates={templates.data ?? []} plugins={plugins.data ?? []} saving={saveMutation.isPending} error={saveMutation.error as Error | null}
         onClose={() => { setDrawerOpen(false); saveMutation.reset(); }} onSave={(input) => saveMutation.mutate({ id: editing?.id, input })}
       />
-    </Space>
+    </div>
   );
+}
+
+function conditionSummary(rule: Rule) {
+  const conditions = (rule.condition as Partial<RuleConditionGroup>).conditions;
+  if (!Array.isArray(conditions) || conditions.length === 0) return '匹配该监控产生的全部新事件';
+  return `${(rule.condition as RuleConditionGroup).match === 'any' ? '任一' : '全部'}满足 ${conditions.length} 个条件`;
 }
 
 function RuleDrawer(props: {

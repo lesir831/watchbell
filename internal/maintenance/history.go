@@ -13,18 +13,20 @@ type HistoryCleaner interface {
 }
 
 type HistoryOptions struct {
-	Policy     store.HistoryRetentionPolicy
-	Interval   time.Duration
-	MaxBatches int
-	Logger     *slog.Logger
+	Policy         store.HistoryRetentionPolicy
+	PolicyProvider func(context.Context) (store.HistoryRetentionPolicy, error)
+	Interval       time.Duration
+	MaxBatches     int
+	Logger         *slog.Logger
 }
 
 type HistoryWorker struct {
-	cleaner    HistoryCleaner
-	policy     store.HistoryRetentionPolicy
-	interval   time.Duration
-	maxBatches int
-	logger     *slog.Logger
+	cleaner        HistoryCleaner
+	policy         store.HistoryRetentionPolicy
+	policyProvider func(context.Context) (store.HistoryRetentionPolicy, error)
+	interval       time.Duration
+	maxBatches     int
+	logger         *slog.Logger
 }
 
 func NewHistoryWorker(cleaner HistoryCleaner, options HistoryOptions) *HistoryWorker {
@@ -38,7 +40,7 @@ func NewHistoryWorker(cleaner HistoryCleaner, options HistoryOptions) *HistoryWo
 		options.Logger = slog.Default()
 	}
 	return &HistoryWorker{
-		cleaner: cleaner, policy: options.Policy, interval: options.Interval,
+		cleaner: cleaner, policy: options.Policy, policyProvider: options.PolicyProvider, interval: options.Interval,
 		maxBatches: options.MaxBatches, logger: options.Logger,
 	}
 }
@@ -46,7 +48,7 @@ func NewHistoryWorker(cleaner HistoryCleaner, options HistoryOptions) *HistoryWo
 // Run performs cleanup immediately and then on every interval until the
 // context is cancelled. Callers normally start it in its own goroutine.
 func (worker *HistoryWorker) Run(ctx context.Context) {
-	if worker.cleaner == nil || !retentionEnabled(worker.policy) {
+	if worker.cleaner == nil || (worker.policyProvider == nil && !retentionEnabled(worker.policy)) {
 		return
 	}
 	worker.cleanup(ctx)
@@ -63,9 +65,23 @@ func (worker *HistoryWorker) Run(ctx context.Context) {
 }
 
 func (worker *HistoryWorker) cleanup(ctx context.Context) {
+	policy := worker.policy
+	if worker.policyProvider != nil {
+		current, err := worker.policyProvider(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				worker.logger.Error("load history retention policy", "error", err)
+			}
+			return
+		}
+		policy = current
+	}
+	if !retentionEnabled(policy) {
+		return
+	}
 	var total store.HistoryCleanupResult
 	for batch := 0; batch < worker.maxBatches; batch++ {
-		result, err := worker.cleaner.CleanupHistory(ctx, worker.policy, time.Now().UTC())
+		result, err := worker.cleaner.CleanupHistory(ctx, policy, time.Now().UTC())
 		if err != nil {
 			if ctx.Err() == nil {
 				worker.logger.Error("cleanup history", "error", err)

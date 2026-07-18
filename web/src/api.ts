@@ -15,6 +15,7 @@ import type {
   Monitor,
   MonitorInput,
   MonitorPlugin,
+  NetworkCheckReport,
   NotificationLog,
   NotificationAttempt,
   NotificationTemplate,
@@ -27,6 +28,7 @@ import type {
   RuleEvaluation,
   RuleInput,
   RuleTestResponse,
+  RuntimeSettingsInput,
   SettingsOverview,
   SystemStatus,
   VariableCatalog,
@@ -67,7 +69,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    if (response.status === 401 && !path.startsWith('/api/auth/')) {
+    if (response.status === 401 && path !== '/api/auth/login' && path !== '/api/auth/status' && path !== '/api/auth/me') {
       window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
     }
     const message = `${data.error ?? `HTTP ${response.status}`}${data.requestId ? ` · 请求 ${data.requestId}` : ''}`;
@@ -96,10 +98,13 @@ export const api = {
 
   authStatus: () => request<AuthStatus>('/api/auth/status'),
   me: () => request<CurrentUser>('/api/auth/me'),
+  touchSession: () => request<{ status: string }>('/api/auth/touch', jsonInit('POST')),
   login: (body: LoginInput) => request<CurrentUser>('/api/auth/login', jsonInit('POST', body)),
   logout: () => request<{ status: string }>('/api/auth/logout', jsonInit('POST')),
   settings: () => request<SettingsOverview>('/api/settings'),
+  updateRuntimeSettings: (body: RuntimeSettingsInput) => request<SettingsOverview>('/api/settings/runtime', jsonInit('PUT', body)),
   changePassword: (body: ChangePasswordInput) => request<{ status: string }>('/api/settings/password', jsonInit('POST', body)),
+  networkCheck: () => request<NetworkCheckReport>('/api/settings/network-check', jsonInit('POST')),
   listProxies: () => request<ProxyProfile[]>('/api/settings/proxies'),
   createProxy: (body: ProxyProfileInput) => request<ProxyProfile>('/api/settings/proxies', jsonInit('POST', body)),
   updateProxy: (id: number, body: ProxyProfileInput) => request<ProxyProfile>(`/api/settings/proxies/${id}`, jsonInit('PUT', body)),
@@ -137,6 +142,8 @@ export const api = {
   deleteTemplate: (id: number) => request<void>(`/api/templates/${id}`, jsonInit('DELETE')),
   previewTemplate: (body: Partial<NotificationTemplateInput> & { eventId?: number }) =>
     request<{ subject: string; body: string }>('/api/templates/preview', jsonInit('POST', body)),
+  sendTemplatePreview: (body: { templateId: number; channelId: number; eventId?: number }) =>
+    request<NotificationAttempt>('/api/templates/send-preview', jsonInit('POST', body)),
 
   listEvents: () => request<EventRecord[]>('/api/events?limit=100'),
   listEventsPage: (query: HistoryQuery) => request<HistoryPage<EventRecord>>(withQuery('/api/events', query)),

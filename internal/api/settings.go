@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -15,16 +17,190 @@ import (
 	"github.com/watchbell/watchbell/internal/store"
 )
 
+var allowedSessionTimeoutHours = map[int]bool{1: true, 8: true, 24: true}
+var allowedHistoryRetentionDays = map[int]bool{30: true, 90: true, 180: true}
+
+type NetworkCheckItem struct {
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	DurationMS int64  `json:"durationMs"`
+	Detail     string `json:"detail"`
+}
+
+type NetworkCheckReport struct {
+	Status      string             `json:"status"`
+	GeneratedAt time.Time          `json:"generatedAt"`
+	Checks      []NetworkCheckItem `json:"checks"`
+}
+
 func (s *Server) settingsOverview(w http.ResponseWriter, r *http.Request) {
 	authEnabled := s.auth != nil && s.auth.Enabled()
 	username := ""
 	if authEnabled {
 		username = s.auth.Username()
 	}
+	settings, err := s.store.GetRuntimeSettings(r.Context(), s.effectiveRuntimeDefaults())
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"authEnabled": authEnabled,
-		"username":    username,
+		"authEnabled":          authEnabled,
+		"username":             username,
+		"sessionTimeoutHours":  durationHours(settings.SessionTTL),
+		"historyRetentionDays": commonRetentionDays(settings.HistoryRetention),
 	})
+}
+
+func (s *Server) updateRuntimeSettings(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		SessionTimeoutHours  int `json:"sessionTimeoutHours"`
+		HistoryRetentionDays int `json:"historyRetentionDays"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	current, err := s.store.GetRuntimeSettings(r.Context(), s.effectiveRuntimeDefaults())
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	fields := map[string]string{}
+	if !allowedSessionTimeoutHours[input.SessionTimeoutHours] && input.SessionTimeoutHours != durationHours(current.SessionTTL) {
+		fields["sessionTimeoutHours"] = "闲置会话过期时间必须是 1、8 或 24 小时。"
+	}
+	if !allowedHistoryRetentionDays[input.HistoryRetentionDays] && input.HistoryRetentionDays != commonRetentionDays(current.HistoryRetention) {
+		fields["historyRetentionDays"] = "活动保留期必须是 30、90 或 180 天。"
+	}
+	if len(fields) > 0 {
+		writeError(w, r, validationProblem("请修正运行时设置。", fields))
+		return
+	}
+	if input.SessionTimeoutHours > 0 {
+		current.SessionTTL = time.Duration(input.SessionTimeoutHours) * time.Hour
+	}
+	if input.HistoryRetentionDays > 0 {
+		retention := time.Duration(input.HistoryRetentionDays) * 24 * time.Hour
+		current.HistoryRetention.EventAge = retention
+		current.HistoryRetention.CheckRunAge = retention
+		current.HistoryRetention.NotificationAttemptAge = retention
+		current.HistoryRetention.AuditLogAge = retention
+	}
+	if err := s.store.SetRuntimeSettingsAudited(r.Context(), current, s.actor(r)); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	if s.auth != nil && s.auth.Enabled() {
+		if err := s.auth.SetSessionTTL(current.SessionTTL); err != nil {
+			writeError(w, r, err)
+			return
+		}
+		if err := s.auth.RefreshCurrentSession(w, r); err != nil {
+			writeError(w, r, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"authEnabled":          authEnabled(s.auth),
+		"username":             username(s.auth),
+		"sessionTimeoutHours":  input.SessionTimeoutHours,
+		"historyRetentionDays": input.HistoryRetentionDays,
+	})
+}
+
+func (s *Server) effectiveRuntimeDefaults() store.RuntimeSettings {
+	defaults := s.runtimeDefaults
+	if !s.runtimeDefaultsSet {
+		defaults.HistoryRetention = store.HistoryRetentionPolicy{
+			EventAge: 90 * 24 * time.Hour, CheckRunAge: 90 * 24 * time.Hour,
+			NotificationAttemptAge: 90 * 24 * time.Hour, AuditLogAge: 90 * 24 * time.Hour,
+			BatchSize: 500,
+		}
+	}
+	if defaults.SessionTTL <= 0 {
+		if s.auth != nil && s.auth.Enabled() && s.auth.SessionTTL() > 0 {
+			defaults.SessionTTL = s.auth.SessionTTL()
+		} else {
+			defaults.SessionTTL = 8 * time.Hour
+		}
+	}
+	return defaults
+}
+
+func durationHours(value time.Duration) int {
+	if value <= 0 || value%time.Hour != 0 {
+		return 0
+	}
+	return int(value / time.Hour)
+}
+
+func commonRetentionDays(policy store.HistoryRetentionPolicy) int {
+	value := policy.EventAge
+	if value <= 0 || value%(24*time.Hour) != 0 || policy.CheckRunAge != value ||
+		policy.NotificationAttemptAge != value || policy.AuditLogAge != value {
+		return 0
+	}
+	return int(value / (24 * time.Hour))
+}
+
+func authEnabled(manager *auth.Manager) bool { return manager != nil && manager.Enabled() }
+
+func username(manager *auth.Manager) string {
+	if manager == nil || !manager.Enabled() {
+		return ""
+	}
+	return manager.Username()
+}
+
+func (s *Server) networkSelfCheck(w http.ResponseWriter, r *http.Request) {
+	report := s.networkCheck(r.Context())
+	s.recordAudit(r.Context(), s.actor(r), "test", "network", nil, "执行网络自检", report)
+	writeJSON(w, http.StatusOK, report)
+}
+
+func runNetworkCheck(parent context.Context) NetworkCheckReport {
+	report := NetworkCheckReport{Status: "ok", GeneratedAt: time.Now().UTC(), Checks: make([]NetworkCheckItem, 0, 2)}
+	dnsStart := time.Now()
+	dnsCtx, cancelDNS := context.WithTimeout(parent, 5*time.Second)
+	addresses, dnsErr := net.DefaultResolver.LookupHost(dnsCtx, "example.com")
+	cancelDNS()
+	dnsItem := NetworkCheckItem{Name: "DNS", Status: "ok", DurationMS: time.Since(dnsStart).Milliseconds(), Detail: fmt.Sprintf("example.com 已解析到 %d 个地址", len(addresses))}
+	if dnsErr != nil {
+		dnsItem.Status = "failed"
+		dnsItem.Detail = dnsErr.Error()
+		report.Status = "degraded"
+	}
+	report.Checks = append(report.Checks, dnsItem)
+
+	httpsStart := time.Now()
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	transport.TLSHandshakeTimeout = 5 * time.Second
+	client := &http.Client{Transport: transport, Timeout: 8 * time.Second}
+	request, requestErr := http.NewRequestWithContext(parent, http.MethodGet, "https://example.com/", nil)
+	var response *http.Response
+	if requestErr == nil {
+		request.Header.Set("User-Agent", "WatchBell-Network-Check/1.0")
+		response, requestErr = client.Do(request)
+	}
+	httpsItem := NetworkCheckItem{Name: "HTTPS", Status: "ok", DurationMS: time.Since(httpsStart).Milliseconds(), Detail: "example.com TLS 与 HTTP 响应正常"}
+	if response != nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 32<<10))
+		_ = response.Body.Close()
+		if response.StatusCode >= http.StatusInternalServerError {
+			requestErr = fmt.Errorf("HTTPS 返回 %s", response.Status)
+		} else {
+			httpsItem.Detail = "example.com 返回 " + response.Status
+		}
+	}
+	transport.CloseIdleConnections()
+	if requestErr != nil {
+		httpsItem.Status = "failed"
+		httpsItem.Detail = requestErr.Error()
+		report.Status = "degraded"
+	}
+	report.Checks = append(report.Checks, httpsItem)
+	return report
 }
 
 func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {

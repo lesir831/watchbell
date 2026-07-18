@@ -20,24 +20,44 @@ import (
 	"github.com/watchbell/watchbell/internal/auth"
 	"github.com/watchbell/watchbell/internal/eventvars"
 	"github.com/watchbell/watchbell/internal/model"
+	"github.com/watchbell/watchbell/internal/notifier"
 	"github.com/watchbell/watchbell/internal/scheduler"
 	"github.com/watchbell/watchbell/internal/store"
 	"github.com/watchbell/watchbell/internal/templatex"
 )
 
 type Server struct {
-	store     *store.Store
-	scheduler *scheduler.Scheduler
-	webDir    string
-	logger    *slog.Logger
-	auth      *auth.Manager
+	store              *store.Store
+	scheduler          *scheduler.Scheduler
+	webDir             string
+	logger             *slog.Logger
+	auth               *auth.Manager
+	runtimeDefaults    store.RuntimeSettings
+	runtimeDefaultsSet bool
+	networkCheck       func(context.Context) NetworkCheckReport
 }
 
-func NewServer(store *store.Store, scheduler *scheduler.Scheduler, webDir string, logger *slog.Logger, authManager *auth.Manager) *Server {
+type ServerOption func(*Server)
+
+func WithRuntimeDefaults(defaults store.RuntimeSettings) ServerOption {
+	return func(server *Server) {
+		server.runtimeDefaults = defaults
+		server.runtimeDefaultsSet = true
+	}
+}
+
+func NewServer(store *store.Store, scheduler *scheduler.Scheduler, webDir string, logger *slog.Logger, authManager *auth.Manager, options ...ServerOption) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{store: store, scheduler: scheduler, webDir: webDir, logger: logger, auth: authManager}
+	server := &Server{store: store, scheduler: scheduler, webDir: webDir, logger: logger, auth: authManager}
+	for _, option := range options {
+		option(server)
+	}
+	if server.networkCheck == nil {
+		server.networkCheck = runNetworkCheck
+	}
+	return server
 }
 
 func (s *Server) Routes() http.Handler {
@@ -83,8 +103,11 @@ func (s *Server) Routes() http.Handler {
 
 func (s *Server) privateRoutes(r chi.Router) {
 	r.Get("/auth/me", s.authMe)
+	r.Post("/auth/touch", s.authTouch)
 	r.Get("/settings", s.settingsOverview)
+	r.Put("/settings/runtime", s.updateRuntimeSettings)
 	r.Post("/settings/password", s.changePassword)
+	r.Post("/settings/network-check", s.networkSelfCheck)
 	r.Get("/settings/proxies", s.listProxyProfiles)
 	r.Post("/settings/proxies", s.createProxyProfile)
 	r.Put("/settings/proxies/{id}", s.updateProxyProfile)
@@ -122,6 +145,7 @@ func (s *Server) privateRoutes(r chi.Router) {
 	r.Put("/templates/{id}", s.updateNotificationTemplate)
 	r.Delete("/templates/{id}", s.deleteNotificationTemplate)
 	r.Post("/templates/preview", s.previewTemplate)
+	r.Post("/templates/send-preview", s.sendTemplatePreview)
 
 	r.Get("/events", s.listEvents)
 	r.Get("/events/{id}/variables", s.eventVariables)
@@ -214,6 +238,18 @@ func (s *Server) authMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"username": username})
+}
+
+func (s *Server) authTouch(w http.ResponseWriter, r *http.Request) {
+	if s.auth == nil || !s.auth.Enabled() {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "auth_disabled"})
+		return
+	}
+	if err := s.auth.RefreshCurrentSession(w, r); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "session_refreshed"})
 }
 
 func (s *Server) listMonitors(w http.ResponseWriter, r *http.Request) {
@@ -574,34 +610,104 @@ func (s *Server) previewTemplate(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
-	if input.EventID != nil {
-		if *input.EventID <= 0 {
-			writeError(w, r, validationProblem("预览事件无效。", map[string]string{"eventId": "必须是正整数。"}))
-			return
-		}
-		event, err := s.store.GetEvent(r.Context(), *input.EventID)
-		if err != nil {
-			writeError(w, r, err)
-			return
-		}
-		monitor, err := s.store.GetMonitorIncludingArchived(r.Context(), event.MonitorID)
-		if err != nil {
-			writeError(w, r, err)
-			return
-		}
-		var payload map[string]any
-		if err := json.Unmarshal(event.Payload, &payload); err != nil {
-			writeError(w, r, err)
-			return
-		}
-		input.Data = templatePreviewData(monitor, event, payload)
-	} else if input.Data == nil {
-		input.Data = sampleTemplateData()
+	data, _, _, err := s.templateRenderData(r.Context(), input.EventID, input.Data)
+	if err != nil {
+		writeError(w, r, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"subject": templatex.Render(input.SubjectTemplate, input.Data),
-		"body":    templatex.Render(input.BodyTemplate, input.Data),
+		"subject": templatex.Render(input.SubjectTemplate, data),
+		"body":    templatex.Render(input.BodyTemplate, data),
 	})
+}
+
+func (s *Server) sendTemplatePreview(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		TemplateID int64  `json:"templateId"`
+		EventID    *int64 `json:"eventId"`
+		ChannelID  int64  `json:"channelId"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	fields := map[string]string{}
+	if input.TemplateID <= 0 {
+		fields["templateId"] = "请选择通知模板。"
+	}
+	if input.ChannelID <= 0 {
+		fields["channelId"] = "请选择发送渠道。"
+	}
+	if input.EventID != nil && *input.EventID <= 0 {
+		fields["eventId"] = "预览事件必须是正整数。"
+	}
+	if len(fields) > 0 {
+		writeError(w, r, validationProblem("请修正发送预览设置。", fields))
+		return
+	}
+	template, err := s.store.GetNotificationTemplate(r.Context(), input.TemplateID)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	data, monitorID, eventID, err := s.templateRenderData(r.Context(), input.EventID, nil)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	message := notifier.Message{
+		Subject: templatex.Render(template.SubjectTemplate, data),
+		Body:    templatex.Render(template.BodyTemplate, data),
+		Data:    data,
+	}
+	attempt, sendErr := s.scheduler.SendPreview(r.Context(), input.ChannelID, message, monitorID, eventID)
+	if attempt.ID > 0 {
+		s.recordAudit(r.Context(), s.actor(r), "test", "template", &template.ID, "发送模板预览 · "+template.Name, map[string]any{
+			"attemptId": attempt.ID, "channelId": input.ChannelID, "eventId": input.EventID, "status": attempt.Status,
+		})
+	}
+	if sendErr != nil {
+		status := http.StatusInternalServerError
+		code := "template_preview_send_failed"
+		if errors.Is(sendErr, scheduler.ErrChannelDisabled) {
+			status = http.StatusUnprocessableEntity
+			code = "channel_disabled"
+		} else if store.IsNotFound(sendErr) || errors.Is(sendErr, sql.ErrNoRows) {
+			status = http.StatusNotFound
+			code = "channel_not_found"
+		} else if attempt.ID > 0 {
+			status = http.StatusBadGateway
+		}
+		writeJSON(w, status, errorPayload(r, sendErr, code, map[string]string{}, map[string]any{"attempt": attempt}))
+		return
+	}
+	writeJSON(w, http.StatusOK, attempt)
+}
+
+func (s *Server) templateRenderData(ctx context.Context, eventID *int64, supplied map[string]any) (map[string]any, *int64, *int64, error) {
+	if eventID == nil {
+		if supplied == nil {
+			supplied = sampleTemplateData()
+		}
+		return supplied, nil, nil, nil
+	}
+	if *eventID <= 0 {
+		return nil, nil, nil, validationProblem("预览事件无效。", map[string]string{"eventId": "必须是正整数。"})
+	}
+	event, err := s.store.GetEvent(ctx, *eventID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	monitor, err := s.store.GetMonitorIncludingArchived(ctx, event.MonitorID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return nil, nil, nil, err
+	}
+	monitorID := monitor.ID
+	resolvedEventID := event.ID
+	return templatePreviewData(monitor, event, payload), &monitorID, &resolvedEventID, nil
 }
 
 func templatePreviewData(monitor model.Monitor, event model.Event, payload map[string]any) map[string]any {

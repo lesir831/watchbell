@@ -1,13 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Alert,
   App as AntApp,
   Button,
-  Card,
   Col,
   Drawer,
   Form,
-  Grid,
   Input,
   InputNumber,
   Popconfirm,
@@ -15,18 +13,14 @@ import {
   Select,
   Space,
   Switch,
-  Table,
-  Tag,
-  Typography
+  Tag
 } from 'antd';
-import { DeleteOutlined, EditOutlined, LockOutlined, PlusOutlined } from '@ant-design/icons';
+import { ArrowRightOutlined, CheckCircleOutlined, CloseCircleOutlined, DeleteOutlined, EditOutlined, LockOutlined, PlusOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { FormInstance } from 'antd';
 import { api, APIError } from '../api';
-import { EmptyState, PageError, relativeDate } from '../components/Common';
-import type { ChangePasswordInput, ProxyProfile, ProxyProfileInput, ProxyType } from '../types';
-
-const { Text, Title } = Typography;
+import { PageError, PageHeader, relativeDate } from '../components/Common';
+import type { ChangePasswordInput, ProxyProfile, ProxyProfileInput, ProxyType, RuntimeSettingsInput } from '../types';
 
 const proxyTypeLabels: Record<ProxyType, string> = {
   http: 'HTTP',
@@ -34,23 +28,53 @@ const proxyTypeLabels: Record<ProxyType, string> = {
   socks5: 'SOCKS5'
 };
 
-export default function SettingsPage(props: { authEnabled: boolean; username: string }) {
-  const mobile = !Grid.useBreakpoint().md;
+export default function SettingsPage(props: { authEnabled: boolean; username: string; onNavigate: (page: string) => void }) {
   const queryClient = useQueryClient();
   const { message } = AntApp.useApp();
   const [passwordForm] = Form.useForm<ChangePasswordInput>();
   const [proxyForm] = Form.useForm<ProxyProfileInput>();
   const [editing, setEditing] = useState<ProxyProfile | null>(null);
   const [proxyDrawerOpen, setProxyDrawerOpen] = useState(false);
+  const [passwordExpanded, setPasswordExpanded] = useState(false);
+  const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettingsInput>({ sessionTimeoutHours: 8, historyRetentionDays: 90 });
   const overview = useQuery({ queryKey: ['settings'], queryFn: api.settings });
   const proxies = useQuery({ queryKey: ['proxies'], queryFn: api.listProxies });
   const authEnabled = overview.data?.authEnabled ?? props.authEnabled;
   const username = overview.data?.username ?? props.username;
 
+  useEffect(() => {
+    if (!overview.data) return;
+    setRuntimeSettings({
+      sessionTimeoutHours: overview.data.sessionTimeoutHours,
+      historyRetentionDays: overview.data.historyRetentionDays
+    });
+  }, [overview.data]);
+
+  const saveRuntimeSettings = useMutation({
+    mutationFn: api.updateRuntimeSettings,
+    onSuccess: async (saved) => {
+      queryClient.setQueryData(['settings'], saved);
+      setRuntimeSettings({ sessionTimeoutHours: saved.sessionTimeoutHours, historyRetentionDays: saved.historyRetentionDays });
+      await queryClient.invalidateQueries({ queryKey: ['auditLogs'] });
+      message.success('运行与安全设置已保存');
+    },
+    onError: (error: Error) => message.error(error.message)
+  });
+  const networkCheck = useMutation({
+    mutationFn: api.networkCheck,
+    onSuccess: async (report) => {
+      await queryClient.invalidateQueries({ queryKey: ['auditLogs'] });
+      if (report.status === 'ok') message.success('DNS 与 HTTPS 连接均正常');
+      else message.warning('网络自检发现异常，请查看检查结果');
+    },
+    onError: (error: Error) => message.error(error.message)
+  });
+
   const passwordMutation = useMutation({
     mutationFn: api.changePassword,
     onSuccess: async (_, variables) => {
       passwordForm.resetFields();
+      setPasswordExpanded(false);
       scrubPasswordInput(variables);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['authMe'] }),
@@ -116,14 +140,46 @@ export default function SettingsPage(props: { authEnabled: boolean; username: st
   );
 
   return (
-    <Space direction="vertical" size={16} className="full-width">
+    <div className="design-page">
+      <PageHeader
+        eyebrow="实例配置"
+        title="设置"
+        description="管理当前私有实例的调度、数据保留、安全会话与出站网络。"
+        actions={<Space><Button icon={<ReloadOutlined />} onClick={() => { overview.refetch(); proxies.refetch(); }}>刷新</Button><Button className="design-dark" icon={<SaveOutlined />} loading={saveRuntimeSettings.isPending} disabled={!validRuntimeSettings(runtimeSettings, overview.data)} onClick={() => saveRuntimeSettings.mutate(runtimeSettings)}>保存设置</Button></Space>}
+      />
       <PageError error={(overview.error || proxies.error) as Error | null} onRetry={() => { overview.refetch(); proxies.refetch(); }} />
-      <Row gutter={[16, 16]}>
-        <Col xs={24} xl={10}>
-          <Card title={<Space><LockOutlined />账户安全</Space>} className="settings-card">
+      <div className="settings-grid">
+        <div className="settings-stack">
+          <section className="settings-panel">
+            <header><h2>运行与保留</h2><p>运行策略由当前部署环境与内置队列共同管理。</p></header>
+            <div className="setting-row"><div className="setting-copy"><strong>时区</strong><span>活动时间、摘要周期和计划任务使用浏览器与部署环境时区显示。</span></div><span className="setting-value">{Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'}</span></div>
+            <div className="setting-row"><div className="setting-copy"><strong>活动保留期</strong><span>超过期限的检查快照、事件、投递记录和审计日志会自动清理。</span></div><Select className="settings-select" aria-label="活动保留期" value={runtimeSettings.historyRetentionDays || undefined} placeholder="选择保留期" options={historyRetentionOptions(runtimeSettings.historyRetentionDays)} onChange={(historyRetentionDays) => setRuntimeSettings((current) => ({ ...current, historyRetentionDays }))} /></div>
+            <div className="setting-row"><div className="setting-copy"><strong>失败通知自动重试</strong><span>发送队列使用退避策略重新投递，达到上限后进入死信队列。</span></div><Switch checked disabled aria-label="失败通知自动重试已启用" /></div>
+          </section>
+
+          <section className="settings-panel">
+            <header className="settings-panel-action"><div><h2>出站网络</h2><p>监控可单独选择代理；未选择时使用部署环境网络。</p></div><Button icon={<PlusOutlined />} onClick={openNewProxy}>添加代理</Button></header>
+            <div className="setting-row"><div className="setting-copy"><strong>默认网络</strong><span>未指定代理的监控沿用 HTTP_PROXY / HTTPS_PROXY 等部署设置。</span></div><span className="status-chip standalone"><span className="status-dot" />可用</span></div>
+            <div className="setting-row"><div className="setting-copy"><strong>网络自检</strong><span>使用实例的默认出站网络测试 example.com 的 DNS 解析与 HTTPS 连接。</span></div><Button icon={<ReloadOutlined />} loading={networkCheck.isPending} onClick={() => networkCheck.mutate()}>开始检查</Button></div>
+            {networkCheck.data && <div className={`network-check-report ${networkCheck.data.status}`}>
+              {networkCheck.data.checks.map((check) => <div key={check.name} className={check.status}><span>{check.status === 'ok' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}{check.name}</span><strong>{check.detail}</strong><small>{check.durationMs} ms</small></div>)}
+            </div>}
+            {(proxies.data ?? []).map((item) => <div key={item.id} className="setting-row proxy-setting-row">
+              <div className="setting-copy"><strong>{item.name}</strong><span>{proxyTypeLabels[item.type]} · {proxyAddress(item)} · 更新于 {relativeDate(item.updatedAt)}</span></div>
+              <div className="setting-actions"><Tag>{proxyTypeLabels[item.type]}</Tag>{proxyActions(item)}</div>
+            </div>)}
+            {!proxies.data?.length && !proxies.isLoading && <div className="setting-empty">尚未配置代理；所有监控使用部署环境的默认网络。</div>}
+          </section>
+        </div>
+
+        <div className="settings-stack">
+          <section className="settings-panel">
+            <header><h2>账户与安全</h2><p>当前实例为单用户模式。</p></header>
+            <div className="setting-row"><div className="setting-copy"><strong>管理员账户</strong><span>{username || 'admin'} · 当前会话已签名</span></div><Button icon={<LockOutlined />} disabled={!authEnabled} onClick={() => setPasswordExpanded((value) => !value)}>{passwordExpanded ? '收起' : '修改密码'}</Button></div>
+            <div className="setting-row"><div className="setting-copy"><strong>闲置会话过期</strong><span>每次已认证操作会刷新闲置计时；超时后需要重新登录。</span></div><Select className="settings-select" aria-label="闲置会话过期时间" disabled={!authEnabled} value={runtimeSettings.sessionTimeoutHours || undefined} placeholder="选择过期时间" options={sessionTimeoutOptions(runtimeSettings.sessionTimeoutHours)} onChange={(sessionTimeoutHours) => setRuntimeSettings((current) => ({ ...current, sessionTimeoutHours }))} /></div>
             {authEnabled ? (
-              <>
-                <Alert className="form-intro" type="info" showIcon message={`当前管理员：${username}`} description="修改后，除当前浏览器外的既有登录会话会立即失效。新密码保存在 WatchBell 数据库中，并优先于启动环境变量。" />
+              passwordExpanded && <div className="settings-form">
+                <Alert className="form-intro" type="info" showIcon message={`当前管理员：${username}`} description="修改后，除当前浏览器外的既有登录会话会立即失效。" />
                 <Form<ChangePasswordInput> form={passwordForm} layout="vertical" requiredMark="optional" onFinish={(values) => passwordMutation.mutate(values)}>
                   <Form.Item name="currentPassword" label="当前密码" rules={[{ required: true, message: '请输入当前密码' }]}>
                     <Input.Password autoComplete="current-password" />
@@ -139,38 +195,23 @@ export default function SettingsPage(props: { authEnabled: boolean; username: st
                   </Form.Item>
                   <Button type="primary" htmlType="submit" loading={passwordMutation.isPending}>修改密码</Button>
                 </Form>
-              </>
+              </div>
             ) : (
               <Alert type="warning" showIcon message="身份认证已关闭" description="当前实例通过 WATCHBELL_AUTH_DISABLED 关闭了登录认证，因此不能在网页中修改密码。" />
             )}
-          </Card>
-        </Col>
-        <Col xs={24} xl={14}>
-          <Card title="网络代理" className="settings-card" extra={<Button type="primary" icon={<PlusOutlined />} onClick={openNewProxy}>添加代理</Button>}>
-            <Alert className="form-intro" type="info" showIcon message="代理按监控启用" description="保存代理后，在监控编辑页选择它。未选择时使用部署环境的默认网络设置（可能包含 HTTP_PROXY / HTTPS_PROXY）；已选代理不可用时检查会失败，不会绕过它。" />
-            {!proxies.data?.length && !proxies.isLoading ? (
-              <EmptyState title="还没有代理配置" description="添加 HTTP、HTTPS 或 SOCKS5 代理，然后为需要的监控单独启用。" action={<Button type="primary" onClick={openNewProxy}>添加第一个代理</Button>} />
-            ) : mobile ? (
-              <div className="mobile-card-list">{(proxies.data ?? []).map((item) => (
-                <Card key={item.id} size="small" className="entity-card">
-                  <div className="entity-card-head"><div><Title level={5}>{item.name}</Title><Text type="secondary">{proxyAddress(item)}</Text></div><Tag>{proxyTypeLabels[item.type]}</Tag></div>
-                  <div className="tag-row">{item.username && <Tag>用户 {item.username}</Tag>}{item.configuredSecrets?.includes('password') && <Tag color="green">密码已配置</Tag>}</div>
-                  <div className="entity-actions">{proxyActions(item)}</div>
-                </Card>
-              ))}</div>
-            ) : (
-              <Table<ProxyProfile> rowKey="id" loading={proxies.isLoading} dataSource={proxies.data ?? []} pagination={false} scroll={{ x: 720 }} columns={[
-                { title: '名称', dataIndex: 'name' },
-                { title: '类型', dataIndex: 'type', width: 100, render: (value: ProxyType) => <Tag>{proxyTypeLabels[value]}</Tag> },
-                { title: '地址', render: (_, item) => <Text code>{proxyAddress(item)}</Text> },
-                { title: '认证', width: 120, render: (_, item) => item.username ? <Tag color={item.configuredSecrets?.includes('password') ? 'green' : 'default'}>{item.configuredSecrets?.includes('password') ? '用户 + 密码' : '仅用户名'}</Tag> : <Text type="secondary">无</Text> },
-                { title: '最近更新', dataIndex: 'updatedAt', width: 120, render: relativeDate },
-                { title: '操作', width: 180, render: (_, item) => proxyActions(item) }
-              ]} />
-            )}
-          </Card>
-        </Col>
-      </Row>
+          </section>
+
+          <section className="settings-panel">
+            <header><h2>配置迁移</h2><p>配置备份、诊断包和导入报告集中在活动与诊断页面。</p></header>
+            <div className="setting-row"><div className="setting-copy"><strong>导出或导入配置</strong><span>支持脱敏备份、完整备份和合并导入，不会删除现有数据。</span></div><Button onClick={() => props.onNavigate('activity')}>打开诊断<ArrowRightOutlined /></Button></div>
+          </section>
+
+          <section className="settings-panel danger-zone">
+            <header><h2>安全边界</h2><p>敏感字段不会通过 API 回显。</p></header>
+            <div className="setting-row"><div className="setting-copy"><strong>密钥与密码</strong><span>设备密钥、SMTP 密码、代理密码和签名密钥只保存在服务器端。</span></div><LockOutlined className="setting-lock" /></div>
+          </section>
+        </div>
+      </div>
       <ProxyDrawer
         open={proxyDrawerOpen}
         record={editing}
@@ -180,7 +221,7 @@ export default function SettingsPage(props: { authEnabled: boolean; username: st
         onClose={() => { proxyForm.resetFields(); setProxyDrawerOpen(false); setEditing(null); saveProxy.reset(); }}
         onSave={(input) => saveProxy.mutate({ id: editing?.id, input })}
       />
-    </Space>
+    </div>
   );
 }
 
@@ -234,6 +275,36 @@ function ProxyDrawer(props: { open: boolean; record: ProxyProfile | null; form: 
 function proxyAddress(item: Pick<ProxyProfile, 'host' | 'port'>) {
   const host = item.host.includes(':') ? `[${item.host}]` : item.host;
   return `${host}:${item.port}`;
+}
+
+function sessionTimeoutOptions(current: number) {
+  const options = [
+    { value: 1, label: '1 小时' },
+    { value: 8, label: '8 小时' },
+    { value: 24, label: '24 小时' }
+  ];
+  if (current > 0 && !options.some((option) => option.value === current)) {
+    options.push({ value: current, label: `${current} 小时（部署值）` });
+  }
+  return options;
+}
+
+function historyRetentionOptions(current: number) {
+  const options = [
+    { value: 30, label: '30 天' },
+    { value: 90, label: '90 天' },
+    { value: 180, label: '180 天' }
+  ];
+  if (current > 0 && !options.some((option) => option.value === current)) {
+    options.push({ value: current, label: `${current} 天（部署值）` });
+  }
+  return options;
+}
+
+function validRuntimeSettings(settings: RuntimeSettingsInput, current?: RuntimeSettingsInput) {
+  const sessionValid = [1, 8, 24].includes(settings.sessionTimeoutHours) || settings.sessionTimeoutHours === current?.sessionTimeoutHours;
+  const historyValid = [30, 90, 180].includes(settings.historyRetentionDays) || settings.historyRetentionDays === current?.historyRetentionDays;
+  return sessionValid && historyValid;
 }
 
 function scrubPasswordInput(input: ChangePasswordInput) {

@@ -3,7 +3,7 @@ import { Alert, App as AntApp, Button, Card, Drawer, Form, Input, InputNumber, P
 import { CopyOutlined, DownloadOutlined, ReloadOutlined, SearchOutlined, UploadOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
-import { formatDate, formatDuration, jsonText, PageError, relativeDate, StatusTag } from '../components/Common';
+import { formatDate, formatDuration, jsonText, PageError, PageHeader, relativeDate, StatusTag } from '../components/Common';
 import type { AuditLog, CheckRun, ConfigBackup, DeadLetter, EventRecord, HistoryPage, HistoryQuery, NotificationAttempt, RuleEvaluation } from '../types';
 
 const { Text } = Typography;
@@ -13,6 +13,7 @@ type HistoryTab = 'runs' | 'events' | 'evaluations' | 'attempts' | 'audit';
 type PageState = { page: number; pageSize: number };
 type FilterValues = Omit<HistoryQuery, 'page' | 'pageSize'>;
 type PageMeta = Pick<HistoryPage<unknown>, 'page' | 'pageSize' | 'total'>;
+type ActivityKind = 'all' | 'check' | 'event' | 'notification';
 
 const historyTabs: HistoryTab[] = ['runs', 'events', 'evaluations', 'attempts', 'audit'];
 
@@ -25,6 +26,8 @@ export default function ActivityPage() {
   const queryClient = useQueryClient();
   const [detail, setDetail] = useState<DetailItem>(null);
   const [activeTab, setActiveTab] = useState('runs');
+  const [activityKind, setActivityKind] = useState<ActivityKind>('all');
+  const [activitySearch, setActivitySearch] = useState('');
   const [filterForm] = Form.useForm<FilterValues>();
   const [paging, setPaging] = useState(() => initialRecord<PageState>(() => ({ page: 1, pageSize: 15 })));
   const [filters, setFilters] = useState(() => initialRecord<FilterValues>(() => ({})));
@@ -34,17 +37,22 @@ export default function ActivityPage() {
   const evaluationsQuery = { ...paging.evaluations, ...filters.evaluations };
   const attemptsQuery = { ...paging.attempts, ...filters.attempts };
   const auditQuery = { ...paging.audit, ...filters.audit };
-  const runs = useQuery({ queryKey: ['checkRuns', 'page', runsQuery], queryFn: () => api.listCheckRunsPage(runsQuery), enabled: activeTab === 'runs', refetchInterval: 15_000, placeholderData: (previous) => previous });
-  const events = useQuery({ queryKey: ['events', 'page', eventsQuery], queryFn: () => api.listEventsPage(eventsQuery), enabled: activeTab === 'events', refetchInterval: 15_000, placeholderData: (previous) => previous });
+  const runs = useQuery({ queryKey: ['checkRuns', 'page', runsQuery], queryFn: () => api.listCheckRunsPage(runsQuery), refetchInterval: 15_000, placeholderData: (previous) => previous });
+  const events = useQuery({ queryKey: ['events', 'page', eventsQuery], queryFn: () => api.listEventsPage(eventsQuery), refetchInterval: 15_000, placeholderData: (previous) => previous });
   const evaluations = useQuery({ queryKey: ['ruleEvaluations', 'page', evaluationsQuery], queryFn: () => api.listRuleEvaluationsPage(evaluationsQuery), enabled: activeTab === 'evaluations', refetchInterval: 15_000, placeholderData: (previous) => previous });
-  const attempts = useQuery({ queryKey: ['notificationAttempts', 'page', attemptsQuery], queryFn: () => api.listNotificationAttemptsPage(attemptsQuery), enabled: activeTab === 'attempts', refetchInterval: 15_000, placeholderData: (previous) => previous });
+  const attempts = useQuery({ queryKey: ['notificationAttempts', 'page', attemptsQuery], queryFn: () => api.listNotificationAttemptsPage(attemptsQuery), refetchInterval: 15_000, placeholderData: (previous) => previous });
   const audits = useQuery({ queryKey: ['auditLogs', 'page', auditQuery], queryFn: () => api.listAuditLogsPage(auditQuery), enabled: activeTab === 'audit', refetchInterval: 20_000, placeholderData: (previous) => previous });
-  const system = useQuery({ queryKey: ['systemStatus'], queryFn: api.systemStatus, enabled: activeTab === 'system', refetchInterval: 30_000 });
+  const system = useQuery({ queryKey: ['systemStatus'], queryFn: api.systemStatus, refetchInterval: 30_000 });
   const monitorByID = useMemo(() => new Map((monitors.data ?? []).map((item) => [item.id, item.name])), [monitors.data]);
   const retryMutation = useMutation({
     mutationFn: api.retryNotificationAttempt,
     onSuccess: async (item) => { await queryClient.invalidateQueries({ queryKey: ['notificationAttempts'] }); message.success(item.status === 'sent' ? '重试发送成功' : '已记录新的失败尝试'); },
     onError: async (error: Error) => { await queryClient.invalidateQueries({ queryKey: ['notificationAttempts'] }); message.error(error.message); }
+  });
+  const diagnostics = useMutation({
+    mutationFn: api.diagnostics,
+    onSuccess: (data) => downloadJSON(data, `watchbell-diagnostics-${new Date().toISOString().slice(0, 10)}.json`),
+    onError: (error: Error) => message.error(error.message)
   });
 
   const changePage = (key: HistoryTab, page: number, pageSize: number) => setPaging((current) => ({ ...current, [key]: { page, pageSize } }));
@@ -68,11 +76,58 @@ export default function ActivityPage() {
     setPaging((current) => ({ ...current, [key]: { ...current[key], page: 1 } }));
   };
   const loadingError = activeTab === 'runs' ? runs.error : activeTab === 'events' ? events.error : activeTab === 'evaluations' ? evaluations.error : activeTab === 'attempts' ? attempts.error : activeTab === 'audit' ? audits.error : system.error;
+  const timelineItems = useMemo(() => {
+    const items = [
+      ...(runs.data?.items ?? []).map((item) => ({ id: `run-${item.id}`, kind: 'check' as const, time: item.finishedAt || item.startedAt, tone: item.status === 'error' ? 'danger' : item.status === 'warning' ? 'warning' : 'success', title: `${item.status === 'error' ? '检查失败' : item.status === 'warning' ? '检查警告' : '检查完成'} · ${item.monitorName}`, description: item.error || item.message || `未发现新事件，耗时 ${formatDuration(item.durationMs)}。`, search: item.monitorName })),
+      ...(events.data?.items ?? []).map((item) => ({ id: `event-${item.id}`, kind: 'event' as const, time: item.createdAt, tone: 'success', title: `新事件 · ${monitorByID.get(item.monitorId) ?? `监控 #${item.monitorId}`}`, description: `${item.type} · ${eventSummary(item.payload)}`, search: monitorByID.get(item.monitorId) ?? '' })),
+      ...(attempts.data?.items ?? []).map((item) => ({ id: `attempt-${item.id}`, kind: 'notification' as const, time: item.sentAt || item.createdAt, tone: item.status === 'sent' ? 'success' : 'danger', title: `${item.status === 'sent' ? '通知已送达' : '通知发送失败'} · ${item.channelName}`, description: item.error || item.subject || `${item.kind} 通知`, search: `${item.channelName} ${item.monitorId ? monitorByID.get(item.monitorId) ?? '' : ''}` }))
+    ];
+    const normalized = activitySearch.trim().toLowerCase();
+    return items
+      .filter((item) => (activityKind === 'all' || item.kind === activityKind) && `${item.title} ${item.description} ${item.search}`.toLowerCase().includes(normalized))
+      .sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime())
+      .slice(0, 20);
+  }, [activityKind, activitySearch, attempts.data, events.data, monitorByID, runs.data]);
   return (
-    <Space direction="vertical" size={16} className="full-width">
+    <div className="design-page">
+      <PageHeader
+        eyebrow="完整活动链路"
+        title="活动与诊断"
+        description="从信号到通知，每一步都可追溯；异常记录优先提供可行动的上下文。"
+        actions={<Button icon={<DownloadOutlined />} loading={diagnostics.isPending} onClick={() => diagnostics.mutate()}>导出诊断</Button>}
+      />
       <PageError error={loadingError as Error | null} onRetry={() => { runs.refetch(); events.refetch(); evaluations.refetch(); attempts.refetch(); audits.refetch(); }} />
-      {historyTabs.includes(activeTab as HistoryTab) && <HistoryFilters tab={activeTab as HistoryTab} form={filterForm} monitors={monitors.data ?? []} onApply={applyFilters} onClear={clearFilters} />}
-      <Card className="activity-shell" bordered={false}>
+      <div className="design-toolbar">
+        <div className="filter-group" role="group" aria-label="活动筛选">
+          {[['all', '全部'], ['check', '检查'], ['event', '事件'], ['notification', '通知']].map(([value, label]) => <button key={value} type="button" className={`filter-button ${activityKind === value ? 'active' : ''}`} onClick={() => setActivityKind(value as ActivityKind)}>{label}</button>)}
+        </div>
+        <label className="search-box"><SearchOutlined /><span className="sr-only">筛选监控名称</span><input type="search" placeholder="筛选监控名称" value={activitySearch} onChange={(event) => setActivitySearch(event.target.value)} /></label>
+      </div>
+      <div className="activity-layout">
+        <section className="activity-panel">
+          <div className="panel-head"><div><h2>实时活动流</h2><span>最新事件显示在顶部</span></div><span className="live-chip"><i />持续更新</span></div>
+          <div className="timeline">
+            {timelineItems.length ? timelineItems.map((item) => <div key={item.id} className="timeline-item">
+              <time>{activityTime(item.time)}</time><span className={`timeline-rail tone-${item.tone}`}><i /></span><div className="timeline-card"><strong>{item.title}</strong><p>{item.description}</p></div>
+            </div>) : <div className="timeline-empty">没有符合当前筛选条件的活动。</div>}
+          </div>
+        </section>
+        <aside className="health-panel">
+          <div className="panel-head"><div><h2>系统健康</h2><span>最近一次采样</span></div></div>
+          <div className="health-list">
+            <div><span>数据库</span><strong><i className={system.data?.database === 'ok' ? 'ok' : 'danger'} />{system.data?.database === 'ok' ? '正常' : '异常'}</strong></div>
+            <div><span>调度器</span><strong><i className={system.data?.scheduler.lastTickAt ? 'ok' : 'warning'} />{system.data?.scheduler.lastTickAt ? '运行中' : '等待心跳'}</strong></div>
+            <div><span>检查队列</span><strong className="number">{system.data?.scheduler.inFlight ?? 0} 执行中</strong></div>
+            <div><span>通知队列</span><strong className="number">{system.data?.outbox.pending ?? 0} 等待</strong></div>
+            <div><span>工作线程</span><strong className="number">{system.data?.scheduler.workerCount ?? 0}</strong></div>
+          </div>
+          <div className="health-note">真实数值来自系统状态接口，并每 30 秒自动更新。</div>
+        </aside>
+      </div>
+      <section className="records-panel">
+        <div className="records-heading"><div><h2>完整记录</h2><span>筛选、分页并检查每一步的原始数据</span></div></div>
+        {historyTabs.includes(activeTab as HistoryTab) && <HistoryFilters tab={activeTab as HistoryTab} form={filterForm} monitors={monitors.data ?? []} onApply={applyFilters} onClear={clearFilters} />}
+        <Card className="activity-shell" variant="borderless">
         <Tabs
           activeKey={activeTab}
           onChange={selectTab}
@@ -85,13 +140,18 @@ export default function ActivityPage() {
             { key: 'system', label: '系统诊断', children: <SystemPanel data={system.data} loading={system.isLoading} error={system.error as Error | null} onRefresh={() => system.refetch()} /> }
           ]}
         />
-      </Card>
+        </Card>
+      </section>
       <Drawer title={detail?.title} open={detail !== null} onClose={() => setDetail(null)} width={680}>
         <Button icon={<CopyOutlined />} onClick={() => { navigator.clipboard.writeText(jsonText(detail?.data)); message.success('详情已复制'); }}>复制 JSON</Button>
         <pre className="detail-json">{jsonText(detail?.data)}</pre>
       </Drawer>
-    </Space>
+    </div>
   );
+}
+
+function activityTime(value: string) {
+  return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(value));
 }
 
 function HistoryFilters({ tab, form, monitors, onApply, onClear }: { tab: HistoryTab; form: ReturnType<typeof Form.useForm<FilterValues>>[0]; monitors: Array<{ id: number; name: string }>; onApply: () => void; onClear: () => void }) {
