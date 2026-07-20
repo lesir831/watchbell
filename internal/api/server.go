@@ -442,6 +442,9 @@ func (s *Server) createNotifyChannel(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
+	// clearSecret is an update-only command and must never be persisted as
+	// provider configuration if a client includes it during creation.
+	input.Config = stripSecretControlConfig(input.Config)
 	if err := validateChannelInput(input); err != nil {
 		writeError(w, r, err)
 		return
@@ -476,6 +479,10 @@ func (s *Server) updateNotifyChannel(w http.ResponseWriter, r *http.Request) {
 	if existing.Type == input.Type {
 		input.Config = mergeSecretConfig(existing.Config, input.Config, channelSecretKeys(input.Type))
 	}
+	// Also strip update commands when a caller changes the channel type and no
+	// same-type secret merge runs. UI clients disable type changes, but the API
+	// must not rely on that to keep control fields out of provider config.
+	input.Config = stripSecretControlConfig(input.Config)
 	if err := validateChannelInput(input); err != nil {
 		writeError(w, r, err)
 		return

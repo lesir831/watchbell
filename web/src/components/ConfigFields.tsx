@@ -5,15 +5,20 @@ import type { PluginConfigField } from '../types';
 const { Text } = Typography;
 
 export default function ConfigFields({ fields, configuredSecrets = [] }: { fields: PluginConfigField[]; configuredSecrets?: string[] }) {
+  const config = Form.useWatch<Record<string, unknown>>('config') ?? {};
   return (
     <>
-      {fields.map((field) => {
+      {fields.filter((field) => isVisible(field, config, configuredSecrets)).map((field) => {
         const configured = configuredSecrets.includes(field.key);
         const rules = [
           ...(field.required && !configured ? [{ required: true, message: `请填写${field.label}` }] : []),
-          ...(field.type === 'json' ? [{ validator: (_: unknown, value: unknown) => (
-            (configured && (value == null || value === '')) || (value !== null && typeof value === 'object' && !Array.isArray(value))
-          ) ? Promise.resolve() : Promise.reject(new Error(`${field.label}必须是 JSON 对象`)) }] : [])
+          ...(field.type === 'json' ? [{ validator: (_: unknown, value: unknown) => {
+            const empty = value == null || value === '';
+            if (empty && (configured || !field.required)) return Promise.resolve();
+            return value !== null && typeof value === 'object' && !Array.isArray(value)
+              ? Promise.resolve()
+              : Promise.reject(new Error(`${field.label}必须是 JSON 对象`));
+          } }] : [])
         ];
         return (
           <Form.Item
@@ -35,12 +40,21 @@ export default function ConfigFields({ fields, configuredSecrets = [] }: { field
 function renderField(field: PluginConfigField, configured: boolean) {
   if (field.type === 'boolean') return <Switch />;
   if (field.type === 'number') return <InputNumber min={field.key === 'timeoutSeconds' ? 1 : 0} className="full-width" />;
+  if (field.type === 'select') return <Select options={field.options ?? []} />;
   if (field.type === 'string-list') return <Select mode="tags" tokenSeparators={[',']} placeholder="输入后按回车添加" />;
   if (field.type === 'json') return <JSONObjectInput />;
   if (field.type === 'textarea') return <Input.TextArea className="code-input" rows={8} spellCheck={false} />;
   if (field.secret || field.type === 'secret') return <Input.Password autoComplete="new-password" placeholder={configured ? '已配置，留空保持原值' : '请输入敏感信息'} />;
   if (field.type === 'url') return <Input type="url" placeholder="https://" />;
   return <Input />;
+}
+
+function isVisible(field: PluginConfigField, config: Record<string, unknown>, configuredSecrets: string[]) {
+  if (field.showWhenConfiguredSecret && !configuredSecrets.includes(field.showWhenConfiguredSecret)) return false;
+  if (!field.showWhen) return true;
+  const current = config[field.showWhen.key];
+  if (field.showWhen.oneOf) return field.showWhen.oneOf.some((value) => Object.is(value, current));
+  return Object.is(field.showWhen.equals, current);
 }
 
 function JSONObjectInput({ value, onChange }: { value?: unknown; onChange?: (value: unknown) => void }) {

@@ -272,12 +272,14 @@ func validateChannelInput(input model.NotifyChannelInput) error {
 	if strings.TrimSpace(input.Name) == "" {
 		fields["name"] = "请输入渠道名称。"
 	}
-	if input.Type != model.ChannelTypeBark && input.Type != model.ChannelTypeEmail && input.Type != model.ChannelTypeWebhook {
+	if input.Type != model.ChannelTypeBark && input.Type != model.ChannelTypeDingTalk && input.Type != model.ChannelTypeEmail && input.Type != model.ChannelTypeWebhook {
 		fields["type"] = "请选择支持的渠道类型。"
 	}
-	_, err := decodeJSONObject(input.Config)
+	configObject, err := decodeJSONObject(input.Config)
 	if err != nil {
 		fields["config"] = err.Error()
+	} else if _, exists := configObject["clearSecret"]; exists {
+		fields["config.clearSecret"] = "clearSecret 仅用于通知渠道更新，不能作为渠道配置保存。"
 	} else if input.Type == model.ChannelTypeBark {
 		var cfg notifier.BarkConfig
 		if err := json.Unmarshal(input.Config, &cfg); err != nil {
@@ -292,6 +294,10 @@ func validateChannelInput(input model.NotifyChannelInput) error {
 			if raw := strings.TrimSpace(cfg.Icon); raw != "" && !validHTTPURL(raw) {
 				fields["config.icon"] = "图标必须是有效的 HTTP 或 HTTPS URL。"
 			}
+		}
+	} else if input.Type == model.ChannelTypeDingTalk {
+		if err := notifier.ValidateDingTalkConfig(input.Config); err != nil {
+			fields["config"] = "钉钉机器人配置无效：" + err.Error()
 		}
 	} else if input.Type == model.ChannelTypeEmail {
 		var cfg notifier.EmailConfig

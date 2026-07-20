@@ -11,9 +11,10 @@ const (
 	MonitorTypeWebpage       = "webpage"
 	MonitorTypeGitHubRelease = "github_release"
 
-	ChannelTypeBark    = "bark"
-	ChannelTypeEmail   = "email"
-	ChannelTypeWebhook = "webhook"
+	ChannelTypeBark     = "bark"
+	ChannelTypeDingTalk = "dingtalk"
+	ChannelTypeEmail    = "email"
+	ChannelTypeWebhook  = "webhook"
 
 	ProxyTypeHTTP   = "http"
 	ProxyTypeHTTPS  = "https"

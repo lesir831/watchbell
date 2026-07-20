@@ -15,8 +15,9 @@ WatchBell 是一个自托管的监控和通知小工具。
 - 网页文本变化检查，支持简单的 `#id`、`.class` 和标签选择器
 - Bark 推送
 - SMTP 邮件通知
+- 钉钉自定义机器人，支持加签、常用消息格式和原生参数扩展
 - 通用 Webhook，支持模板化 URL、Headers 和 Body
-- 通知模板，支持 `${rss.title}` 这类变量
+- 通知模板，支持 `${rss.title}` 这类变量、自动补全和语法高亮
 - SQLite 持久化
 - 单用户登录，使用 HttpOnly 签名 cookie
 - 响应式 React + Ant Design 管理界面，支持手机端导航和卡片视图
@@ -371,6 +372,24 @@ TestFlight 有空位时本身就会产生事件。如果只想有事件就通知
 - `587`：通常配 `startTls=true`
 - `465`：通常配 `implicitTls=true`
 
+### 钉钉机器人
+
+```json
+{
+  "webhookUrl": "https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN",
+  "secret": "SEC...",
+  "messageType": "markdown",
+  "title": "${message.subject}",
+  "text": "${message.body}",
+  "atMobiles": [],
+  "atUserIds": [],
+  "isAtAll": false,
+  "extraParams": {}
+}
+```
+
+`messageType` 支持 `text`、`markdown`、`link`、`actionCard` 和 `feedCard`。标题、正文以及 `extraParams` 中的字符串都支持模板变量；`extraParams` 会与生成的钉钉原生消息体递归合并，可配置链接图片、卡片按钮、FeedCard 链接和其他扩展字段。启用钉钉机器人“加签”安全设置时填写 `secret`，Webhook 地址和加签密钥都会按敏感字段保存且不会回显。
+
 ### Webhook
 
 ```json
@@ -419,7 +438,7 @@ GET /api/health/ready
 
 ## 通知模板变量
 
-模板变量使用 `${...}`。
+模板变量使用 `${...}`。在模板编辑器中输入 `$` 会自动补全花括号并把光标放在括号内；继续输入可筛选变量，点击变量则插入当前光标或选区位置。编辑器和帮助页读取同一份按系统、跨模块和监控模块聚合的变量目录。
 
 跨模块快捷变量（RSS、TestFlight、网页和 GitHub Release 均可使用）：
 

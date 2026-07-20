@@ -211,6 +211,52 @@ func (n *traceNotifier) sentMessages() []notifier.Message {
 	return append([]notifier.Message(nil), n.messages...)
 }
 
+func TestChannelProvidesRepresentativeTemplateData(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	channel, err := db.CreateNotifyChannel(ctx, model.NotifyChannelInput{
+		Name: "Template test", Type: "trace_channel", Enabled: true, Config: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixed := time.Date(2026, time.July, 20, 6, 52, 58, 0, time.UTC)
+	sender := &traceNotifier{}
+	scheduler := New(db, checker.NewRegistry(), notifier.NewRegistry(sender), Options{Now: func() time.Time { return fixed }})
+	attempt, err := scheduler.TestChannel(ctx, channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Status != "sent" || attempt.Kind != "test" {
+		t.Fatalf("attempt = %#v", attempt)
+	}
+	messages := sender.sentMessages()
+	if len(messages) != 1 {
+		t.Fatalf("messages = %d", len(messages))
+	}
+	data := messages[0].Data
+	for _, key := range []string{"url", "title", "summary", "content", "author", "publishedAt", "status"} {
+		if value, ok := data[key].(string); !ok || strings.TrimSpace(value) == "" {
+			t.Errorf("test data %s = %#v", key, data[key])
+		}
+	}
+	for _, key := range []string{"monitor", "rule", "event", "rss", "testflight", "webpage", "github"} {
+		if value, ok := data[key].(map[string]any); !ok || len(value) == 0 {
+			t.Errorf("test data %s = %#v", key, data[key])
+		}
+	}
+	rss := data["rss"].(map[string]any)
+	github := data["github"].(map[string]any)
+	release := github["release"].(map[string]any)
+	if rss["link"] == "" || release["url"] == "" {
+		t.Fatalf("card template URLs are empty: rss=%#v github=%#v", rss, release)
+	}
+}
+
 type healthSequenceChecker struct {
 	mu                sync.Mutex
 	failuresRemaining int

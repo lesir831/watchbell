@@ -1,12 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, App as AntApp, Button, Card, Drawer, Form, Input, Popconfirm, Select, Space, Tag, Typography } from 'antd';
+import { Alert, App as AntApp, Button, Card, Collapse, Drawer, Form, Input, Popconfirm, Select, Tag } from 'antd';
 import { ArrowRightOutlined, CopyOutlined, DeleteOutlined, EditOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
 import { EmptyState, eventTitle, formatDate, PageError, PageHeader } from '../components/Common';
-import type { NotificationTemplate, NotificationTemplateInput } from '../types';
-
-const { Paragraph } = Typography;
+import { TemplateVariableEditor, type TemplateVariableEditorHandle } from '../components/TemplateVariableEditor';
+import type { NotificationTemplate, NotificationTemplateInput, VariableCatalog, VariableDefinition } from '../types';
 
 type PreviewRequest = Partial<NotificationTemplateInput> & { eventId?: number; requestId: number };
 type PreviewResult = { eventId?: number; subject: string; body: string };
@@ -23,11 +22,11 @@ export default function TemplatesPage() {
   const previewEventIdRef = useRef<number | undefined>();
   const previewRequestRef = useRef(0);
   const templates = useQuery({ queryKey: ['templates'], queryFn: api.listTemplates, refetchInterval: 30_000 });
-  const plugins = useQuery({ queryKey: ['plugins'], queryFn: api.listPlugins });
+  const variableCatalog = useQuery({ queryKey: ['variableCatalog'], queryFn: api.variableCatalog });
   const events = useQuery({ queryKey: ['events'], queryFn: api.listEvents, refetchInterval: 30_000 });
   const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors, refetchInterval: 30_000 });
   const channels = useQuery({ queryKey: ['channels'], queryFn: api.listChannels, refetchInterval: 30_000 });
-  const variables = useMemo(() => Array.from(new Set((plugins.data ?? []).flatMap((plugin) => plugin.templateVariables))).sort(), [plugins.data]);
+  const variableGroups = useMemo(() => templateVariableGroups(variableCatalog.data), [variableCatalog.data]);
   const monitorByID = useMemo(() => new Map((monitors.data ?? []).map((monitor) => [monitor.id, monitor.name])), [monitors.data]);
   const refresh = async () => Promise.all([queryClient.invalidateQueries({ queryKey: ['templates'] }), queryClient.invalidateQueries({ queryKey: ['auditLogs'] })]);
   const saveMutation = useMutation({
@@ -115,7 +114,7 @@ export default function TemplatesPage() {
         description="在真实事件变量的上下文中预览消息，避免模板保存后才发现字段缺失。"
         actions={<Button className="design-primary" type="primary" icon={<PlusOutlined />} onClick={openNew}>新建模板</Button>}
       />
-      <PageError error={(templates.error || events.error || monitors.error || channels.error) as Error | null} onRetry={() => { templates.refetch(); events.refetch(); monitors.refetch(); channels.refetch(); }} />
+      <PageError error={(templates.error || variableCatalog.error || events.error || monitors.error || channels.error) as Error | null} onRetry={() => { templates.refetch(); variableCatalog.refetch(); events.refetch(); monitors.refetch(); channels.refetch(); }} />
       {!templates.data?.length && !templates.isLoading ? <div className="empty-panel"><EmptyState title="还没有通知模板" description="创建模板以控制通知标题和正文。" action={<Button type="primary" onClick={openNew}>创建模板</Button>} /></div> : (
         <div className="template-layout">
           <section className="template-list">
@@ -146,37 +145,85 @@ export default function TemplatesPage() {
                 <div className="message-preview-body"><p>{preview.body}</p><dl><dt>监控</dt><dd>{selectedMonitor?.name ?? '示例监控'}</dd><dt>事件时间</dt><dd>{formatDate(selectedEvent?.createdAt)}</dd></dl></div>
               </article>
             ) : <div className="preview-placeholder">选择模板或事件后将自动生成预览。</div>}
-            <Alert className="preview-notice" type="info" showIcon message="变量使用 ${path} 语法；保存前会检查变量是否可用。" />
+            <Alert className="preview-notice" type="info" showIcon message="变量使用 ${path} 语法；已识别变量会高亮，事件中没有取值的变量在预览中显示为空。" />
           </section>
         </div>
       )}
-      <TemplateDrawer open={drawerOpen} record={editing} variables={variables} saving={saveMutation.isPending} error={saveMutation.error as Error | null} onClose={() => { setDrawerOpen(false); saveMutation.reset(); }} onSave={(input) => saveMutation.mutate({ id: editing?.id, input })} />
+      <TemplateDrawer open={drawerOpen} record={editing} variableGroups={variableGroups} variablesLoading={variableCatalog.isLoading} saving={saveMutation.isPending} error={saveMutation.error as Error | null} onClose={() => { setDrawerOpen(false); saveMutation.reset(); }} onSave={(input) => saveMutation.mutate({ id: editing?.id, input })} />
     </div>
   );
 }
 
-function TemplateDrawer(props: { open: boolean; record: NotificationTemplate | null; variables: string[]; saving: boolean; error: Error | null; onClose: () => void; onSave: (input: NotificationTemplateInput) => void }) {
+interface TemplateVariableGroup {
+  id: string;
+  name: string;
+  variables: VariableDefinition[];
+}
+
+function templateVariableGroups(catalog?: VariableCatalog): TemplateVariableGroup[] {
+  if (!catalog) return [];
+  const inTemplates = (variables: VariableDefinition[]) => variables.filter((item) => item.availableIn.includes('template'));
+  return [
+    { id: 'globals', name: '跨模块通用', variables: inTemplates(catalog.globals) },
+    { id: 'system', name: '系统上下文', variables: inTemplates(catalog.system) },
+    ...catalog.modules.map((module) => ({ id: module.id, name: module.name, variables: inTemplates(module.variables) }))
+  ].filter((group) => group.variables.length > 0);
+}
+
+function TemplateDrawer(props: { open: boolean; record: NotificationTemplate | null; variableGroups: TemplateVariableGroup[]; variablesLoading: boolean; saving: boolean; error: Error | null; onClose: () => void; onSave: (input: NotificationTemplateInput) => void }) {
   const [form] = Form.useForm();
   const [insertTarget, setInsertTarget] = useState<'subjectTemplate' | 'bodyTemplate'>('bodyTemplate');
+  const subjectEditor = useRef<TemplateVariableEditorHandle>(null);
+  const bodyEditor = useRef<TemplateVariableEditorHandle>(null);
+  const variables = useMemo(() => props.variableGroups.flatMap((group) => group.variables), [props.variableGroups]);
   const setInitial = () => form.setFieldsValue({
     name: props.record?.name ?? '', subjectTemplate: props.record?.subjectTemplate ?? '${monitor.name}: ${event.type}',
     bodyTemplate: props.record?.bodyTemplate ?? '监控：${monitor.name}\n时间：${event.time}\n\n${rss.title}${testflight.message}${webpage.summary}${github.release.name}\n${rss.link}${testflight.url}${webpage.url}${github.release.url}'
   });
+  const insertVariable = (key: string) => {
+    const editor = insertTarget === 'subjectTemplate' ? subjectEditor.current : bodyEditor.current;
+    editor?.insertVariable(key);
+    form.validateFields([insertTarget]).catch(() => undefined);
+  };
   return (
     <Drawer title={props.record ? '编辑模板' : '新建模板'} open={props.open} onClose={props.onClose} width={720} destroyOnClose afterOpenChange={(open) => { if (open) setInitial(); }} footer={<div className="drawer-footer"><Button onClick={props.onClose}>取消</Button><Button type="primary" loading={props.saving} onClick={() => form.submit()}>保存模板</Button></div>}>
       <PageError error={props.error} />
       <Form form={form} layout="vertical" onFinish={(values) => props.onSave(values)}>
         <Form.Item name="name" label="名称" rules={[{ required: true, whitespace: true }]}><Input /></Form.Item>
-        <Form.Item name="subjectTemplate" label="标题" rules={[{ required: true, whitespace: true }]}><Input onFocus={() => setInsertTarget('subjectTemplate')} /></Form.Item>
-        <Form.Item name="bodyTemplate" label="正文" rules={[{ required: true, whitespace: true }]}><Input.TextArea rows={12} className="code-input" onFocus={() => setInsertTarget('bodyTemplate')} /></Form.Item>
+        <Form.Item name="subjectTemplate" label="标题" rules={[{ required: true, whitespace: true }]}>
+          <TemplateVariableEditor ref={subjectEditor} variables={variables} placeholder="输入 $ 插入变量" onFocus={() => setInsertTarget('subjectTemplate')} />
+        </Form.Item>
+        <Form.Item name="bodyTemplate" label="正文" rules={[{ required: true, whitespace: true }]}>
+          <TemplateVariableEditor ref={bodyEditor} variables={variables} multiline rows={12} placeholder="输入正文；输入 $ 可搜索变量" onFocus={() => setInsertTarget('bodyTemplate')} />
+        </Form.Item>
       </Form>
-      <Card size="small" title="可用变量" className="variable-card">
-        <Paragraph type="secondary">先点击标题或正文，再点击变量；它会直接插入当前编辑区。</Paragraph>
-        <Space wrap>{['monitor.name', 'event.type', 'event.time', ...props.variables].map((item) => <Tag className="copy-tag" key={item} onClick={() => {
-          const token = `\${${item}}`;
-          form.setFieldValue(insertTarget, `${form.getFieldValue(insertTarget) ?? ''}${token}`);
-          form.validateFields([insertTarget]).catch(() => undefined);
-        }}>{`\${${item}}`}</Tag>)}</Space>
+      <Card size="small" className="variable-card template-variable-browser">
+        <div className="template-variable-browser-head">
+          <div><strong>可用变量</strong><span>输入 $ 搜索，或点击下方变量插入光标位置</span></div>
+          <div className="template-variable-browser-actions"><Tag color="blue">插入到{insertTarget === 'subjectTemplate' ? '标题' : '正文'}</Tag><a href="#/help">完整变量帮助</a></div>
+        </div>
+        {props.variablesLoading ? <div className="template-variable-browser-empty">正在载入变量目录…</div> : props.variableGroups.length ? (
+          <Collapse
+            ghost
+            size="small"
+            defaultActiveKey={['globals', 'system']}
+            items={props.variableGroups.map((group) => ({
+              key: group.id,
+              label: <span className="template-variable-group-label"><strong>{group.name}</strong><small>{group.variables.length}</small></span>,
+              children: <div className="template-variable-grid">{group.variables.map((item) => (
+                <button
+                  type="button"
+                  key={item.key}
+                  title={item.description}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => insertVariable(item.key)}
+                >
+                  <span>{item.label}</span><code>{`\${${item.key}}`}</code>
+                </button>
+              ))}</div>
+            }))}
+          />
+        ) : <div className="template-variable-browser-empty">变量目录暂不可用，请稍后重试。</div>}
       </Card>
     </Drawer>
   );

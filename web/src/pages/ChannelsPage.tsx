@@ -11,7 +11,7 @@ import {
   Space,
   Switch
 } from 'antd';
-import { BellOutlined, CodeOutlined, DeleteOutlined, EditOutlined, MailOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons';
+import { BellOutlined, CodeOutlined, DeleteOutlined, DingdingOutlined, EditOutlined, MailOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, APIError } from '../api';
 import ConfigFields from '../components/ConfigFields';
@@ -50,6 +50,35 @@ const channelSchemas: Record<ChannelType, { name: string; description: string; f
       { key: 'allowPrivate', label: '允许内网地址', type: 'boolean', description: '仅在连接你信任的内网/本机服务时开启；默认阻止 SSRF' }
     ],
     defaults: { url: '', method: 'POST', headers: { 'Content-Type': 'application/json' }, bodyTemplate: '', allowPrivate: false }
+  },
+  dingtalk: {
+    name: '钉钉机器人', description: '通过钉钉群自定义机器人 Webhook 发送通知，支持文本、Markdown、链接、ActionCard 和 FeedCard。',
+    fields: [
+      { key: 'webhookUrl', label: 'Webhook 地址', type: 'secret', secret: true, required: true, description: '在钉钉机器人设置中复制；地址中含访问令牌，因此不会在界面回显。' },
+      { key: 'secret', label: '加签密钥', type: 'secret', secret: true, description: '开启“加签”安全设置时填写，以 SEC 开头；新建时留空不签名，编辑时使用下方移除开关关闭加签。' },
+      { key: 'clearSecret', label: '移除加签密钥', type: 'boolean', description: '保存后删除当前加签密钥并关闭加签；Webhook 地址不受影响。', showWhenConfiguredSecret: 'secret' },
+      {
+        key: 'messageType', label: '消息格式', type: 'select', required: true, description: '正文和标题支持 ${...} 模板变量。复杂原生字段可在下方“额外参数”中补充。',
+        options: [
+          { label: '文本（text）', value: 'text' },
+          { label: 'Markdown', value: 'markdown' },
+          { label: '链接卡片（link）', value: 'link' },
+          { label: '操作卡片（ActionCard）', value: 'actionCard' },
+          { label: '信息流卡片（FeedCard）', value: 'feedCard' }
+        ]
+      },
+      { key: 'title', label: '消息标题', type: 'string', description: 'Markdown、链接卡片和 ActionCard 使用；可使用 ${message.subject}。', showWhen: { key: 'messageType', oneOf: ['markdown', 'link', 'actionCard'] } },
+      { key: 'text', label: '消息正文', type: 'textarea', description: '默认使用通知模板正文，可使用 ${message.body}；Markdown 与卡片格式支持对应语法。', showWhen: { key: 'messageType', oneOf: ['text', 'markdown', 'link', 'actionCard'] } },
+      { key: 'atMobiles', label: '@ 手机号', type: 'string-list', description: '可选；输入手机号后按回车，可添加多个成员。' },
+      { key: 'atUserIds', label: '@ 用户 ID', type: 'string-list', description: '可选；输入钉钉用户 ID 后按回车，可添加多个成员。' },
+      { key: 'isAtAll', label: '@ 所有人', type: 'boolean', description: '开启后忽略单独指定的手机号和用户 ID。' },
+      { key: 'extraParams', label: '额外参数', type: 'json', description: '可选的钉钉原生 JSON 字段。支持模板变量，并与生成的消息体深度合并；例如 link.picUrl、actionCard.btns 或 feedCard.links。' },
+      { key: 'allowPrivate', label: '允许内网地址', type: 'boolean', description: '仅在连接你信任的内网钉钉代理时开启；默认阻止 SSRF。' }
+    ],
+    defaults: {
+      webhookUrl: '', secret: '', messageType: 'text', title: '${message.subject}', text: '${message.body}',
+      atMobiles: [], atUserIds: [], isAtAll: false, extraParams: {}, allowPrivate: false
+    }
   }
 };
 
@@ -105,7 +134,7 @@ export default function ChannelsPage() {
       />
       <PageError error={(channels.error || rules.error || attempts.error) as Error | null} onRetry={() => { channels.refetch(); rules.refetch(); attempts.refetch(); }} />
       {!channels.data?.length && !channels.isLoading ? (
-        <div className="empty-panel"><EmptyState title="还没有通知渠道" description="先配置 Bark 或 SMTP，并发送一次测试通知。" action={<Button type="primary" onClick={openNew}>创建第一个渠道</Button>} /></div>
+        <div className="empty-panel"><EmptyState title="还没有通知渠道" description="先配置 Bark、钉钉机器人或 SMTP，并发送一次测试通知。" action={<Button type="primary" onClick={openNew}>创建第一个渠道</Button>} /></div>
       ) : (
         <div className="collection-grid">
           {(channels.data ?? []).map((item) => {
@@ -136,6 +165,7 @@ export default function ChannelsPage() {
 function channelIcon(type: ChannelType) {
   if (type === 'bark') return <BellOutlined />;
   if (type === 'email') return <MailOutlined />;
+  if (type === 'dingtalk') return <DingdingOutlined />;
   return <CodeOutlined />;
 }
 

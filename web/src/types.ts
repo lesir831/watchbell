@@ -1,5 +1,5 @@
 export type MonitorType = 'rss' | 'testflight' | 'webpage' | 'github_release';
-export type ChannelType = 'bark' | 'email' | 'webhook';
+export type ChannelType = 'bark' | 'email' | 'webhook' | 'dingtalk';
 export type ProxyType = 'http' | 'https' | 'socks5';
 
 export interface PluginConfigField {
@@ -9,6 +9,9 @@ export interface PluginConfigField {
   required?: boolean;
   secret?: boolean;
   description?: string;
+  options?: Array<{ label: string; value: string }>;
+  showWhen?: { key: string; equals?: unknown; oneOf?: unknown[] };
+  showWhenConfiguredSecret?: string;
 }
 
 export interface MonitorPlugin {

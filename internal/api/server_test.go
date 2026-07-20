@@ -27,7 +27,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *store.Store) {
 	}
 	sched := scheduler.New(db, checker.NewRegistry(
 		checker.NewRSSChecker(), checker.NewTestFlightChecker(), checker.NewWebpageChecker(), checker.NewGitHubReleaseChecker(),
-	), notifier.NewRegistry(notifier.NewBarkNotifier(), notifier.NewEmailNotifier()), scheduler.Options{})
+	), notifier.NewRegistry(notifier.NewBarkNotifier(), notifier.NewDingTalkNotifier(), notifier.NewEmailNotifier()), scheduler.Options{})
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	server := httptest.NewServer(NewServer(db, sched, "", logger, nil).Routes())
 	t.Cleanup(func() { server.Close(); db.Close() })

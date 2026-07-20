@@ -173,14 +173,58 @@ func (s *Scheduler) TestChannel(ctx context.Context, channelID int64) (model.Not
 	message := notifier.Message{
 		Subject: "WatchBell 测试通知",
 		Body:    "这是一条来自 WatchBell 的测试通知。",
-		Data: map[string]any{
-			"event": map[string]any{"type": "test", "time": s.nowUTC().Format(time.RFC3339Nano)},
-		},
+		Data:    channelTestTemplateData(s.nowUTC()),
 	}
 	return s.sendAndRecord(ctx, channel, message, model.NotificationAttemptInput{
 		ChannelID: int64Ptr(channel.ID), ChannelName: channel.Name, ChannelType: channel.Type,
 		Kind: "test", AttemptNo: 1,
 	})
+}
+
+// channelTestTemplateData exercises provider-side templates with concrete,
+// safe values. In particular, card-style webhook channels often require a URL
+// in their native payload; limiting test data to event.type would make a valid
+// ${url} or ${rss.link} configuration fail only when the user clicks Test.
+func channelTestTemplateData(now time.Time) map[string]any {
+	formattedTime := now.UTC().Format(time.RFC3339Nano)
+	return map[string]any{
+		"url":         "https://example.com/watchbell/test-event",
+		"title":       "WatchBell 测试事件",
+		"summary":     "用于验证通知渠道配置的示例事件。",
+		"content":     "这是一条来自 WatchBell 的测试通知。",
+		"author":      "WatchBell",
+		"publishedAt": formattedTime,
+		"status":      "test",
+		"monitor": map[string]any{
+			"id": int64(1), "name": "WatchBell 示例监控", "type": model.MonitorTypeRSS,
+		},
+		"rule": map[string]any{
+			"id": int64(1), "name": "WatchBell 示例规则", "matched": []string{"test"},
+		},
+		"event": map[string]any{
+			"id": int64(1), "type": "rss.item", "fingerprint": "watchbell:test", "time": formattedTime,
+		},
+		"rss": map[string]any{
+			"title": "WatchBell 测试事件", "link": "https://example.com/watchbell/test-event",
+			"author": "WatchBell", "summary": "用于验证通知渠道配置的示例事件。",
+			"content": "这是一条来自 WatchBell 的测试通知。", "publishedAt": formattedTime,
+			"sourceTitle": "WatchBell 示例订阅源", "sourceLink": "https://example.com/watchbell/feed",
+		},
+		"testflight": map[string]any{
+			"url": "https://testflight.apple.com/join/watchbell", "status": "available", "message": "TestFlight 测试名额可用",
+		},
+		"webpage": map[string]any{
+			"url": "https://example.com/watchbell", "selector": "main", "oldHash": "old", "newHash": "new", "summary": "示例网页内容已更新",
+		},
+		"github": map[string]any{
+			"owner": "watchbell", "repo": "watchbell", "repository": "watchbell/watchbell",
+			"release": map[string]any{
+				"id": int64(1), "tagName": "v1.0.0", "name": "WatchBell v1.0.0", "body": "Example release notes",
+				"url": "https://github.com/watchbell/watchbell/releases/tag/v1.0.0", "prerelease": false,
+				"publishedAt": formattedTime, "author": "WatchBell", "assetCount": 0, "assets": []any{},
+			},
+		},
+	}
 }
 
 // SendPreview delivers an already-rendered template preview through the same

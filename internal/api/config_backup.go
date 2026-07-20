@@ -420,15 +420,22 @@ func validateBackupSecrets(prefix string, raw json.RawMessage, redacted, allowed
 }
 
 func backupSecretValidationValues(channelType string) map[string]any {
-	if channelType != model.ChannelTypeWebhook {
+	switch channelType {
+	case model.ChannelTypeWebhook:
+		// Webhook secrets are not both scalar strings: headers is an object and
+		// URL validation requires a syntactically valid HTTP(S) endpoint. These
+		// values exist only in the temporary validation copy and are never stored.
+		return map[string]any{
+			"url":     "https://example.com/watchbell-validation",
+			"headers": map[string]any{"X-WatchBell-Validation": "redacted"},
+		}
+	case model.ChannelTypeDingTalk:
+		return map[string]any{
+			"webhookUrl": "https://oapi.dingtalk.com/robot/send?access_token=watchbell-validation",
+			"secret":     "watchbell-validation-secret",
+		}
+	default:
 		return nil
-	}
-	// Webhook secrets are not both scalar strings: headers is an object and
-	// URL validation requires a syntactically valid HTTP(S) endpoint. These
-	// values exist only in the temporary validation copy and are never stored.
-	return map[string]any{
-		"url":     "https://example.com/watchbell-validation",
-		"headers": map[string]any{"X-WatchBell-Validation": "redacted"},
 	}
 }
 

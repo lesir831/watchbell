@@ -89,7 +89,16 @@ func mergeSecretConfig(existing, incoming json.RawMessage, secretKeys []string) 
 	if json.Unmarshal(incoming, &next) != nil {
 		return incoming
 	}
+	clearSecret, _ := next["clearSecret"].(bool)
+	// clearSecret is an update command, never provider configuration. DingTalk
+	// uses it to explicitly turn off its optional signing secret while the
+	// ordinary empty secret field continues to mean “retain the redacted value”.
+	delete(next, "clearSecret")
 	for _, key := range secretKeys {
+		if key == "secret" && clearSecret {
+			delete(next, key)
+			continue
+		}
 		if isEmptyConfigValue(next[key]) {
 			if value, ok := current[key]; ok {
 				next[key] = value
@@ -97,6 +106,23 @@ func mergeSecretConfig(existing, incoming json.RawMessage, secretKeys []string) 
 		}
 	}
 	data, err := json.Marshal(next)
+	if err != nil {
+		return incoming
+	}
+	return data
+}
+
+func stripSecretControlConfig(incoming json.RawMessage) json.RawMessage {
+	var config map[string]any
+	if json.Unmarshal(incoming, &config) != nil {
+		return incoming
+	}
+	clearSecret, _ := config["clearSecret"].(bool)
+	delete(config, "clearSecret")
+	if clearSecret {
+		delete(config, "secret")
+	}
+	data, err := json.Marshal(config)
 	if err != nil {
 		return incoming
 	}
@@ -122,6 +148,10 @@ func channelSecretKeys(channelType string) []string {
 	switch channelType {
 	case model.ChannelTypeBark:
 		return []string{"deviceKey"}
+	case model.ChannelTypeDingTalk:
+		// The access token is embedded in webhookUrl; secret is the optional
+		// HMAC signing key configured in DingTalk's robot security settings.
+		return []string{"webhookUrl", "secret"}
 	case model.ChannelTypeEmail:
 		return []string{"password"}
 	case model.ChannelTypeWebhook:
