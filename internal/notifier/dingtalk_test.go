@@ -111,6 +111,114 @@ func TestDingTalkNotifierBuildsSupportedMessageFormats(t *testing.T) {
 	}
 }
 
+func TestNormalizeDingTalkMarkdownBreaks(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "ordinary soft breaks",
+			input: "第一行\n第二行\r\n第三行",
+			want:  "第一行  \n第二行  \n第三行",
+		},
+		{
+			name:  "paragraphs and existing hard breaks",
+			input: "第一段\n\n第二段第一行  \n第二行\\\n第三行",
+			want:  "第一段\n\n第二段第一行  \n第二行\\\n第三行",
+		},
+		{
+			name:  "list block",
+			input: "说明第一行\n说明第二行\n\n- 第一项\n  延续内容\n\n  松散列表段落\n  - 嵌套项\n- 第二项\n\n结尾第一行\n结尾第二行",
+			want:  "说明第一行  \n说明第二行\n\n- 第一项\n  延续内容\n\n  松散列表段落\n  - 嵌套项\n- 第二项\n\n结尾第一行  \n结尾第二行",
+		},
+		{
+			name:  "list establishes paragraph boundary",
+			input: "说明\n1. 第一项\n2. 第二项",
+			want:  "说明\n\n1. 第一项\n2. 第二项",
+		},
+		{
+			name:  "fenced and indented code",
+			input: "代码如下\n```go\nfirst := 1\n```not-a-close\nsecond := 2\n```\n处理完成\n\n    alpha\n    beta\n\n尾行",
+			want:  "代码如下\n\n```go\nfirst := 1\n```not-a-close\nsecond := 2\n```\n\n处理完成\n\n    alpha\n    beta\n\n尾行",
+		},
+		{
+			name:  "setext heading",
+			input: "标题\n---\n正文第一行\n正文第二行",
+			want:  "标题\n---\n\n正文第一行  \n正文第二行",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := normalizeDingTalkMarkdownBreaks(test.input); got != test.want {
+				t.Fatalf("normalizeDingTalkMarkdownBreaks() =\n%q\nwant\n%q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDingTalkMarkdownBreakNormalizationOnlyAffectsMarkdownTextFields(t *testing.T) {
+	input := "第一行\n第二行"
+	wantMarkdown := "第一行  \n第二行"
+	tests := []struct {
+		name    string
+		config  DingTalkConfig
+		section string
+		field   string
+		want    string
+	}{
+		{name: "text unchanged", config: DingTalkConfig{MessageType: "text"}, section: "text", field: "content", want: input},
+		{
+			name: "markdown normalized after extra params merge",
+			config: DingTalkConfig{MessageType: "markdown", ExtraParams: map[string]any{
+				"markdown": map[string]any{"text": input},
+			}},
+			section: "markdown", field: "text", want: wantMarkdown,
+		},
+		{
+			name: "link unchanged",
+			config: DingTalkConfig{MessageType: "link", ExtraParams: map[string]any{
+				"link": map[string]any{"messageUrl": "https://example.com/item"},
+			}},
+			section: "link", field: "text", want: input,
+		},
+		{
+			name: "actionCard normalized",
+			config: DingTalkConfig{MessageType: "actionCard", ExtraParams: map[string]any{
+				"actionCard": map[string]any{"singleTitle": "打开", "singleURL": "https://example.com/item"},
+			}},
+			section: "actionCard", field: "text", want: wantMarkdown,
+		},
+		{
+			name: "feedCard native title unchanged",
+			config: DingTalkConfig{MessageType: "feedCard", ExtraParams: map[string]any{
+				"feedCard": map[string]any{"links": []any{map[string]any{
+					"title": input, "messageURL": "https://example.com/item", "picURL": "https://example.com/pic.png",
+				}}},
+			}},
+			section: "feedCard", field: "links.0.title", want: input,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := buildDingTalkPayload(test.config, Message{Subject: "标题", Body: input})
+			if err != nil {
+				t.Fatal(err)
+			}
+			section := payload[test.section].(map[string]any)
+			var got string
+			if test.field == "links.0.title" {
+				got = section["links"].([]any)[0].(map[string]any)["title"].(string)
+			} else {
+				got = section[test.field].(string)
+			}
+			if got != test.want {
+				t.Fatalf("%s = %q, want %q", test.field, got, test.want)
+			}
+		})
+	}
+}
+
 func TestDingTalkNotifierSignsAndSendsNativeParameters(t *testing.T) {
 	fixed := time.Date(2026, time.July, 20, 6, 52, 58, 610*1e6, time.UTC)
 	secret := "SEC-signing-secret"
@@ -150,7 +258,7 @@ func TestDingTalkNotifierSignsAndSendsNativeParameters(t *testing.T) {
 	notifier := NewDingTalkNotifier()
 	notifier.now = func() time.Time { return fixed }
 	if err := notifier.Send(context.Background(), model.NotifyChannel{Config: raw}, Message{
-		Subject: "Subject", Body: "Body", Data: map[string]any{"event": map[string]any{"id": 9}},
+		Subject: "Subject", Body: "第一行\n第二行", Data: map[string]any{"event": map[string]any{"id": 9}},
 	}); err != nil {
 		t.Fatalf("Send() error = %v", err)
 	}
@@ -158,6 +266,10 @@ func TestDingTalkNotifierSignsAndSendsNativeParameters(t *testing.T) {
 	at, ok := payload["at"].(map[string]any)
 	if !ok || at["isAtAll"] != true || at["customAtField"] != "9" {
 		t.Fatalf("at = %#v", payload["at"])
+	}
+	markdown, ok := payload["markdown"].(map[string]any)
+	if !ok || markdown["text"] != "第一行  \n第二行" {
+		t.Fatalf("markdown = %#v", payload["markdown"])
 	}
 }
 

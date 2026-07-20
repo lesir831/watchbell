@@ -6,6 +6,7 @@ require (
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/mattn/go-sqlite3 v1.14.47
 	github.com/mmcdole/gofeed v1.3.0
+	github.com/yuin/goldmark v1.8.4
 	golang.org/x/net v0.43.0
 	golang.org/x/term v0.34.0
 )

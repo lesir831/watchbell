@@ -4,7 +4,12 @@ import { ArrowRightOutlined, CopyOutlined, DeleteOutlined, EditOutlined, PlusOut
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
 import { EmptyState, eventTitle, formatDate, PageError, PageHeader } from '../components/Common';
-import { TemplateVariableEditor, type TemplateVariableEditorHandle } from '../components/TemplateVariableEditor';
+import {
+  templateTextTransforms,
+  TemplateVariableEditor,
+  type TemplateTextTransform,
+  type TemplateVariableEditorHandle
+} from '../components/TemplateVariableEditor';
 import type { NotificationTemplate, NotificationTemplateInput, VariableCatalog, VariableDefinition } from '../types';
 
 type PreviewRequest = Partial<NotificationTemplateInput> & { eventId?: number; requestId: number };
@@ -19,6 +24,7 @@ export default function TemplatesPage() {
   const [previewEventId, setPreviewEventId] = useState<number | undefined>();
   const [previewChannelId, setPreviewChannelId] = useState<number | undefined>();
   const [preview, setPreview] = useState<PreviewResult | null>(null);
+  const previewingRef = useRef<NotificationTemplate | null>(null);
   const previewEventIdRef = useRef<number | undefined>();
   const previewRequestRef = useRef(0);
   const templates = useQuery({ queryKey: ['templates'], queryFn: api.listTemplates, refetchInterval: 30_000 });
@@ -29,10 +35,6 @@ export default function TemplatesPage() {
   const variableGroups = useMemo(() => templateVariableGroups(variableCatalog.data), [variableCatalog.data]);
   const monitorByID = useMemo(() => new Map((monitors.data ?? []).map((monitor) => [monitor.id, monitor.name])), [monitors.data]);
   const refresh = async () => Promise.all([queryClient.invalidateQueries({ queryKey: ['templates'] }), queryClient.invalidateQueries({ queryKey: ['auditLogs'] })]);
-  const saveMutation = useMutation({
-    mutationFn: (payload: { id?: number; input: NotificationTemplateInput }) => payload.id ? api.updateTemplate(payload.id, payload.input) : api.createTemplate(payload.input),
-    onSuccess: async () => { await refresh(); setDrawerOpen(false); setEditing(null); message.success('模板已保存'); }
-  });
   const deleteMutation = useMutation({
     mutationFn: api.deleteTemplate,
     onSuccess: async () => { await refresh(); message.success('模板已归档'); },
@@ -56,6 +58,29 @@ export default function TemplatesPage() {
       }
     }
   });
+  const renderPreview = (record: NotificationTemplate, eventId: number | undefined) => {
+    const requestId = previewRequestRef.current + 1;
+    previewRequestRef.current = requestId;
+    previewEventIdRef.current = eventId;
+    setPreviewEventId(eventId);
+    setPreview(null);
+    previewMutation.reset();
+    previewMutation.mutate({ requestId, subjectTemplate: record.subjectTemplate, bodyTemplate: record.bodyTemplate, eventId });
+  };
+  const saveMutation = useMutation({
+    mutationFn: (payload: { id?: number; input: NotificationTemplateInput }) => payload.id ? api.updateTemplate(payload.id, payload.input) : api.createTemplate(payload.input),
+    onSuccess: async (saved) => {
+      if (previewingRef.current?.id === saved.id) {
+        previewingRef.current = saved;
+        setPreviewing(saved);
+        renderPreview(saved, previewEventIdRef.current);
+      }
+      setDrawerOpen(false);
+      setEditing(null);
+      await refresh();
+      message.success('模板已保存');
+    }
+  });
   const sendPreviewMutation = useMutation({
     mutationFn: api.sendTemplatePreview,
     onSuccess: async (attempt) => {
@@ -68,26 +93,18 @@ export default function TemplatesPage() {
     onError: (error: Error) => message.error(error.message)
   });
   const selectPreviewEvent = (eventId?: number) => {
-    const requestId = previewRequestRef.current + 1;
-    previewRequestRef.current = requestId;
-    previewEventIdRef.current = eventId;
-    setPreviewEventId(eventId);
-    setPreview(null);
-    previewMutation.reset();
-    if (previewing) {
-      previewMutation.mutate({ requestId, subjectTemplate: previewing.subjectTemplate, bodyTemplate: previewing.bodyTemplate, eventId });
+    if (previewing) renderPreview(previewing, eventId);
+    else {
+      previewEventIdRef.current = eventId;
+      setPreviewEventId(eventId);
+      setPreview(null);
     }
   };
   const openPreview = (record: NotificationTemplate) => {
     const eventId = events.data?.[0]?.id;
-    const requestId = previewRequestRef.current + 1;
-    previewRequestRef.current = requestId;
-    previewEventIdRef.current = eventId;
+    previewingRef.current = record;
     setPreviewing(record);
-    setPreviewEventId(eventId);
-    setPreview(null);
-    previewMutation.reset();
-    previewMutation.mutate({ requestId, subjectTemplate: record.subjectTemplate, bodyTemplate: record.bodyTemplate, eventId });
+    renderPreview(record, eventId);
   };
   const openNew = () => { setEditing(null); setDrawerOpen(true); };
   useEffect(() => {
@@ -145,7 +162,7 @@ export default function TemplatesPage() {
                 <div className="message-preview-body"><p>{preview.body}</p><dl><dt>监控</dt><dd>{selectedMonitor?.name ?? '示例监控'}</dd><dt>事件时间</dt><dd>{formatDate(selectedEvent?.createdAt)}</dd></dl></div>
               </article>
             ) : <div className="preview-placeholder">选择模板或事件后将自动生成预览。</div>}
-            <Alert className="preview-notice" type="info" showIcon message="变量使用 ${path} 语法；已识别变量会高亮，事件中没有取值的变量在预览中显示为空。" />
+            <Alert className="preview-notice" type="info" showIcon message="变量使用 ${path}；${text:path} 可转为纯文本，${markdown:path} 可转为 Markdown。已识别语法会高亮。" />
           </section>
         </div>
       )}
@@ -185,23 +202,45 @@ function TemplateDrawer(props: { open: boolean; record: NotificationTemplate | n
     editor?.insertVariable(key);
     form.validateFields([insertTarget]).catch(() => undefined);
   };
+  const insertTransform = (key: TemplateTextTransform['key']) => {
+    const editor = insertTarget === 'subjectTemplate' ? subjectEditor.current : bodyEditor.current;
+    editor?.insertTransform(key);
+    form.validateFields([insertTarget]).catch(() => undefined);
+  };
   return (
     <Drawer title={props.record ? '编辑模板' : '新建模板'} open={props.open} onClose={props.onClose} width={720} destroyOnClose afterOpenChange={(open) => { if (open) setInitial(); }} footer={<div className="drawer-footer"><Button onClick={props.onClose}>取消</Button><Button type="primary" loading={props.saving} onClick={() => form.submit()}>保存模板</Button></div>}>
       <PageError error={props.error} />
       <Form form={form} layout="vertical" onFinish={(values) => props.onSave(values)}>
         <Form.Item name="name" label="名称" rules={[{ required: true, whitespace: true }]}><Input /></Form.Item>
         <Form.Item name="subjectTemplate" label="标题" rules={[{ required: true, whitespace: true }]}>
-          <TemplateVariableEditor ref={subjectEditor} variables={variables} placeholder="输入 $ 插入变量" onFocus={() => setInsertTarget('subjectTemplate')} />
+          <TemplateVariableEditor id="template-subject" ref={subjectEditor} variables={variables} placeholder="输入 $ 插入变量或文本处理函数" onFocus={() => setInsertTarget('subjectTemplate')} />
         </Form.Item>
         <Form.Item name="bodyTemplate" label="正文" rules={[{ required: true, whitespace: true }]}>
-          <TemplateVariableEditor ref={bodyEditor} variables={variables} multiline rows={12} placeholder="输入正文；输入 $ 可搜索变量" onFocus={() => setInsertTarget('bodyTemplate')} />
+          <TemplateVariableEditor id="template-body" ref={bodyEditor} variables={variables} multiline rows={12} placeholder="输入正文；输入 $ 可搜索变量和文本处理函数" onFocus={() => setInsertTarget('bodyTemplate')} />
         </Form.Item>
       </Form>
       <Card size="small" className="variable-card template-variable-browser">
         <div className="template-variable-browser-head">
-          <div><strong>可用变量</strong><span>输入 $ 搜索，或点击下方变量插入光标位置</span></div>
+          <div><strong>变量与文本处理</strong><span>输入 $ 搜索，或点击下方项目插入当前光标位置</span></div>
           <div className="template-variable-browser-actions"><Tag color="blue">插入到{insertTarget === 'subjectTemplate' ? '标题' : '正文'}</Tag><a href="#/help">完整变量帮助</a></div>
         </div>
+        <section className="template-transform-section" aria-label="文本处理函数">
+          <div className="template-transform-heading"><strong>文本处理函数</strong><span>插入函数后继续选择变量路径</span></div>
+          <div className="template-transform-grid">
+            {templateTextTransforms.map((item) => (
+              <button
+                type="button"
+                key={item.key}
+                title={item.description}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => insertTransform(item.key)}
+              >
+                <span><strong>{item.label}</strong><small>{item.description}</small></span>
+                <code>{`\${${item.key}:path}`}</code>
+              </button>
+            ))}
+          </div>
+        </section>
         {props.variablesLoading ? <div className="template-variable-browser-empty">正在载入变量目录…</div> : props.variableGroups.length ? (
           <Collapse
             ghost

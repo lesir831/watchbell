@@ -91,7 +91,7 @@ export default function HelpPage() {
           {[['helpInspect', '实时变量检查'], ['helpCatalog', '变量目录'], ['helpRules', '嵌套规则示例'], ['helpBoundaries', '使用边界']].map(([id, label]) => <button key={id} type="button" onClick={() => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' })}>{label}<ArrowRightOutlined /></button>)}
         </nav>
         <div className="help-sections">
-          <div className="help-syntax-banner"><span className="type-mark"><CodeOutlined /></span><div><strong>变量语法</strong><p>通知模板和渠道配置使用 <code>{'${path}'}</code>；Webhook JSON 需要保留原始值类型时使用 <code>{'${json:path}'}</code>。规则编辑器无需手写模板语法，直接选择同名字段。</p></div></div>
+          <div className="help-syntax-banner"><span className="type-mark"><CodeOutlined /></span><div><strong>变量语法</strong><p>通知模板和渠道配置使用 <code>{'${path}'}</code>。<code>{'${text:path}'}</code> 会转为纯文本并去除 HTML、Markdown 标记；<code>{'${markdown:path}'}</code> 会将 HTML 富文本转为 Markdown，已有 Markdown 会尽量保留，适合 Markdown 或卡片渠道。Webhook JSON 需要保留原始值类型时使用 <code>{'${json:path}'}</code>。</p></div></div>
 
           <section className="help-section" id="helpInspect">
             <header className="help-section-head"><div><h2>实时变量检查</h2><p>选择一个现有监控，读取当前源数据，并查看本次可用变量。</p></div><Button icon={<ReloadOutlined />} disabled={!monitorId} loading={snapshot.isFetching} onClick={() => snapshot.refetch()}>重新检查</Button></header>

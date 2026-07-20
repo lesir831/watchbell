@@ -7,41 +7,45 @@ import (
 	"strings"
 )
 
-var variablePattern = regexp.MustCompile(`\$\{([a-zA-Z0-9_.-]+)\}`)
-var jsonVariablePattern = regexp.MustCompile(`\$\{(?:json:)?[a-zA-Z0-9_.-]+\}`)
+var renderVariablePattern = regexp.MustCompile(`\$\{(?:(text|markdown):)?([a-zA-Z0-9_.-]+)\}`)
+var templateVariablePattern = regexp.MustCompile(`\$\{(?:(?:json|text|markdown):)?[a-zA-Z0-9_.-]+\}`)
 
+// Render interpolates ordinary values and the text/markdown presentation
+// processors used by notification templates. JSON-safe interpolation remains
+// exclusive to RenderJSONTemplate.
 func Render(input string, data map[string]any) string {
-	return variablePattern.ReplaceAllStringFunc(input, func(token string) string {
-		matches := variablePattern.FindStringSubmatch(token)
-		if len(matches) != 2 {
+	return renderVariablePattern.ReplaceAllStringFunc(input, func(token string) string {
+		matches := renderVariablePattern.FindStringSubmatch(token)
+		if len(matches) != 3 {
 			return token
 		}
-		value, ok := lookup(data, matches[1])
+		value, ok := lookup(data, matches[2])
 		if !ok || value == nil {
 			return ""
 		}
-		return fmt.Sprint(value)
+		return renderValue(matches[1], value)
 	})
 }
 
-// RenderJSONTemplate renders ordinary ${path} variables as strings and
-// ${json:path} variables as complete JSON values. The latter is the safe way
-// to insert untrusted strings, arrays, or objects into a JSON webhook body.
+// RenderJSONTemplate renders ordinary and presentation-processed variables as
+// strings and ${json:path} variables as complete JSON values. The latter is
+// the safe way to insert untrusted strings, arrays, or objects into a JSON
+// webhook body.
 func RenderJSONTemplate(input string, data map[string]any) (string, error) {
 	var renderErr error
-	rendered := jsonVariablePattern.ReplaceAllStringFunc(input, func(token string) string {
+	rendered := templateVariablePattern.ReplaceAllStringFunc(input, func(token string) string {
 		if renderErr != nil {
 			return token
 		}
 		expression := strings.TrimSuffix(strings.TrimPrefix(token, "${"), "}")
-		if !strings.HasPrefix(expression, "json:") {
-			value, ok := lookup(data, expression)
+		processor, path := splitProcessor(expression)
+		if processor != "json" {
+			value, ok := lookup(data, path)
 			if !ok || value == nil {
 				return ""
 			}
-			return fmt.Sprint(value)
+			return renderValue(processor, value)
 		}
-		path := strings.TrimPrefix(expression, "json:")
 		value, ok := lookup(data, path)
 		if !ok {
 			value = nil
@@ -59,17 +63,37 @@ func RenderJSONTemplate(input string, data map[string]any) (string, error) {
 	return rendered, nil
 }
 
-// HasPlainVariables reports whether a template contains raw ${path}
-// interpolation. Raw interpolation is useful for text, URLs, and headers, but
-// must not be accepted in a JSON document because an attacker-controlled value
-// can change the document's structure while leaving it syntactically valid.
+// HasPlainVariables reports whether a template contains raw or presentation-
+// processed interpolation. Such interpolation is useful for text, URLs, and
+// headers, but must not be accepted in a JSON document because an attacker-
+// controlled value can change the document's structure while leaving it
+// syntactically valid.
 func HasPlainVariables(input string) bool {
-	for _, token := range jsonVariablePattern.FindAllString(input, -1) {
+	for _, token := range templateVariablePattern.FindAllString(input, -1) {
 		if !strings.HasPrefix(token, "${json:") {
 			return true
 		}
 	}
 	return false
+}
+
+func splitProcessor(expression string) (string, string) {
+	if index := strings.IndexByte(expression, ':'); index >= 0 {
+		return expression[:index], expression[index+1:]
+	}
+	return "", expression
+}
+
+func renderValue(processor string, value any) string {
+	text := fmt.Sprint(value)
+	switch processor {
+	case "text":
+		return richTextToPlainText(text)
+	case "markdown":
+		return richTextToMarkdown(text)
+	default:
+		return text
+	}
 }
 
 func lookup(data map[string]any, path string) (any, bool) {

@@ -388,7 +388,7 @@ TestFlight 有空位时本身就会产生事件。如果只想有事件就通知
 }
 ```
 
-`messageType` 支持 `text`、`markdown`、`link`、`actionCard` 和 `feedCard`。标题、正文以及 `extraParams` 中的字符串都支持模板变量；`extraParams` 会与生成的钉钉原生消息体递归合并，可配置链接图片、卡片按钮、FeedCard 链接和其他扩展字段。启用钉钉机器人“加签”安全设置时填写 `secret`，Webhook 地址和加签密钥都会按敏感字段保存且不会回显。
+`messageType` 支持 `text`、`markdown`、`link`、`actionCard` 和 `feedCard`。标题、正文以及 `extraParams` 中的字符串都支持模板变量；`extraParams` 会与生成的钉钉原生消息体递归合并，可配置链接图片、卡片按钮、FeedCard 链接和其他扩展字段。Markdown 和 ActionCard 正文发送前会把普通软换行转换成可见换行，同时保留已有空行。启用钉钉机器人“加签”安全设置时填写 `secret`，Webhook 地址和加签密钥都会按敏感字段保存且不会回显。
 
 ### Webhook
 
@@ -439,6 +439,15 @@ GET /api/health/ready
 ## 通知模板变量
 
 模板变量使用 `${...}`。在模板编辑器中输入 `$` 会自动补全花括号并把光标放在括号内；继续输入可筛选变量，点击变量则插入当前光标或选区位置。编辑器和帮助页读取同一份按系统、跨模块和监控模块聚合的变量目录。
+
+变量路径前可以添加文本处理函数：
+
+```text
+${text:rss.content}
+${markdown:rss.content}
+```
+
+`text` 会去除 HTML 和 Markdown 标记，保留便于阅读的段落与列表文本；`markdown` 会把 HTML 富文本转换为 Markdown，并尽量保持已经是 Markdown 的内容不变。它们适合在 RSS 正文等富文本变量用于通知模板时按目标渠道选择输出格式。
 
 跨模块快捷变量（RSS、TestFlight、网页和 GitHub Release 均可使用）：
 

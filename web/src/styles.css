@@ -1138,6 +1138,31 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .template-variable-browser-actions { display: flex; align-items: center; gap: 8px; flex: none; }
 .template-variable-browser-actions .ant-tag { margin: 0; }
 .template-variable-browser-actions a { color: var(--accent-strong); font-size: 10px; white-space: nowrap; }
+.template-transform-section { padding: 10px 2px; border-top: 1px solid var(--border); }
+.template-transform-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 7px; }
+.template-transform-heading strong { font-size: 11px; font-weight: 570; }
+.template-transform-heading span { color: var(--muted); font-size: 9px; }
+.template-transform-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+.template-transform-grid > button {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--fg);
+  cursor: pointer;
+  text-align: left;
+}
+.template-transform-grid > button:hover { border-color: color-mix(in oklch, var(--accent) 38%, var(--border)); background: var(--accent-soft); }
+.template-transform-grid > button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.template-transform-grid > button > span { min-width: 0; }
+.template-transform-grid strong { display: block; font-size: 10px; font-weight: 570; }
+.template-transform-grid small { display: block; overflow: hidden; margin-top: 2px; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.template-transform-grid code { flex: none; color: var(--accent-strong); font-family: var(--font-mono); font-size: 9px; }
 .template-variable-browser .ant-collapse { border-top: 1px solid var(--border); }
 .template-variable-browser .ant-collapse-header { padding: 8px 3px !important; }
 .template-variable-browser .ant-collapse-content-box { padding: 0 3px 10px !important; }
@@ -1167,6 +1192,8 @@ button, a { -webkit-tap-highlight-color: transparent; }
 @media (max-width: 520px) {
   .template-variable-browser-head { align-items: stretch; flex-direction: column; }
   .template-variable-browser-actions { justify-content: space-between; }
+  .template-transform-heading { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .template-transform-grid { grid-template-columns: 1fr; }
   .template-variable-grid { grid-template-columns: 1fr; }
 }
 .help-monitor-select { width: min(520px, 100%); }

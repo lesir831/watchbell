@@ -36,12 +36,13 @@ var dingTalkMessageTypes = map[string]struct{}{
 	"feedCard":   {},
 }
 
-var dingTalkTemplateVariablePattern = regexp.MustCompile(`\$\{[a-zA-Z0-9_.-]+\}`)
+var dingTalkTemplateVariablePattern = regexp.MustCompile(`\$\{(?:(?:text|markdown):)?[a-zA-Z0-9_.-]+\}`)
 
 // DingTalkConfig describes a DingTalk custom-robot webhook. ExtraParams is
 // recursively merged into the provider-native request body, so new or less
 // common DingTalk fields do not require a WatchBell release. String values in
-// ExtraParams support the same ${path} variables as notification templates.
+// ExtraParams support the same ${path}, ${text:path}, and ${markdown:path}
+// expressions as notification templates.
 type DingTalkConfig struct {
 	WebhookURL   string         `json:"webhookUrl"`
 	Secret       string         `json:"secret"`
@@ -305,7 +306,224 @@ func buildDingTalkPayload(cfg DingTalkConfig, message Message) (map[string]any, 
 	// messageType remains the source of truth even if extraParams contains a
 	// stale or conflicting msgtype field.
 	payload["msgtype"] = cfg.MessageType
+	normalizeDingTalkMarkdownPayload(cfg.MessageType, payload)
 	return payload, nil
+}
+
+// normalizeDingTalkMarkdownPayload turns ordinary editor newlines into
+// explicit Markdown hard breaks for the two DingTalk formats whose text field
+// is rendered as Markdown. Provider-native text/link/feedCard values are left
+// byte-for-byte unchanged.
+func normalizeDingTalkMarkdownPayload(messageType string, payload map[string]any) {
+	if messageType != "markdown" && messageType != "actionCard" {
+		return
+	}
+	message, ok := payload[messageType].(map[string]any)
+	if !ok {
+		return
+	}
+	text, ok := message["text"].(string)
+	if !ok {
+		return
+	}
+	message["text"] = normalizeDingTalkMarkdownBreaks(text)
+}
+
+func normalizeDingTalkMarkdownBreaks(input string) string {
+	if !strings.ContainsAny(input, "\r\n") {
+		return input
+	}
+	input = strings.ReplaceAll(input, "\r\n", "\n")
+	input = strings.ReplaceAll(input, "\r", "\n")
+	lines := strings.Split(input, "\n")
+	protected := dingTalkMarkdownProtectedLines(lines)
+
+	var result strings.Builder
+	result.Grow(len(input) + len(lines)*2)
+	for index, line := range lines {
+		if index == len(lines)-1 {
+			result.WriteString(line)
+			break
+		}
+		next := lines[index+1]
+		if strings.TrimSpace(line) == "" || strings.TrimSpace(next) == "" {
+			result.WriteString(line)
+			result.WriteByte('\n')
+			continue
+		}
+		if protected[index] || protected[index+1] {
+			result.WriteString(line)
+			if protected[index] != protected[index+1] {
+				// Establish a paragraph boundary before or after a list/code block.
+				result.WriteString("\n\n")
+			} else {
+				result.WriteByte('\n')
+			}
+			continue
+		}
+		if dingTalkMarkdownHardBreak(line) {
+			result.WriteString(line)
+			result.WriteByte('\n')
+			continue
+		}
+		// Two trailing spaces are the portable Markdown hard-break syntax. Trim
+		// a lone editor-added trailing space so the output stays deterministic.
+		result.WriteString(strings.TrimRight(line, " \t"))
+		result.WriteString("  \n")
+	}
+	return result.String()
+}
+
+func dingTalkMarkdownProtectedLines(lines []string) []bool {
+	protected := make([]bool, len(lines))
+	markDingTalkFencedCode(lines, protected)
+	for index := 1; index < len(lines); index++ {
+		if !protected[index-1] && !protected[index] && strings.TrimSpace(lines[index-1]) != "" && dingTalkMarkdownSetextUnderline(lines[index]) {
+			protected[index-1] = true
+			protected[index] = true
+		}
+	}
+
+	// A list item can contain nested markers, lazy continuation lines, and loose
+	// paragraphs separated by a blank line. Keep those lines intact until an
+	// unindented paragraph after a blank line definitively ends the list.
+	for index := 0; index < len(lines); index++ {
+		if protected[index] || !dingTalkMarkdownListMarker(lines[index]) {
+			continue
+		}
+		baseIndent := dingTalkMarkdownIndent(lines[index])
+		afterBlank := false
+		for cursor := index; cursor < len(lines); cursor++ {
+			if strings.TrimSpace(lines[cursor]) == "" {
+				afterBlank = true
+				continue
+			}
+			marker := dingTalkMarkdownListMarker(lines[cursor])
+			if afterBlank && !marker && dingTalkMarkdownIndent(lines[cursor]) <= baseIndent {
+				break
+			}
+			protected[cursor] = true
+			afterBlank = false
+		}
+	}
+	for index, line := range lines {
+		if dingTalkMarkdownIndentedCode(line) {
+			protected[index] = true
+		}
+	}
+	return protected
+}
+
+func dingTalkMarkdownIndent(line string) int {
+	indent := 0
+	for index := 0; index < len(line); index++ {
+		switch line[index] {
+		case ' ':
+			indent++
+		case '\t':
+			indent += 4
+		default:
+			return indent
+		}
+	}
+	return indent
+}
+
+func dingTalkMarkdownSetextUnderline(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || (trimmed[0] != '=' && trimmed[0] != '-') {
+		return false
+	}
+	marker := trimmed[0]
+	for index := 1; index < len(trimmed); index++ {
+		if trimmed[index] != marker {
+			return false
+		}
+	}
+	return true
+}
+
+func markDingTalkFencedCode(lines []string, protected []bool) {
+	inside := false
+	var fence byte
+	fenceLength := 0
+	for index, line := range lines {
+		marker, length, ok := dingTalkMarkdownFence(line)
+		if inside {
+			protected[index] = true
+			if ok && marker == fence && length >= fenceLength && dingTalkMarkdownClosingFence(line, marker, length) {
+				inside = false
+			}
+			continue
+		}
+		if ok {
+			protected[index] = true
+			inside = true
+			fence = marker
+			fenceLength = length
+		}
+	}
+}
+
+func dingTalkMarkdownClosingFence(line string, marker byte, length int) bool {
+	trimmed := strings.TrimLeft(line, " ")
+	if len(trimmed) < length {
+		return false
+	}
+	for index := 0; index < length; index++ {
+		if trimmed[index] != marker {
+			return false
+		}
+	}
+	return strings.TrimSpace(trimmed[length:]) == ""
+}
+
+func dingTalkMarkdownFence(line string) (byte, int, bool) {
+	indent := len(line) - len(strings.TrimLeft(line, " "))
+	if indent > 3 {
+		return 0, 0, false
+	}
+	trimmed := strings.TrimLeft(line, " ")
+	if len(trimmed) < 3 || (trimmed[0] != '`' && trimmed[0] != '~') {
+		return 0, 0, false
+	}
+	marker := trimmed[0]
+	length := 0
+	for length < len(trimmed) && trimmed[length] == marker {
+		length++
+	}
+	return marker, length, length >= 3
+}
+
+func dingTalkMarkdownListMarker(line string) bool {
+	trimmed := strings.TrimLeft(line, " \t")
+	if len(trimmed) < 2 {
+		return false
+	}
+	if (trimmed[0] == '-' || trimmed[0] == '+' || trimmed[0] == '*') && (trimmed[1] == ' ' || trimmed[1] == '\t') {
+		return true
+	}
+	index := 0
+	for index < len(trimmed) && trimmed[index] >= '0' && trimmed[index] <= '9' {
+		index++
+	}
+	return index > 0 && index+1 < len(trimmed) && (trimmed[index] == '.' || trimmed[index] == ')') && (trimmed[index+1] == ' ' || trimmed[index+1] == '\t')
+}
+
+func dingTalkMarkdownIndentedCode(line string) bool {
+	return strings.HasPrefix(line, "\t") || strings.HasPrefix(line, "    ")
+}
+
+func dingTalkMarkdownHardBreak(line string) bool {
+	if strings.HasSuffix(line, "  ") {
+		return true
+	}
+	trimmed := strings.TrimRight(line, " \t")
+	backslashes := 0
+	for index := len(trimmed) - 1; index >= 0 && trimmed[index] == '\\'; index-- {
+		backslashes++
+	}
+	return backslashes%2 == 1
 }
 
 func dingTalkValidationConfig(cfg DingTalkConfig) (DingTalkConfig, error) {
