@@ -221,3 +221,48 @@ func TestMatchKeepsLegacyFlatConditionBehavior(t *testing.T) {
 		t.Fatalf("matched = %#v, want %#v", matched, want)
 	}
 }
+
+func TestEvaluateAtExplainsNestedAnyGroupFailures(t *testing.T) {
+	raw := json.RawMessage(`{
+		"match":"all",
+		"conditions":[{
+			"match":"any",
+			"conditions":[
+				{"field":"rss.title","operator":"contains","value":"送码"},
+				{"field":"rss.content","operator":"contains","value":"兑换码"}
+			]
+		}]
+	}`)
+	details, err := EvaluateAt(raw, map[string]any{
+		"rss": map[string]any{"title": "普通文章", "content": "没有活动"},
+	}, time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if details.Matched {
+		t.Fatal("expected rule not to match")
+	}
+	for _, want := range []string{
+		"第 1 个条件组（任一）未满足",
+		"第 1.1 个条件",
+		`字段 "rss.title" 应包含 "送码"`,
+		`实际值为 "普通文章"`,
+		"第 1.2 个条件",
+		`字段 "rss.content" 应包含 "兑换码"`,
+	} {
+		if !strings.Contains(details.MismatchReason, want) {
+			t.Fatalf("reason %q does not contain %q", details.MismatchReason, want)
+		}
+	}
+}
+
+func TestEvaluateAtExplainsMissingField(t *testing.T) {
+	raw := json.RawMessage(`{"match":"all","conditions":[{"field":"rss.link","operator":"exists"}]}`)
+	details, err := EvaluateAt(raw, map[string]any{"rss": map[string]any{}}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if details.Matched || !strings.Contains(details.MismatchReason, `第 1 个条件（字段 "rss.link" 应存在）未满足：事件中不存在字段 "rss.link"`) {
+		t.Fatalf("unexpected details: %#v", details)
+	}
+}

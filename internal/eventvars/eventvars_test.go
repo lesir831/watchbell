@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/watchbell/watchbell/internal/model"
 )
@@ -93,6 +94,17 @@ func TestEventDataProtectsReservedAndGlobalVariables(t *testing.T) {
 	eventData := data["event"].(map[string]any)
 	if monitorData["name"] != "Protected feed" || eventData["id"] != int64(11) {
 		t.Fatalf("reserved context was overwritten: monitor=%#v event=%#v", monitorData, eventData)
+	}
+}
+
+func TestEventDataForDisplayUsesConfiguredTimezoneAndFormat(t *testing.T) {
+	event := model.Event{ID: 11, Type: "rss.item", CreatedAt: time.Date(2026, 7, 20, 6, 52, 58, 0, time.UTC)}
+	data, err := EventDataForDisplay(model.Monitor{Name: "Feed", Type: model.MonitorTypeRSS}, event, map[string]any{}, "Asia/Shanghai", "yyyy-MM-dd HH:mm:ss")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := data["event"].(map[string]any)["time"]; got != "2026-07-20 14:52:58" {
+		t.Fatalf("event.time = %#v", got)
 	}
 }
 

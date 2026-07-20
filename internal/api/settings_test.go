@@ -251,6 +251,8 @@ func TestRuntimeSettingsAndNetworkCheckEndpoints(t *testing.T) {
 	defaults := store.RuntimeSettings{
 		SessionTTL:       8 * time.Hour,
 		HistoryRetention: store.UniformHistoryRetention(90*24*time.Hour, 500),
+		Timezone:         "UTC",
+		DateTimeFormat:   "yyyy-MM-dd HH:mm:ss",
 	}
 	sched := scheduler.New(db, checker.NewRegistry(), notifier.NewRegistry(), scheduler.Options{})
 	apiServer := NewServer(db, sched, "", slog.New(slog.NewTextHandler(io.Discard, nil)), nil, WithRuntimeDefaults(defaults))
@@ -259,19 +261,36 @@ func TestRuntimeSettingsAndNetworkCheckEndpoints(t *testing.T) {
 	}
 	handler := apiServer.Routes()
 
-	update := httptest.NewRequest(http.MethodPut, "http://watchbell.test/api/settings/runtime", bytes.NewBufferString(`{"sessionTimeoutHours":24,"historyRetentionDays":30}`))
+	overview := httptest.NewRecorder()
+	handler.ServeHTTP(overview, httptest.NewRequest(http.MethodGet, "http://watchbell.test/api/settings", nil))
+	if overview.Code != http.StatusOK || !strings.Contains(overview.Body.String(), `"timezone":"UTC"`) || !strings.Contains(overview.Body.String(), `"dateTimeFormat":"yyyy-MM-dd HH:mm:ss"`) {
+		t.Fatalf("overview status=%d body=%s", overview.Code, overview.Body.String())
+	}
+
+	update := httptest.NewRequest(http.MethodPut, "http://watchbell.test/api/settings/runtime", bytes.NewBufferString(`{"sessionTimeoutHours":24,"historyRetentionDays":30,"timezone":"Asia/Shanghai","dateTimeFormat":"yyyy-MM-dd HH:mm"}`))
 	update.Header.Set("Content-Type", "application/json")
 	updateResponse := httptest.NewRecorder()
 	handler.ServeHTTP(updateResponse, update)
 	if updateResponse.Code != http.StatusOK {
 		t.Fatalf("update status=%d body=%s", updateResponse.Code, updateResponse.Body.String())
 	}
+	if !strings.Contains(updateResponse.Body.String(), `"timezone":"Asia/Shanghai"`) || !strings.Contains(updateResponse.Body.String(), `"dateTimeFormat":"yyyy-MM-dd HH:mm"`) {
+		t.Fatalf("update omitted display settings: %s", updateResponse.Body.String())
+	}
 	settings, err := db.GetRuntimeSettings(ctx, defaults)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if settings.SessionTTL != 24*time.Hour || settings.HistoryRetention.EventAge != 30*24*time.Hour || settings.HistoryRetention.AuditLogAge != 30*24*time.Hour {
+	if settings.SessionTTL != 24*time.Hour || settings.HistoryRetention.EventAge != 30*24*time.Hour || settings.HistoryRetention.AuditLogAge != 30*24*time.Hour || settings.Timezone != "Asia/Shanghai" || settings.DateTimeFormat != "yyyy-MM-dd HH:mm" {
 		t.Fatalf("persisted runtime settings = %#v", settings)
+	}
+
+	legacyUpdate := httptest.NewRequest(http.MethodPut, "http://watchbell.test/api/settings/runtime", bytes.NewBufferString(`{"sessionTimeoutHours":8,"historyRetentionDays":90}`))
+	legacyUpdate.Header.Set("Content-Type", "application/json")
+	legacyResponse := httptest.NewRecorder()
+	handler.ServeHTTP(legacyResponse, legacyUpdate)
+	if legacyResponse.Code != http.StatusOK || !strings.Contains(legacyResponse.Body.String(), `"timezone":"Asia/Shanghai"`) || !strings.Contains(legacyResponse.Body.String(), `"dateTimeFormat":"yyyy-MM-dd HH:mm"`) {
+		t.Fatalf("legacy update status=%d body=%s", legacyResponse.Code, legacyResponse.Body.String())
 	}
 
 	invalid := httptest.NewRequest(http.MethodPut, "http://watchbell.test/api/settings/runtime", bytes.NewBufferString(`{"sessionTimeoutHours":2,"historyRetentionDays":7}`))
@@ -280,6 +299,14 @@ func TestRuntimeSettingsAndNetworkCheckEndpoints(t *testing.T) {
 	handler.ServeHTTP(invalidResponse, invalid)
 	if invalidResponse.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("invalid settings status=%d body=%s", invalidResponse.Code, invalidResponse.Body.String())
+	}
+
+	invalidDisplay := httptest.NewRequest(http.MethodPut, "http://watchbell.test/api/settings/runtime", bytes.NewBufferString(`{"sessionTimeoutHours":8,"historyRetentionDays":90,"timezone":"UTC+8","dateTimeFormat":"RFC3339"}`))
+	invalidDisplay.Header.Set("Content-Type", "application/json")
+	invalidDisplayResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidDisplayResponse, invalidDisplay)
+	if invalidDisplayResponse.Code != http.StatusUnprocessableEntity || !strings.Contains(invalidDisplayResponse.Body.String(), `"timezone"`) || !strings.Contains(invalidDisplayResponse.Body.String(), `"dateTimeFormat"`) {
+		t.Fatalf("invalid display settings status=%d body=%s", invalidDisplayResponse.Code, invalidDisplayResponse.Body.String())
 	}
 
 	networkRequest := httptest.NewRequest(http.MethodPost, "http://watchbell.test/api/settings/network-check", bytes.NewReader(nil))

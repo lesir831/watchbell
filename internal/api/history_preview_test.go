@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/watchbell/watchbell/internal/datetime"
 	"github.com/watchbell/watchbell/internal/model"
 	"github.com/watchbell/watchbell/internal/store"
 )
@@ -59,6 +60,18 @@ func TestHistoryEndpointsSupportPaginationAndFilters(t *testing.T) {
 	if filteredOnly.StatusCode != http.StatusOK || filteredPage.Total != 3 || len(filteredPage.Items) != 3 {
 		t.Fatalf("filter-only query was not paginated: status=%d page=%#v", filteredOnly.StatusCode, filteredPage)
 	}
+	eventOnly, err := http.Get(fmt.Sprintf("%s/api/events?page=1&pageSize=20&eventId=%d", server.URL, page.Items[0].ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eventOnly.Body.Close()
+	var eventPage store.Page[model.Event]
+	if err := json.NewDecoder(eventOnly.Body).Decode(&eventPage); err != nil {
+		t.Fatal(err)
+	}
+	if eventOnly.StatusCode != http.StatusOK || eventPage.Total != 1 || len(eventPage.Items) != 1 || eventPage.Items[0].ID != page.Items[0].ID {
+		t.Fatalf("event-id page: status=%d page=%#v", eventOnly.StatusCode, eventPage)
+	}
 
 	invalid, err := http.Get(server.URL + "/api/events?page=0&pageSize=20")
 	if err != nil {
@@ -85,9 +98,18 @@ func TestTemplatePreviewCanUseRealEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := db.SetRuntimeSettingsAudited(context.Background(), store.RuntimeSettings{
+		SessionTTL: 8 * time.Hour, Timezone: "Asia/Shanghai", DateTimeFormat: datetime.FormatYearMonthDay,
+	}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	formattedTime, err := datetime.Format(event.CreatedAt, "Asia/Shanghai", datetime.FormatYearMonthDay)
+	if err != nil {
+		t.Fatal(err)
+	}
 	body, _ := json.Marshal(map[string]any{
 		"subjectTemplate": "${monitor.name}: ${rss.title}",
-		"bodyTemplate":    "${event.type} ${rss.link} ${url}",
+		"bodyTemplate":    "${event.type} ${rss.link} ${url} ${event.time}",
 		"eventId":         event.ID,
 	})
 	response, err := http.Post(server.URL+"/api/templates/preview", "application/json", bytes.NewReader(body))
@@ -102,7 +124,7 @@ func TestTemplatePreviewCanUseRealEvent(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		t.Fatal(err)
 	}
-	if result["subject"] != "Production feed: A real release" || result["body"] != "rss.item https://example.com/release https://example.com/release" {
+	if result["subject"] != "Production feed: A real release" || result["body"] != "rss.item https://example.com/release https://example.com/release "+formattedTime {
 		t.Fatalf("unexpected preview: %#v", result)
 	}
 }

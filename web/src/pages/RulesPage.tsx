@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   App as AntApp,
@@ -28,18 +28,20 @@ const { Text } = Typography;
 const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 const clockPattern = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 
-export default function RulesPage() {
+export default function RulesPage({ editRuleId }: { editRuleId?: number }) {
   const queryClient = useQueryClient();
   const { message } = AntApp.useApp();
   const [editing, setEditing] = useState<Rule | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState<'all' | 'enabled' | 'disabled'>('all');
+  const handledRuleLink = useRef<number>();
   const rules = useQuery({ queryKey: ['rules'], queryFn: api.listRules, refetchInterval: 30_000 });
   const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors, refetchInterval: 30_000 });
   const channels = useQuery({ queryKey: ['channels'], queryFn: api.listChannels, refetchInterval: 30_000 });
   const templates = useQuery({ queryKey: ['templates'], queryFn: api.listTemplates, refetchInterval: 30_000 });
   const plugins = useQuery({ queryKey: ['plugins'], queryFn: api.listPlugins });
+  const settings = useQuery({ queryKey: ['settings'], queryFn: api.settings, staleTime: 60_000 });
   const monitorByID = useMemo(() => new Map((monitors.data ?? []).map((item) => [item.id, item])), [monitors.data]);
   const templateByID = useMemo(() => new Map((templates.data ?? []).map((item) => [item.id, item])), [templates.data]);
   const pluginByID = useMemo(() => new Map((plugins.data ?? []).map((item) => [item.id, item])), [plugins.data]);
@@ -80,6 +82,17 @@ export default function RulesPage() {
   });
   const canCreate = Boolean(monitors.data?.length && channels.data?.some((item) => item.enabled));
   const openNew = () => { setEditing(null); setDrawerOpen(true); };
+  useEffect(() => {
+    if (!editRuleId || !rules.data || handledRuleLink.current === editRuleId) return;
+    handledRuleLink.current = editRuleId;
+    const record = rules.data.find((item) => item.id === editRuleId);
+    if (!record) {
+      message.warning(`规则 #${editRuleId} 不存在或已归档`);
+      return;
+    }
+    setEditing(record);
+    setDrawerOpen(true);
+  }, [editRuleId, message, rules.data]);
   return (
     <div className="design-page">
       <PageHeader
@@ -126,7 +139,7 @@ export default function RulesPage() {
       )}
       <RuleDrawer
         open={drawerOpen} record={editing} monitors={monitors.data ?? []} channels={channels.data ?? []}
-        templates={templates.data ?? []} plugins={plugins.data ?? []} saving={saveMutation.isPending} error={saveMutation.error as Error | null}
+        templates={templates.data ?? []} plugins={plugins.data ?? []} defaultTimezone={settings.data?.timezone ?? browserTimezone} saving={saveMutation.isPending} error={saveMutation.error as Error | null}
         onClose={() => { setDrawerOpen(false); saveMutation.reset(); }} onSave={(input) => saveMutation.mutate({ id: editing?.id, input })}
       />
     </div>
@@ -141,7 +154,7 @@ function conditionSummary(rule: Rule) {
 
 function RuleDrawer(props: {
   open: boolean; record: Rule | null; monitors: Monitor[]; channels: NotifyChannel[]; templates: NotificationTemplate[]; plugins: MonitorPlugin[];
-  saving: boolean; error: Error | null; onClose: () => void; onSave: (input: RuleInput) => void;
+  defaultTimezone: string; saving: boolean; error: Error | null; onClose: () => void; onSave: (input: RuleInput) => void;
 }) {
   const [form] = Form.useForm();
   const { message } = AntApp.useApp();
@@ -177,7 +190,7 @@ function RuleDrawer(props: {
       enabled: props.record?.enabled ?? true, cooldownSeconds: props.record?.cooldownSeconds ?? 0,
       notifyChannelIds: props.record?.notifyChannelIds ?? [], templateId: props.record?.templateId ?? defaultTemplateId,
       allEvents: isAllEvents,
-      quietHours: { enabled: false, start: '22:00', end: '08:00', timezone: browserTimezone, ...props.record?.quietHours }
+      quietHours: { enabled: false, start: '22:00', end: '08:00', timezone: props.defaultTimezone, ...props.record?.quietHours }
     });
   };
   const submit = async () => {

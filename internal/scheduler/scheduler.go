@@ -460,15 +460,16 @@ func (s *Scheduler) dispatchEvent(ctx context.Context, monitor model.Monitor, ev
 			}
 			continue
 		}
-		matchedOK, matched, matchErr := rule.MatchAt(item.Condition, payload, s.nowUTC())
+		matchDetails, matchErr := rule.EvaluateAt(item.Condition, payload, s.nowUTC())
+		matched := matchDetails.Values
 		if matchErr != nil {
 			if _, err := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "error", matchErr.Error(), matched); err != nil {
 				return err
 			}
 			continue
 		}
-		if !matchedOK {
-			if _, err := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "not_matched", "事件内容不符合规则条件。", matched); err != nil {
+		if !matchDetails.Matched {
+			if _, err := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "not_matched", matchDetails.MismatchReason, matched); err != nil {
 				return err
 			}
 			continue
@@ -504,7 +505,13 @@ func (s *Scheduler) dispatchEvent(ctx context.Context, monitor model.Monitor, ev
 			}
 			continue
 		}
-		data := notificationData(monitor, item, event, payload, matched)
+		data, err := s.notificationData(ctx, monitor, item, event, payload, matched)
+		if err != nil {
+			if _, recordErr := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "error", "格式化通知时间失败："+err.Error(), matched); recordErr != nil {
+				return recordErr
+			}
+			continue
+		}
 		message := notifier.Message{
 			Subject: templatex.Render(template.SubjectTemplate, data),
 			Body:    templatex.Render(template.BodyTemplate, data),
@@ -788,6 +795,19 @@ func notificationData(monitor model.Monitor, ruleItem model.Rule, event model.Ev
 	data := eventvars.EventData(monitor, event, payload)
 	data["rule"] = map[string]any{"id": ruleItem.ID, "name": ruleItem.Name, "matched": matched}
 	return data
+}
+
+func (s *Scheduler) notificationData(ctx context.Context, monitor model.Monitor, ruleItem model.Rule, event model.Event, payload map[string]any, matched []string) (map[string]any, error) {
+	settings, err := s.store.GetRuntimeSettings(ctx, store.RuntimeSettings{})
+	if err != nil {
+		return nil, err
+	}
+	data, err := eventvars.EventDataForDisplay(monitor, event, payload, settings.Timezone, settings.DateTimeFormat)
+	if err != nil {
+		return nil, err
+	}
+	data["rule"] = map[string]any{"id": ruleItem.ID, "name": ruleItem.Name, "matched": matched}
+	return data, nil
 }
 
 func (s *Scheduler) NextCheckAt(monitor model.Monitor) *time.Time {

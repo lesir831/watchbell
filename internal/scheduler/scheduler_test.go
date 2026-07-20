@@ -309,6 +309,49 @@ func TestTraceChainAndRetry(t *testing.T) {
 	}
 }
 
+func TestUnmatchedRuleEvaluationIdentifiesFailedCondition(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	monitor, err := db.CreateMonitor(ctx, model.MonitorInput{
+		Name: "Diagnostic monitor", Type: "trace_test", Enabled: false, IntervalSeconds: 60, Config: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.CreateRule(ctx, model.RuleInput{
+		MonitorID: monitor.ID, Name: "Blocked value", Enabled: true,
+		Condition: json.RawMessage(`{"match":"all","conditions":[{"field":"trace.value","operator":"equals","value":"blocked"}]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scheduler := New(db, checker.NewRegistry(traceChecker{}), notifier.NewRegistry(), Options{})
+	if err := scheduler.RunOnce(ctx, monitor.ID); err != nil {
+		t.Fatal(err)
+	}
+	evaluations, err := db.ListRuleEvaluations(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evaluations) != 1 || evaluations[0].Status != "not_matched" {
+		t.Fatalf("unexpected evaluations: %#v", evaluations)
+	}
+	for _, want := range []string{"第 1 个条件", `"trace.value"`, `"blocked"`, `实际值为 "ready"`} {
+		if !strings.Contains(evaluations[0].Reason, want) {
+			t.Fatalf("reason %q does not contain %q", evaluations[0].Reason, want)
+		}
+	}
+	if evaluations[0].Reason == "事件内容不符合规则条件。" {
+		t.Fatalf("evaluation kept generic reason: %#v", evaluations[0])
+	}
+}
+
 func TestNotificationDataIncludesCrossModuleVariables(t *testing.T) {
 	monitor := model.Monitor{ID: 1, Name: "Feed", Type: model.MonitorTypeRSS, Config: json.RawMessage(`{"url":"https://example.com/feed.xml"}`)}
 	ruleItem := model.Rule{ID: 2, Name: "Keywords"}

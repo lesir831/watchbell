@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/watchbell/watchbell/internal/auth"
+	"github.com/watchbell/watchbell/internal/datetime"
 	"github.com/watchbell/watchbell/internal/model"
 	"github.com/watchbell/watchbell/internal/store"
 )
@@ -44,18 +45,15 @@ func (s *Server) settingsOverview(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"authEnabled":          authEnabled,
-		"username":             username,
-		"sessionTimeoutHours":  durationHours(settings.SessionTTL),
-		"historyRetentionDays": commonRetentionDays(settings.HistoryRetention),
-	})
+	writeJSON(w, http.StatusOK, runtimeSettingsPayload(settings, authEnabled, username))
 }
 
 func (s *Server) updateRuntimeSettings(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		SessionTimeoutHours  int `json:"sessionTimeoutHours"`
-		HistoryRetentionDays int `json:"historyRetentionDays"`
+		SessionTimeoutHours  int     `json:"sessionTimeoutHours"`
+		HistoryRetentionDays int     `json:"historyRetentionDays"`
+		Timezone             *string `json:"timezone"`
+		DateTimeFormat       *string `json:"dateTimeFormat"`
 	}
 	if !decode(w, r, &input) {
 		return
@@ -72,6 +70,17 @@ func (s *Server) updateRuntimeSettings(w http.ResponseWriter, r *http.Request) {
 	if !allowedHistoryRetentionDays[input.HistoryRetentionDays] && input.HistoryRetentionDays != commonRetentionDays(current.HistoryRetention) {
 		fields["historyRetentionDays"] = "活动保留期必须是 30、90 或 180 天。"
 	}
+	if input.Timezone != nil {
+		timezone := strings.TrimSpace(*input.Timezone)
+		if err := datetime.ValidateTimeZone(timezone); err != nil {
+			fields["timezone"] = "时区必须是有效的 IANA 名称，例如 Asia/Shanghai。"
+		}
+	}
+	if input.DateTimeFormat != nil {
+		if err := datetime.ValidateFormat(*input.DateTimeFormat); err != nil {
+			fields["dateTimeFormat"] = "日期时间格式必须是 yyyy-MM-dd HH:mm:ss、yyyy-MM-dd HH:mm 或 MM-dd-yyyy HH:mm:ss。"
+		}
+	}
 	if len(fields) > 0 {
 		writeError(w, r, validationProblem("请修正运行时设置。", fields))
 		return
@@ -85,6 +94,12 @@ func (s *Server) updateRuntimeSettings(w http.ResponseWriter, r *http.Request) {
 		current.HistoryRetention.CheckRunAge = retention
 		current.HistoryRetention.NotificationAttemptAge = retention
 		current.HistoryRetention.AuditLogAge = retention
+	}
+	if input.Timezone != nil {
+		current.Timezone = strings.TrimSpace(*input.Timezone)
+	}
+	if input.DateTimeFormat != nil {
+		current.DateTimeFormat = *input.DateTimeFormat
 	}
 	if err := s.store.SetRuntimeSettingsAudited(r.Context(), current, s.actor(r)); err != nil {
 		writeError(w, r, err)
@@ -100,12 +115,7 @@ func (s *Server) updateRuntimeSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"authEnabled":          authEnabled(s.auth),
-		"username":             username(s.auth),
-		"sessionTimeoutHours":  input.SessionTimeoutHours,
-		"historyRetentionDays": input.HistoryRetentionDays,
-	})
+	writeJSON(w, http.StatusOK, runtimeSettingsPayload(current, authEnabled(s.auth), username(s.auth)))
 }
 
 func (s *Server) effectiveRuntimeDefaults() store.RuntimeSettings {
@@ -141,6 +151,17 @@ func commonRetentionDays(policy store.HistoryRetentionPolicy) int {
 		return 0
 	}
 	return int(value / (24 * time.Hour))
+}
+
+func runtimeSettingsPayload(settings store.RuntimeSettings, authEnabled bool, username string) map[string]any {
+	return map[string]any{
+		"authEnabled":          authEnabled,
+		"username":             username,
+		"sessionTimeoutHours":  durationHours(settings.SessionTTL),
+		"historyRetentionDays": commonRetentionDays(settings.HistoryRetention),
+		"timezone":             settings.Timezone,
+		"dateTimeFormat":       settings.DateTimeFormat,
+	}
 }
 
 func authEnabled(manager *auth.Manager) bool { return manager != nil && manager.Enabled() }

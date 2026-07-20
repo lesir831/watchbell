@@ -94,7 +94,7 @@ func (c *RSSChecker) Check(ctx context.Context, monitor model.Monitor) (model.Ch
 	if fetched.NotModified {
 		return model.CheckResult{
 			Status:  "ok",
-			Message: "not modified",
+			Message: "暂无新增文章",
 			State:   stateToMap(state),
 		}, nil
 	}
@@ -120,9 +120,13 @@ func (c *RSSChecker) Check(ctx context.Context, monitor model.Monitor) (model.Ch
 	state.LastModified = fetched.LastModified
 	trimRSSSeen(&state, currentKeys, cfg.MaxSeenItems)
 
+	message := "暂无新增文章"
+	if len(events) > 0 {
+		message = fmt.Sprintf("新增 %d 篇文章", len(events))
+	}
 	return model.CheckResult{
 		Status:  "ok",
-		Message: fmt.Sprintf("%d new item(s)", len(events)),
+		Message: message,
 		State:   stateToMap(state),
 		Events:  events,
 	}, nil

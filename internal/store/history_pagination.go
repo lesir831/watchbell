@@ -45,6 +45,7 @@ type CheckRunFilter struct {
 type EventFilter struct {
 	PageRequest
 	HistoryTimeRange
+	EventID    int64
 	MonitorID  int64
 	CheckRunID int64
 	Type       string
@@ -120,6 +121,7 @@ func (s *Store) ListEventsPage(ctx context.Context, filter EventFilter) (Page[mo
 	if err != nil {
 		return Page[model.Event]{}, err
 	}
+	addInt64Condition(&clauses, &args, "e.id", filter.EventID)
 	addInt64Condition(&clauses, &args, "e.monitor_id", filter.MonitorID)
 	addInt64Condition(&clauses, &args, "l.check_run_id", filter.CheckRunID)
 	addStringCondition(&clauses, &args, "e.type", filter.Type)

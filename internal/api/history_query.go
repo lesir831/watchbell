@@ -119,7 +119,11 @@ func eventFilter(r *http.Request) (store.EventFilter, error) {
 	if err != nil {
 		return store.EventFilter{}, err
 	}
-	return store.EventFilter{PageRequest: page, HistoryTimeRange: timeRange, MonitorID: monitorID, CheckRunID: checkRunID, Type: r.URL.Query().Get("type")}, nil
+	eventID, err := optionalQueryID(r, "eventId")
+	if err != nil {
+		return store.EventFilter{}, err
+	}
+	return store.EventFilter{PageRequest: page, HistoryTimeRange: timeRange, EventID: eventID, MonitorID: monitorID, CheckRunID: checkRunID, Type: r.URL.Query().Get("type")}, nil
 }
 
 func ruleEvaluationFilter(r *http.Request) (store.RuleEvaluationFilter, error) {

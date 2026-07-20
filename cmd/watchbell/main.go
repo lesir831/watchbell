@@ -18,6 +18,7 @@ import (
 	"github.com/watchbell/watchbell/internal/auth"
 	"github.com/watchbell/watchbell/internal/checker"
 	"github.com/watchbell/watchbell/internal/config"
+	"github.com/watchbell/watchbell/internal/datetime"
 	"github.com/watchbell/watchbell/internal/maintenance"
 	"github.com/watchbell/watchbell/internal/notifier"
 	"github.com/watchbell/watchbell/internal/scheduler"
@@ -84,7 +85,9 @@ func main() {
 	defer db.Close()
 	retention := config.RetentionFromEnv()
 	runtimeDefaults := store.RuntimeSettings{
-		SessionTTL: cfg.Auth.SessionTTL,
+		SessionTTL:     cfg.Auth.SessionTTL,
+		Timezone:       datetime.DeploymentTimeZone(),
+		DateTimeFormat: datetime.DefaultFormat,
 		HistoryRetention: store.HistoryRetentionPolicy{
 			EventAge: retention.EventAge, CheckRunAge: retention.CheckRunAge,
 			NotificationAttemptAge: retention.NotificationAttemptAge,

@@ -18,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/watchbell/watchbell/internal/auth"
+	"github.com/watchbell/watchbell/internal/datetime"
 	"github.com/watchbell/watchbell/internal/eventvars"
 	"github.com/watchbell/watchbell/internal/model"
 	"github.com/watchbell/watchbell/internal/notifier"
@@ -687,6 +688,15 @@ func (s *Server) templateRenderData(ctx context.Context, eventID *int64, supplie
 	if eventID == nil {
 		if supplied == nil {
 			supplied = sampleTemplateData()
+			settings, err := s.store.GetRuntimeSettings(ctx, s.effectiveRuntimeDefaults())
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			formatted, err := datetime.Format(time.Date(2026, time.July, 2, 0, 0, 0, 0, time.UTC), settings.Timezone, settings.DateTimeFormat)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			supplied["event"].(map[string]any)["time"] = formatted
 		}
 		return supplied, nil, nil, nil
 	}
@@ -705,15 +715,26 @@ func (s *Server) templateRenderData(ctx context.Context, eventID *int64, supplie
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return nil, nil, nil, err
 	}
+	settings, err := s.store.GetRuntimeSettings(ctx, s.effectiveRuntimeDefaults())
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	data, err := templatePreviewData(monitor, event, payload, settings.Timezone, settings.DateTimeFormat)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	monitorID := monitor.ID
 	resolvedEventID := event.ID
-	return templatePreviewData(monitor, event, payload), &monitorID, &resolvedEventID, nil
+	return data, &monitorID, &resolvedEventID, nil
 }
 
-func templatePreviewData(monitor model.Monitor, event model.Event, payload map[string]any) map[string]any {
-	data := eventvars.EventData(monitor, event, payload)
+func templatePreviewData(monitor model.Monitor, event model.Event, payload map[string]any, timezone, format string) (map[string]any, error) {
+	data, err := eventvars.EventDataForDisplay(monitor, event, payload, timezone, format)
+	if err != nil {
+		return nil, err
+	}
 	data["rule"] = map[string]any{"id": int64(0), "name": "模板预览", "matched": []string{}}
-	return data
+	return data, nil
 }
 
 func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {

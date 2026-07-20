@@ -136,7 +136,7 @@ export default function MonitorsPage({ onNavigate, createRequest = 0 }: { onNavi
                 <td><div className="entity-name"><span className="type-mark">{monitorTypeIcon(item.type)}</span><span className="name-stack"><strong>{item.name}</strong><span>{pluginByID.get(item.type)?.name ?? item.type}</span></span></div></td>
                 <td><div className="status-stack"><StatusTag status={!item.enabled ? 'disabled' : item.lastStatus} />{item.failureAlertActive && <span className="inline-warning">故障告警中</span>}</div></td>
                 <td className="number">每 {formatInterval(item.intervalSeconds)}</td>
-                <td><span className="number">{relativeDate(item.lastCheckedAt)}</span><small>{item.lastError || item.lastMessage || (item.enabled ? `下次 ${relativeDate(item.nextCheckAt)}` : '手动停用')}</small></td>
+                <td><span className="number">{relativeDate(item.lastCheckedAt)}</span><small>{item.lastError || monitorStatusMessage(item) || (item.enabled ? `下次 ${relativeDate(item.nextCheckAt)}` : '手动停用')}</small></td>
                 <td>{actions(item)}</td>
               </tr>
             ))}</tbody>
@@ -147,7 +147,7 @@ export default function MonitorsPage({ onNavigate, createRequest = 0 }: { onNavi
             <article key={item.id} className="mobile-entity-card">
               <div className="mobile-card-head"><div className="entity-name"><span className="type-mark">{monitorTypeIcon(item.type)}</span><span className="name-stack"><strong>{item.name}</strong><span>{pluginByID.get(item.type)?.name ?? item.type}</span></span></div><StatusTag status={!item.enabled ? 'disabled' : item.lastStatus} /></div>
               <div className="mobile-card-meta"><div><span>检查频率</span><strong>每 {formatInterval(item.intervalSeconds)}</strong></div><div><span>最近检查</span><strong>{relativeDate(item.lastCheckedAt)}</strong></div><div><span>网络</span><strong>{item.proxyId ? proxyByID.get(item.proxyId)?.name ?? `代理 #${item.proxyId}` : '默认网络'}</strong></div><div><span>连续失败</span><strong>{item.consecutiveFailures || '—'}</strong></div></div>
-              {(item.lastError || item.lastMessage) && <Alert type={item.lastError ? 'error' : 'info'} showIcon message={item.lastError || item.lastMessage} />}
+              {(item.lastError || item.lastMessage) && <Alert type={item.lastError ? 'error' : 'info'} showIcon message={item.lastError || monitorStatusMessage(item)} />}
               {actions(item)}
             </article>
           ))}
@@ -175,6 +175,18 @@ function monitorTypeIcon(type: MonitorType) {
   if (type === 'rss') return <RadarChartOutlined />;
   if (type === 'webpage') return <GlobalOutlined />;
   return <RocketOutlined />;
+}
+
+function monitorStatusMessage(item: Monitor) {
+  const message = item.lastMessage?.trim() ?? '';
+  const normalized = message.toLowerCase();
+  if (item.type === 'rss' && normalized === 'not modified') return '暂无新增文章';
+  if (item.type === 'testflight' && (normalized.includes('beta is full') || normalized.includes('testflight beta is full'))) return 'TestFlight 测试名额已满';
+  if (item.type === 'github_release') {
+    const latestVersion = typeof item.state?.latestVersion === 'string' ? item.state.latestVersion.trim() : '';
+    if (latestVersion) return `最新版本：${latestVersion}`;
+  }
+  return message;
 }
 
 function MonitorDrawer(props: {

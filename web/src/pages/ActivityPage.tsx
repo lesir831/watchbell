@@ -1,9 +1,9 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Alert, App as AntApp, Button, Card, Drawer, Form, Input, InputNumber, Popconfirm, Select, Space, Statistic, Table, Tabs, Tag, Typography, Upload } from 'antd';
 import { CopyOutlined, DownloadOutlined, ReloadOutlined, SearchOutlined, UploadOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
-import { formatDate, formatDuration, jsonText, PageError, PageHeader, relativeDate, StatusTag } from '../components/Common';
+import { eventTitle, formatDate, formatDuration, formatTime, jsonText, PageError, PageHeader, relativeDate, RenderedData, StatusTag } from '../components/Common';
 import type { AuditLog, CheckRun, ConfigBackup, DeadLetter, EventRecord, HistoryPage, HistoryQuery, NotificationAttempt, RuleEvaluation } from '../types';
 
 const { Text } = Typography;
@@ -21,16 +21,21 @@ function initialRecord<T>(factory: () => T): Record<HistoryTab, T> {
   return Object.fromEntries(historyTabs.map((key) => [key, factory()])) as Record<HistoryTab, T>;
 }
 
-export default function ActivityPage() {
+export default function ActivityPage({ initialTab, initialEventId }: { initialTab?: 'events' | 'evaluations' | 'attempts'; initialEventId?: number }) {
   const { message } = AntApp.useApp();
   const queryClient = useQueryClient();
   const [detail, setDetail] = useState<DetailItem>(null);
-  const [activeTab, setActiveTab] = useState('runs');
+  const [activeTab, setActiveTab] = useState(initialTab ?? 'runs');
   const [activityKind, setActivityKind] = useState<ActivityKind>('all');
   const [activitySearch, setActivitySearch] = useState('');
   const [filterForm] = Form.useForm<FilterValues>();
   const [paging, setPaging] = useState(() => initialRecord<PageState>(() => ({ page: 1, pageSize: 15 })));
-  const [filters, setFilters] = useState(() => initialRecord<FilterValues>(() => ({})));
+  const [filters, setFilters] = useState(() => {
+    const values = initialRecord<FilterValues>(() => ({}));
+    if (initialEventId) values.events = { eventId: initialEventId };
+    return values;
+  });
+  const [pendingEventId, setPendingEventId] = useState(initialEventId);
   const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors, refetchInterval: 20_000 });
   const runsQuery = { ...paging.runs, ...filters.runs };
   const eventsQuery = { ...paging.events, ...filters.events };
@@ -55,6 +60,26 @@ export default function ActivityPage() {
     onError: (error: Error) => message.error(error.message)
   });
 
+  useEffect(() => {
+    if (!initialTab && !initialEventId) return;
+    if (initialTab) setActiveTab(initialTab);
+    if (initialEventId) {
+      setActiveTab('events');
+      setFilters((current) => ({ ...current, events: { eventId: initialEventId } }));
+      setPaging((current) => ({ ...current, events: { ...current.events, page: 1 } }));
+      filterForm.setFieldsValue({ eventId: initialEventId });
+      setPendingEventId(initialEventId);
+    }
+  }, [filterForm, initialEventId, initialTab]);
+
+  useEffect(() => {
+    if (!pendingEventId) return;
+    const event = events.data?.items.find((item) => item.id === pendingEventId);
+    if (!event) return;
+    setDetail({ title: `事件 #${event.id} · ${eventTitle(event.payload, monitorByID.get(event.monitorId))}`, data: event });
+    setPendingEventId(undefined);
+  }, [events.data, monitorByID, pendingEventId]);
+
   const changePage = (key: HistoryTab, page: number, pageSize: number) => setPaging((current) => ({ ...current, [key]: { page, pageSize } }));
   const selectTab = (key: string) => {
     setActiveTab(key);
@@ -74,6 +99,13 @@ export default function ActivityPage() {
     filterForm.resetFields();
     setFilters((current) => ({ ...current, [key]: {} }));
     setPaging((current) => ({ ...current, [key]: { ...current[key], page: 1 } }));
+  };
+  const openRelatedEvent = (eventId: number) => {
+    setActiveTab('events');
+    setFilters((current) => ({ ...current, events: { eventId } }));
+    setPaging((current) => ({ ...current, events: { ...current.events, page: 1 } }));
+    filterForm.setFieldsValue({ eventId });
+    setPendingEventId(eventId);
   };
   const loadingError = activeTab === 'runs' ? runs.error : activeTab === 'events' ? events.error : activeTab === 'evaluations' ? evaluations.error : activeTab === 'attempts' ? attempts.error : activeTab === 'audit' ? audits.error : system.error;
   const timelineItems = useMemo(() => {
@@ -135,7 +167,7 @@ export default function ActivityPage() {
             { key: 'runs', label: `检查运行 ${runs.data?.total ?? ''}`, children: <RunsTable data={runs.data?.items ?? []} page={runs.data} loading={runs.isFetching} onPage={(page, size) => changePage('runs', page, size)} onDetail={(item) => setDetail({ title: `检查运行 #${item.id}`, data: item })} /> },
             { key: 'events', label: `事件 ${events.data?.total ?? ''}`, children: <EventsTable data={events.data?.items ?? []} page={events.data} loading={events.isFetching} monitorByID={monitorByID} onPage={(page, size) => changePage('events', page, size)} onDetail={(item) => setDetail({ title: `事件 #${item.id}`, data: item })} /> },
             { key: 'evaluations', label: `规则判断 ${evaluations.data?.total ?? ''}`, children: <EvaluationsTable data={evaluations.data?.items ?? []} page={evaluations.data} loading={evaluations.isFetching} onPage={(page, size) => changePage('evaluations', page, size)} onDetail={(item) => setDetail({ title: `规则判断 #${item.id}`, data: item })} /> },
-            { key: 'attempts', label: `通知尝试 ${attempts.data?.total ?? ''}`, children: <AttemptsTable data={attempts.data?.items ?? []} page={attempts.data} loading={attempts.isFetching} retrying={retryMutation.isPending ? retryMutation.variables : undefined} monitorByID={monitorByID} onPage={(page, size) => changePage('attempts', page, size)} onRetry={(id) => retryMutation.mutate(id)} onDetail={(item) => setDetail({ title: `通知尝试 #${item.id}`, data: item })} /> },
+            { key: 'attempts', label: `通知尝试 ${attempts.data?.total ?? ''}`, children: <AttemptsTable data={attempts.data?.items ?? []} page={attempts.data} loading={attempts.isFetching} retrying={retryMutation.isPending ? retryMutation.variables : undefined} monitorByID={monitorByID} onPage={(page, size) => changePage('attempts', page, size)} onRetry={(id) => retryMutation.mutate(id)} onDetail={(item) => setDetail({ title: `通知尝试 #${item.id}`, data: item })} onOpenEvent={openRelatedEvent} /> },
             { key: 'audit', label: `操作审计 ${audits.data?.total ?? ''}`, children: <AuditTable data={audits.data?.items ?? []} page={audits.data} loading={audits.isFetching} onPage={(page, size) => changePage('audit', page, size)} onDetail={(item) => setDetail({ title: `操作记录 #${item.id}`, data: item })} /> },
             { key: 'system', label: '系统诊断', children: <SystemPanel data={system.data} loading={system.isLoading} error={system.error as Error | null} onRefresh={() => system.refetch()} /> }
           ]}
@@ -144,14 +176,14 @@ export default function ActivityPage() {
       </section>
       <Drawer title={detail?.title} open={detail !== null} onClose={() => setDetail(null)} width={680}>
         <Button icon={<CopyOutlined />} onClick={() => { navigator.clipboard.writeText(jsonText(detail?.data)); message.success('详情已复制'); }}>复制 JSON</Button>
-        <pre className="detail-json">{jsonText(detail?.data)}</pre>
+        <div className="activity-rendered-detail"><RenderedData value={detail?.data} /></div>
       </Drawer>
     </div>
   );
 }
 
 function activityTime(value: string) {
-  return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(value));
+  return formatTime(value);
 }
 
 function HistoryFilters({ tab, form, monitors, onApply, onClear }: { tab: HistoryTab; form: ReturnType<typeof Form.useForm<FilterValues>>[0]; monitors: Array<{ id: number; name: string }>; onApply: () => void; onClear: () => void }) {
@@ -164,7 +196,7 @@ function HistoryFilters({ tab, form, monitors, onApply, onClear }: { tab: Histor
   return <Card size="small" className="history-filters">
     <Form form={form} layout="inline" onFinish={onApply}>
       {(tab === 'runs' || tab === 'events') && <Form.Item name="monitorId" label="监控"><Select allowClear showSearch optionFilterProp="label" options={monitorOptions} placeholder="全部监控" style={{ width: 180 }} /></Form.Item>}
-      {tab === 'events' && <><Form.Item name="checkRunId" label="检查 ID"><InputNumber min={1} /></Form.Item><Form.Item name="type" label="事件类型"><Input allowClear placeholder="rss.item" /></Form.Item></>}
+      {tab === 'events' && <><Form.Item name="eventId" label="事件 ID"><InputNumber min={1} /></Form.Item><Form.Item name="checkRunId" label="检查 ID"><InputNumber min={1} /></Form.Item><Form.Item name="type" label="事件类型"><Input allowClear placeholder="rss.item" /></Form.Item></>}
       {tab === 'runs' && <><Form.Item name="status" label="状态"><Select allowClear options={statusOptions} style={{ width: 130 }} /></Form.Item><Form.Item name="trigger" label="触发"><Select allowClear options={[{ value: 'manual', label: '手动' }, { value: 'scheduled', label: '定时' }]} style={{ width: 120 }} /></Form.Item></>}
       {tab === 'evaluations' && <><Form.Item name="eventId" label="事件 ID"><InputNumber min={1} /></Form.Item><Form.Item name="ruleId" label="规则 ID"><InputNumber min={1} /></Form.Item><Form.Item name="status" label="状态"><Select allowClear options={statusOptions} style={{ width: 145 }} /></Form.Item></>}
       {tab === 'attempts' && <><Form.Item name="monitorId" label="监控"><Select allowClear showSearch optionFilterProp="label" options={monitorOptions} placeholder="全部监控" style={{ width: 180 }} /></Form.Item><Form.Item name="eventId" label="事件 ID"><InputNumber min={1} /></Form.Item><Form.Item name="channelId" label="渠道 ID"><InputNumber min={1} /></Form.Item><Form.Item name="status" label="状态"><Select allowClear options={statusOptions} style={{ width: 120 }} /></Form.Item><Form.Item name="kind" label="类型"><Select allowClear options={[{ value: 'delivery', label: '事件通知' }, { value: 'test', label: '渠道测试' }, { value: 'monitor_failure', label: '监控故障' }, { value: 'monitor_recovery', label: '监控恢复' }]} style={{ width: 130 }} /></Form.Item></>}
@@ -238,11 +270,11 @@ function EvaluationsTable({ data, page, loading, onPage, onDetail }: { data: Rul
   ]} />;
 }
 
-function AttemptsTable({ data, page, loading, retrying, monitorByID, onPage, onRetry, onDetail }: { data: NotificationAttempt[]; page?: PageMeta; loading: boolean; retrying?: number; monitorByID: Map<number, string>; onPage: (page: number, pageSize: number) => void; onRetry: (id: number) => void; onDetail: (item: NotificationAttempt) => void }) {
+function AttemptsTable({ data, page, loading, retrying, monitorByID, onPage, onRetry, onDetail, onOpenEvent }: { data: NotificationAttempt[]; page?: PageMeta; loading: boolean; retrying?: number; monitorByID: Map<number, string>; onPage: (page: number, pageSize: number) => void; onRetry: (id: number) => void; onDetail: (item: NotificationAttempt) => void; onOpenEvent: (eventId: number) => void }) {
   return <Table<NotificationAttempt> rowKey="id" loading={loading} dataSource={data} scroll={{ x: 1220 }} pagination={pagination(page, onPage)} columns={[
     { title: 'ID', dataIndex: 'id', width: 75, render: (id, item) => <Button type="link" onClick={() => onDetail(item)}>#{id}</Button> },
     { title: '监控', dataIndex: 'monitorId', width: 160, render: (id) => id ? monitorByID.get(id) ?? `已归档监控 #${id}` : '—' },
-    { title: '关联', width: 130, render: (_, item) => attemptKindLabel(item) },
+    { title: '关联', width: 150, render: (_, item) => attemptKindLabel(item, onOpenEvent) },
     { title: '渠道', dataIndex: 'channelName', width: 160 }, { title: '状态', dataIndex: 'status', width: 90, render: (value) => <StatusTag status={value} /> },
     { title: '尝试', dataIndex: 'attemptNo', width: 75, render: (value) => `第 ${value} 次` },
     { title: '错误', dataIndex: 'error', ellipsis: true, render: (value) => <Text type={value ? 'danger' : undefined}>{value || '—'}</Text> },
@@ -263,12 +295,12 @@ function attemptRetryState(item: NotificationAttempt) {
   return '—';
 }
 
-function attemptKindLabel(item: NotificationAttempt) {
+function attemptKindLabel(item: NotificationAttempt, onOpenEvent: (eventId: number) => void) {
   switch (item.kind) {
     case 'test': return <Tag color="blue">渠道测试</Tag>;
     case 'monitor_failure': return <Tag color="error">监控故障</Tag>;
     case 'monitor_recovery': return <Tag color="success">监控恢复</Tag>;
-    default: return item.eventId ? `事件 #${item.eventId}` : <Tag>事件通知</Tag>;
+    default: return item.eventId ? <Button type="link" className="table-link" onClick={() => onOpenEvent(item.eventId!)}>事件 #{item.eventId}</Button> : <Tag>事件通知</Tag>;
   }
 }
 

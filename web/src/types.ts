@@ -42,11 +42,15 @@ export interface SettingsOverview {
   username: string;
   sessionTimeoutHours: number;
   historyRetentionDays: number;
+  timezone: string;
+  dateTimeFormat: 'yyyy-MM-dd HH:mm:ss' | 'yyyy-MM-dd HH:mm' | 'MM-dd-yyyy HH:mm:ss';
 }
 
 export interface RuntimeSettingsInput {
   sessionTimeoutHours: number;
   historyRetentionDays: number;
+  timezone: string;
+  dateTimeFormat: SettingsOverview['dateTimeFormat'];
 }
 
 export interface NetworkCheckItem {

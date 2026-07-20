@@ -67,6 +67,9 @@ func TestGitHubReleaseCheckerDetectsNewReleaseAndUsesETag(t *testing.T) {
 	if len(first.Events) != 0 {
 		t.Fatalf("first check emitted %d event(s), want 0", len(first.Events))
 	}
+	if first.Message != "最新版本：v1.0.0" {
+		t.Fatalf("first message = %q", first.Message)
+	}
 	monitor.State = testJSON(t, first.State)
 
 	mode = 304
@@ -74,7 +77,7 @@ func TestGitHubReleaseCheckerDetectsNewReleaseAndUsesETag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if unchanged.Message != "not modified" || len(unchanged.Events) != 0 {
+	if unchanged.Message != "最新版本：v1.0.0" || len(unchanged.Events) != 0 {
 		t.Fatalf("unexpected unchanged result: %#v", unchanged)
 	}
 
@@ -86,6 +89,9 @@ func TestGitHubReleaseCheckerDetectsNewReleaseAndUsesETag(t *testing.T) {
 	if len(result.Events) != 1 {
 		t.Fatalf("got %d event(s), want 1", len(result.Events))
 	}
+	if result.Message != "最新版本：v1.1.0" {
+		t.Fatalf("new release message = %q", result.Message)
+	}
 	event := result.Events[0]
 	if event.Type != "github.release" || event.Fingerprint != "github:release:2" {
 		t.Fatalf("unexpected event: %#v", event)
@@ -94,6 +100,74 @@ func TestGitHubReleaseCheckerDetectsNewReleaseAndUsesETag(t *testing.T) {
 	release := github["release"].(map[string]any)
 	if release["tagName"] != "v1.1.0" || release["assetCount"] != 1 {
 		t.Fatalf("unexpected release payload: %#v", release)
+	}
+}
+
+func TestGitHubReleaseCheckerHandlesNoPublishedReleaseAndIts304(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 2 {
+			if got := r.Header.Get("If-None-Match"); got != `"empty"` {
+				t.Errorf("If-None-Match = %q, want empty ETag", got)
+			}
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"empty"`)
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+
+	checker := NewGitHubReleaseChecker()
+	monitor := model.Monitor{Config: testJSON(t, GitHubReleaseConfig{Repository: "acme/empty", APIURL: server.URL})}
+	first, err := checker.Check(context.Background(), monitor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Message != "暂无已发布版本" || len(first.Events) != 0 {
+		t.Fatalf("first empty result = %#v", first)
+	}
+
+	monitor.State = testJSON(t, first.State)
+	unchanged, err := checker.Check(context.Background(), monitor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Message != "暂无已发布版本" || len(unchanged.Events) != 0 {
+		t.Fatalf("unchanged empty result = %#v", unchanged)
+	}
+}
+
+func TestGitHubReleaseCheckerRefreshesLegacyStateToLearnLatestVersion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("If-None-Match"); got != "" {
+			t.Errorf("legacy state sent stale conditional ETag %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"release-v3"`)
+		_, _ = w.Write([]byte(`[{
+			"id": 3, "tag_name": "v3.0.0", "name": "Third",
+			"published_at": "2026-07-03T00:00:00Z"
+		}]`))
+	}))
+	defer server.Close()
+
+	checker := NewGitHubReleaseChecker()
+	monitor := model.Monitor{
+		Config: testJSON(t, GitHubReleaseConfig{Repository: "acme/widget", APIURL: server.URL}),
+		State: testJSON(t, githubReleaseState{
+			Initialized: true, Source: server.URL + "|acme/widget|prerelease=false",
+			ETag: `"release-v2"`, SeenReleaseIDs: []int64{3},
+		}),
+	}
+	result, err := checker.Check(context.Background(), monitor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Message != "最新版本：v3.0.0" || len(result.Events) != 0 {
+		t.Fatalf("legacy refresh result = %#v", result)
 	}
 }
 

@@ -187,7 +187,7 @@ func (c *TestFlightChecker) fetch(ctx context.Context, monitor model.Monitor, cf
 	snapshot := testFlightSnapshot{Status: "unknown", Message: "unable to classify page"}
 	if containsAny(text, cfg.FullPatterns) {
 		snapshot.Status = "full"
-		snapshot.Message = "testflight beta is full"
+		snapshot.Message = "TestFlight 测试名额已满"
 	} else if containsAny(text, cfg.AvailablePatterns) {
 		snapshot.Status = "available"
 		snapshot.Message = "testflight beta has available slots"

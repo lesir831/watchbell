@@ -19,7 +19,7 @@ import { ArrowRightOutlined, CheckCircleOutlined, CloseCircleOutlined, DeleteOut
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { FormInstance } from 'antd';
 import { api, APIError } from '../api';
-import { PageError, PageHeader, relativeDate } from '../components/Common';
+import { formatDateWithPreferences, PageError, PageHeader, relativeDate, type DateTimeFormat } from '../components/Common';
 import type { ChangePasswordInput, ProxyProfile, ProxyProfileInput, ProxyType, RuntimeSettingsInput } from '../types';
 
 const proxyTypeLabels: Record<ProxyType, string> = {
@@ -36,7 +36,12 @@ export default function SettingsPage(props: { authEnabled: boolean; username: st
   const [editing, setEditing] = useState<ProxyProfile | null>(null);
   const [proxyDrawerOpen, setProxyDrawerOpen] = useState(false);
   const [passwordExpanded, setPasswordExpanded] = useState(false);
-  const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettingsInput>({ sessionTimeoutHours: 8, historyRetentionDays: 90 });
+  const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettingsInput>({
+    sessionTimeoutHours: 8,
+    historyRetentionDays: 90,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    dateTimeFormat: 'yyyy-MM-dd HH:mm:ss'
+  });
   const overview = useQuery({ queryKey: ['settings'], queryFn: api.settings });
   const proxies = useQuery({ queryKey: ['proxies'], queryFn: api.listProxies });
   const authEnabled = overview.data?.authEnabled ?? props.authEnabled;
@@ -46,7 +51,9 @@ export default function SettingsPage(props: { authEnabled: boolean; username: st
     if (!overview.data) return;
     setRuntimeSettings({
       sessionTimeoutHours: overview.data.sessionTimeoutHours,
-      historyRetentionDays: overview.data.historyRetentionDays
+      historyRetentionDays: overview.data.historyRetentionDays,
+      timezone: overview.data.timezone,
+      dateTimeFormat: overview.data.dateTimeFormat
     });
   }, [overview.data]);
 
@@ -54,7 +61,12 @@ export default function SettingsPage(props: { authEnabled: boolean; username: st
     mutationFn: api.updateRuntimeSettings,
     onSuccess: async (saved) => {
       queryClient.setQueryData(['settings'], saved);
-      setRuntimeSettings({ sessionTimeoutHours: saved.sessionTimeoutHours, historyRetentionDays: saved.historyRetentionDays });
+      setRuntimeSettings({
+        sessionTimeoutHours: saved.sessionTimeoutHours,
+        historyRetentionDays: saved.historyRetentionDays,
+        timezone: saved.timezone,
+        dateTimeFormat: saved.dateTimeFormat
+      });
       await queryClient.invalidateQueries({ queryKey: ['auditLogs'] });
       message.success('运行与安全设置已保存');
     },
@@ -152,7 +164,8 @@ export default function SettingsPage(props: { authEnabled: boolean; username: st
         <div className="settings-stack">
           <section className="settings-panel">
             <header><h2>运行与保留</h2><p>运行策略由当前部署环境与内置队列共同管理。</p></header>
-            <div className="setting-row"><div className="setting-copy"><strong>时区</strong><span>活动时间、摘要周期和计划任务使用浏览器与部署环境时区显示。</span></div><span className="setting-value">{Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'}</span></div>
+            <div className="setting-row"><div className="setting-copy"><strong>系统时区</strong><span>活动时间、事件详情和通知中的时间统一按此 IANA 时区显示。</span></div><Select showSearch optionFilterProp="label" className="settings-select timezone-select" aria-label="系统时区" value={runtimeSettings.timezone} options={timezoneOptions(runtimeSettings.timezone)} onChange={(timezone) => setRuntimeSettings((current) => ({ ...current, timezone }))} /></div>
+            <div className="setting-row"><div className="setting-copy"><strong>日期时间格式</strong><span>当前预览：{formatDateWithPreferences(new Date().toISOString(), runtimeSettings.timezone, runtimeSettings.dateTimeFormat)}</span></div><Select className="settings-select" aria-label="日期时间格式" value={runtimeSettings.dateTimeFormat} options={dateTimeFormatOptions} onChange={(dateTimeFormat) => setRuntimeSettings((current) => ({ ...current, dateTimeFormat }))} /></div>
             <div className="setting-row"><div className="setting-copy"><strong>活动保留期</strong><span>超过期限的检查快照、事件、投递记录和审计日志会自动清理。</span></div><Select className="settings-select" aria-label="活动保留期" value={runtimeSettings.historyRetentionDays || undefined} placeholder="选择保留期" options={historyRetentionOptions(runtimeSettings.historyRetentionDays)} onChange={(historyRetentionDays) => setRuntimeSettings((current) => ({ ...current, historyRetentionDays }))} /></div>
             <div className="setting-row"><div className="setting-copy"><strong>失败通知自动重试</strong><span>发送队列使用退避策略重新投递，达到上限后进入死信队列。</span></div><Switch checked disabled aria-label="失败通知自动重试已启用" /></div>
           </section>
@@ -304,7 +317,20 @@ function historyRetentionOptions(current: number) {
 function validRuntimeSettings(settings: RuntimeSettingsInput, current?: RuntimeSettingsInput) {
   const sessionValid = [1, 8, 24].includes(settings.sessionTimeoutHours) || settings.sessionTimeoutHours === current?.sessionTimeoutHours;
   const historyValid = [30, 90, 180].includes(settings.historyRetentionDays) || settings.historyRetentionDays === current?.historyRetentionDays;
-  return sessionValid && historyValid;
+  return sessionValid && historyValid && Boolean(settings.timezone.trim()) && dateTimeFormatOptions.some((option) => option.value === settings.dateTimeFormat);
+}
+
+const dateTimeFormatOptions: Array<{ value: DateTimeFormat; label: string }> = [
+  { value: 'yyyy-MM-dd HH:mm:ss', label: '2026-07-20 14:52:58' },
+  { value: 'yyyy-MM-dd HH:mm', label: '2026-07-20 14:52' },
+  { value: 'MM-dd-yyyy HH:mm:ss', label: '07-20-2026 14:52:58' }
+];
+
+function timezoneOptions(current: string) {
+  const intl = Intl as typeof Intl & { supportedValuesOf?: (key: 'timeZone') => string[] };
+  const fallback = ['UTC', 'Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Tokyo', 'Europe/London', 'America/New_York', 'America/Los_Angeles'];
+  const values = intl.supportedValuesOf?.('timeZone') ?? fallback;
+  return Array.from(new Set([current, 'UTC', 'Asia/Shanghai', ...values])).filter(Boolean).map((value) => ({ value, label: value }));
 }
 
 function scrubPasswordInput(input: ChangePasswordInput) {

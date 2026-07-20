@@ -26,6 +26,7 @@ import {
 } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, APIError, AUTH_EXPIRED_EVENT } from './api';
+import { configureDateTimePreferences } from './components/Common';
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage'));
 const MonitorsPage = lazy(() => import('./pages/MonitorsPage'));
@@ -38,7 +39,7 @@ const HelpPage = lazy(() => import('./pages/HelpPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 
 type PageKey = 'dashboard' | 'monitors' | 'monitorDetail' | 'rules' | 'channels' | 'templates' | 'activity' | 'settings' | 'help';
-type RouteState = { page: PageKey; monitorId?: number };
+type RouteState = { page: PageKey; monitorId?: number; ruleId?: number; activityTab?: 'events' | 'evaluations' | 'attempts'; eventId?: number };
 type NavigationPageKey = Exclude<PageKey, 'monitorDetail'>;
 
 type NavigationItem = {
@@ -253,6 +254,8 @@ function Shell(props: { authEnabled: boolean; username: string }) {
   const [route, setRoute] = useState<RouteState>(() => routeFromHash());
   const queryClient = useQueryClient();
   const system = useQuery({ queryKey: ['systemStatus'], queryFn: api.systemStatus, refetchInterval: 30_000, retry: false });
+  const settings = useQuery({ queryKey: ['settings'], queryFn: api.settings, refetchInterval: 60_000, retry: false });
+  if (settings.data) configureDateTimePreferences(settings.data);
   const logout = useMutation({
     mutationFn: api.logout,
     onSuccess: async () => queryClient.invalidateQueries({ queryKey: ['authMe'] })
@@ -381,10 +384,10 @@ function Shell(props: { authEnabled: boolean; username: string }) {
             {route.page === 'dashboard' && <DashboardPage onNavigate={navigate} onCreateMonitor={openNewMonitor} />}
             {route.page === 'monitors' && <MonitorsPage onNavigate={navigate} createRequest={monitorCreateRequest} />}
             {route.page === 'monitorDetail' && route.monitorId && <MonitorDetailPage monitorId={route.monitorId} onNavigate={navigate} />}
-            {route.page === 'rules' && <RulesPage />}
+            {route.page === 'rules' && <RulesPage editRuleId={route.ruleId} />}
             {route.page === 'channels' && <ChannelsPage />}
             {route.page === 'templates' && <TemplatesPage />}
-            {route.page === 'activity' && <ActivityPage />}
+            {route.page === 'activity' && <ActivityPage initialTab={route.activityTab} initialEventId={route.eventId} />}
             {route.page === 'settings' && <SettingsPage authEnabled={props.authEnabled} username={props.username} onNavigate={navigate} />}
             {route.page === 'help' && <HelpPage />}
           </Suspense>
@@ -476,9 +479,21 @@ function ErrorScreen({ error }: { error: Error }) {
 }
 
 function routeFromHash(): RouteState {
-  const value = window.location.hash.replace(/^#\/?/, '');
+  const raw = window.location.hash.replace(/^#\/?/, '');
+  const [value, query = ''] = raw.split('?', 2);
+  const params = new URLSearchParams(query);
   const monitorMatch = value.match(/^monitors\/(\d+)$/);
   if (monitorMatch && Number(monitorMatch[1]) > 0) return { page: 'monitorDetail', monitorId: Number(monitorMatch[1]) };
+  if (value === 'rules') {
+    const ruleId = Number(params.get('ruleId'));
+    return { page: 'rules', ...(ruleId > 0 ? { ruleId } : {}) };
+  }
+  if (value === 'activity') {
+    const tab = params.get('tab');
+    const eventId = Number(params.get('eventId'));
+    const activityTab = tab === 'events' || tab === 'evaluations' || tab === 'attempts' ? tab : undefined;
+    return { page: 'activity', ...(activityTab ? { activityTab } : {}), ...(eventId > 0 ? { eventId } : {}) };
+  }
   return pageItems.some((item) => item.key === value) ? { page: value as PageKey } : { page: 'dashboard' };
 }
 

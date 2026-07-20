@@ -38,10 +38,12 @@ type GitHubReleaseConfig struct {
 }
 
 type githubReleaseState struct {
-	Initialized    bool    `json:"initialized"`
-	Source         string  `json:"source,omitempty"`
-	ETag           string  `json:"etag,omitempty"`
-	SeenReleaseIDs []int64 `json:"seenReleaseIds,omitempty"`
+	Initialized          bool    `json:"initialized"`
+	Source               string  `json:"source,omitempty"`
+	ETag                 string  `json:"etag,omitempty"`
+	SeenReleaseIDs       []int64 `json:"seenReleaseIds,omitempty"`
+	ReleaseSnapshotKnown bool    `json:"releaseSnapshotKnown,omitempty"`
+	LatestVersion        string  `json:"latestVersion,omitempty"`
 }
 
 type githubRelease struct {
@@ -115,12 +117,19 @@ func (c *GitHubReleaseChecker) Check(ctx context.Context, monitor model.Monitor)
 	if state.Source != "" && state.Source != source {
 		state = githubReleaseState{}
 	}
-	fetched, err := c.fetch(ctx, monitor, cfg, owner, repo, state.ETag)
+	// Older persisted states do not contain LatestVersion. Force one
+	// unconditional refresh for those states so a 304 can never leave the
+	// monitor displaying the old "not modified" message without a version.
+	etag := state.ETag
+	if !state.ReleaseSnapshotKnown {
+		etag = ""
+	}
+	fetched, err := c.fetch(ctx, monitor, cfg, owner, repo, etag)
 	if err != nil {
 		return model.CheckResult{}, err
 	}
 	if fetched.NotModified {
-		return model.CheckResult{Status: "ok", Message: "not modified", State: stateToMap(state)}, nil
+		return model.CheckResult{Status: "ok", Message: githubReleaseMessage(state), State: stateToMap(state)}, nil
 	}
 
 	seen := make(map[int64]struct{}, len(state.SeenReleaseIDs))
@@ -148,16 +157,34 @@ func (c *GitHubReleaseChecker) Check(ctx context.Context, monitor model.Monitor)
 	state.Initialized = true
 	state.Source = source
 	state.ETag = fetched.ETag
+	state.ReleaseSnapshotKnown = true
+	state.LatestVersion = latestGitHubReleaseVersion(fetched.Releases)
 	state.SeenReleaseIDs = make([]int64, 0, len(fetched.Releases))
 	for _, release := range fetched.Releases {
 		state.SeenReleaseIDs = append(state.SeenReleaseIDs, release.ID)
 	}
 
-	message := fmt.Sprintf("%d new release(s)", len(events))
-	if len(fetched.Releases) == 0 {
-		message = "no published releases found"
+	return model.CheckResult{Status: "ok", Message: githubReleaseMessage(state), State: stateToMap(state), Events: events}, nil
+}
+
+func latestGitHubReleaseVersion(releases []githubRelease) string {
+	if len(releases) == 0 {
+		return ""
 	}
-	return model.CheckResult{Status: "ok", Message: message, State: stateToMap(state), Events: events}, nil
+	if version := strings.TrimSpace(releases[0].TagName); version != "" {
+		return version
+	}
+	return strings.TrimSpace(releases[0].Name)
+}
+
+func githubReleaseMessage(state githubReleaseState) string {
+	if version := strings.TrimSpace(state.LatestVersion); version != "" {
+		return "最新版本：" + version
+	}
+	if state.ReleaseSnapshotKnown {
+		return "暂无已发布版本"
+	}
+	return "暂无版本信息"
 }
 
 // Inspect bypasses the stored ETag and returns the first release that survives

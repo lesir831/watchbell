@@ -22,7 +22,7 @@ func TestTestFlightCheckerNotifiesWhenStatusBecomesAvailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if full.Status != "full" || len(full.Events) != 0 {
+	if full.Status != "full" || full.Message != "TestFlight 测试名额已满" || len(full.Events) != 0 {
 		t.Fatalf("unexpected full result: %#v", full)
 	}
 

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/watchbell/watchbell/internal/datetime"
 	"github.com/watchbell/watchbell/internal/model"
 )
 
@@ -43,7 +44,7 @@ var systemDefinitions = []Definition{
 	{Key: "event.id", Label: "事件 ID", Description: "WatchBell 内部持久化事件 ID；实时变量检查不会创建事件，因此不可用。", ValueType: "number"},
 	{Key: "event.type", Label: "事件类型", Description: "事件或当前观测对应的类型，例如 rss.item。", ValueType: "string"},
 	{Key: "event.fingerprint", Label: "事件指纹", Description: "持久化事件中用于去重；实时检查显示当前观测的只读标识，不代表已经创建事件。", ValueType: "string"},
-	{Key: "event.time", Label: "事件时间", Description: "WatchBell 创建持久化事件的 RFC3339 时间；实时变量检查中不可用。", ValueType: "datetime"},
+	{Key: "event.time", Label: "事件时间", Description: "WatchBell 创建持久化事件的时间；通知模板按系统设置的时区和格式渲染，实时变量检查中不可用。", ValueType: "datetime"},
 	{Key: "message.subject", Label: "通知标题", Description: "渲染完成后的通知标题，仅用于 Webhook 等渠道动态配置。", ValueType: "string"},
 	{Key: "message.body", Label: "通知正文", Description: "渲染完成后的通知正文，仅用于 Webhook 等渠道动态配置。", ValueType: "string"},
 }
@@ -214,6 +215,18 @@ func EventData(monitor model.Monitor, event model.Event, payload map[string]any)
 		"time": event.CreatedAt.UTC().Format(time.RFC3339Nano),
 	}
 	return data
+}
+
+// EventDataForDisplay keeps persisted timestamps machine-readable while
+// rendering event.time for user-facing templates with the configured policy.
+func EventDataForDisplay(monitor model.Monitor, event model.Event, payload map[string]any, timezone, format string) (map[string]any, error) {
+	data := EventData(monitor, event, payload)
+	formatted, err := datetime.Format(event.CreatedAt, timezone, format)
+	if err != nil {
+		return nil, err
+	}
+	data["event"].(map[string]any)["time"] = formatted
+	return data, nil
 }
 
 // ObservationData builds the event-like context used by live variable

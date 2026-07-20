@@ -1,9 +1,9 @@
 import { useState } from 'react';
-import { Alert, App as AntApp, Button, Card, Space, Table, Tabs, Tag } from 'antd';
-import { ArrowLeftOutlined, PlayCircleOutlined } from '@ant-design/icons';
+import { Alert, App as AntApp, Button, Card, Drawer, Space, Table, Tabs, Tag } from 'antd';
+import { ArrowLeftOutlined, EyeOutlined, PlayCircleOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
-import { formatDuration, formatInterval, jsonText, PageError, relativeDate, StatusTag } from '../components/Common';
+import { eventTitle, formatDate, formatDuration, formatInterval, jsonText, PageError, relativeDate, RenderedData, StatusTag } from '../components/Common';
 import type { CheckRun, EventRecord, NotificationAttempt, Rule } from '../types';
 
 type PageState = { page: number; pageSize: number };
@@ -15,6 +15,7 @@ export default function MonitorDetailPage({ monitorId, onNavigate }: { monitorId
   const [runsPaging, setRunsPaging] = useState<PageState>({ page: 1, pageSize: 10 });
   const [eventsPaging, setEventsPaging] = useState<PageState>({ page: 1, pageSize: 10 });
   const [attemptsPaging, setAttemptsPaging] = useState<PageState>({ page: 1, pageSize: 10 });
+  const [eventDetail, setEventDetail] = useState<EventRecord | null>(null);
   const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors, refetchInterval: 20_000 });
   const rules = useQuery({ queryKey: ['rules'], queryFn: api.listRules, refetchInterval: 30_000 });
   const channels = useQuery({ queryKey: ['channels'], queryFn: api.listChannels, refetchInterval: 30_000 });
@@ -54,10 +55,10 @@ export default function MonitorDetailPage({ monitorId, onNavigate }: { monitorId
           <div><div className="page-eyebrow">{monitor.type}</div><h1>{monitor.name}</h1><div className="detail-meta"><StatusTag status={!monitor.enabled ? 'disabled' : monitor.lastStatus} /><span className="detail-chip">每 {formatInterval(monitor.intervalSeconds)}</span><span className="detail-chip">{monitor.proxyId ? `代理 #${monitor.proxyId}` : '默认网络'}</span></div></div>
           <div className="detail-next"><span>下次检查</span><strong>{monitor.enabled ? relativeDate(monitor.nextCheckAt) : '已停用'}</strong><Button className="design-dark" icon={<PlayCircleOutlined />} loading={check.isPending} disabled={!monitor.enabled} onClick={() => check.mutate()}>立即检查</Button></div>
         </section>
-        {(monitor.lastError || monitor.lastMessage) && <Alert className="detail-health-alert" type={monitor.lastError ? 'error' : 'info'} showIcon message={monitor.lastError || monitor.lastMessage} />}
+        {(monitor.lastError || monitor.lastMessage) && <Alert className="detail-health-alert" type={monitor.lastError ? 'error' : 'info'} showIcon message={monitor.lastError || monitorStatusMessage(monitor)} />}
         {monitor.failureAlertActive && <Alert className="detail-health-alert" type="error" showIcon message="已发送监控故障告警" description="恢复正常后会向所选渠道发送恢复通知，并关闭本轮故障状态。" />}
         <div className="detail-stats">
-          <div><span>最近结果</span><strong>{monitor.lastError ? '检查失败' : monitor.lastMessage || '未发现新事件'}</strong></div>
+          <div><span>最近结果</span><strong>{monitor.lastError ? '检查失败' : monitorStatusMessage(monitor) || '未发现新事件'}</strong></div>
           <div><span>连续失败</span><strong className="number">{monitor.consecutiveFailures} 次</strong></div>
           <div><span>关联规则</span><strong className="number">{monitorRules.length}</strong></div>
           <div><span>通知失败</span><strong className="number">{failedAttempts.data?.total ?? 0}</strong></div>
@@ -65,12 +66,22 @@ export default function MonitorDetailPage({ monitorId, onNavigate }: { monitorId
         <section className="tabs-panel">
           <Tabs items={[
             { key: 'runs', label: `检查 ${runs.data?.total ?? 0}`, children: <Runs data={monitorRuns} page={{ ...runsPaging, total: runs.data?.total ?? 0 }} loading={runs.isFetching} onPage={(page, pageSize) => setRunsPaging({ page, pageSize })} /> },
-            { key: 'events', label: `事件 ${events.data?.total ?? 0}`, children: <Events data={monitorEvents} page={{ ...eventsPaging, total: events.data?.total ?? 0 }} loading={events.isFetching} onPage={(page, pageSize) => setEventsPaging({ page, pageSize })} /> },
-            { key: 'rules', label: `规则 ${monitorRules.length}`, children: <Rules data={monitorRules} channelByID={channelByID} /> },
-            { key: 'attempts', label: `通知 ${attempts.data?.total ?? 0}`, children: <Attempts data={monitorAttempts} page={{ ...attemptsPaging, total: attempts.data?.total ?? 0 }} loading={attempts.isFetching} onPage={(page, pageSize) => setAttemptsPaging({ page, pageSize })} /> },
+            { key: 'events', label: `事件 ${events.data?.total ?? 0}`, children: <Events data={monitorEvents} monitorName={monitor.name} page={{ ...eventsPaging, total: events.data?.total ?? 0 }} loading={events.isFetching} onPage={(page, pageSize) => setEventsPaging({ page, pageSize })} onDetail={setEventDetail} /> },
+            { key: 'rules', label: `规则 ${monitorRules.length}`, children: <Rules data={monitorRules} channelByID={channelByID} onNavigate={onNavigate} /> },
+            { key: 'attempts', label: `通知 ${attempts.data?.total ?? 0}`, children: <Attempts data={monitorAttempts} page={{ ...attemptsPaging, total: attempts.data?.total ?? 0 }} loading={attempts.isFetching} onPage={(page, pageSize) => setAttemptsPaging({ page, pageSize })} onNavigate={onNavigate} /> },
             { key: 'config', label: '配置', children: <pre className="detail-json">{jsonText(monitor.config)}</pre> }
           ]} />
         </section>
+        <Drawer title={`事件详情 #${eventDetail?.id ?? ''}`} open={eventDetail !== null} onClose={() => setEventDetail(null)} width={720}>
+          {eventDetail && <>
+            <div className="event-detail-heading">
+              <Tag>{eventDetail.type}</Tag>
+              <h2>{eventTitle(eventDetail.payload, monitor.name)}</h2>
+              <span title={eventDetail.createdAt}>{formatDate(eventDetail.createdAt)}</span>
+            </div>
+            <RenderedData value={eventDetail.payload} />
+          </>}
+        </Drawer>
       </>}
     </div>
   );
@@ -96,25 +107,42 @@ function Runs({ data, page, loading, onPage }: { data: CheckRun[]; page?: PageMe
   ]} />;
 }
 
-function Events({ data, page, loading, onPage }: { data: EventRecord[]; page?: PageMeta; loading: boolean; onPage: (page: number, pageSize: number) => void }) {
-  return <Table<EventRecord> rowKey="id" loading={loading} dataSource={data} pagination={detailPagination(page, onPage)} scroll={{ x: 650 }} columns={[
-    { title: 'ID', dataIndex: 'id', render: (id) => `#${id}` }, { title: '检查', dataIndex: 'checkRunId', render: (id) => id ? `#${id}` : '—' },
-    { title: '类型', dataIndex: 'type', render: (value) => <Tag>{value}</Tag> }, { title: '事件数据', dataIndex: 'payload', ellipsis: true, render: jsonText }, { title: '时间', dataIndex: 'createdAt', render: relativeDate }
+function Events({ data, monitorName, page, loading, onPage, onDetail }: { data: EventRecord[]; monitorName: string; page?: PageMeta; loading: boolean; onPage: (page: number, pageSize: number) => void; onDetail: (item: EventRecord) => void }) {
+  return <Table<EventRecord> rowKey="id" loading={loading} dataSource={data} pagination={detailPagination(page, onPage)} scroll={{ x: 760 }} columns={[
+    { title: 'ID', dataIndex: 'id', width: 80, render: (id) => `#${id}` },
+    { title: '事件数据', dataIndex: 'payload', ellipsis: true, render: (payload) => <strong title={eventTitle(payload, monitorName)}>{eventTitle(payload, monitorName)}</strong> },
+    { title: '检查', dataIndex: 'checkRunId', width: 85, render: (id) => id ? `#${id}` : '—' },
+    { title: '类型', dataIndex: 'type', width: 150, render: (value) => <Tag>{value}</Tag> },
+    { title: '时间', dataIndex: 'createdAt', width: 120, render: relativeDate },
+    { title: '详情', width: 72, fixed: 'right', render: (_, item) => <Button type="text" icon={<EyeOutlined />} aria-label={`查看事件 #${item.id} 详情`} title="查看详情" onClick={() => onDetail(item)} /> }
   ]} />;
 }
 
-function Rules({ data, channelByID = new Map<number, string>() }: { data: Rule[]; channelByID?: Map<number, string> }) {
+function Rules({ data, channelByID = new Map<number, string>(), onNavigate }: { data: Rule[]; channelByID?: Map<number, string>; onNavigate: (page: string) => void }) {
   return <Table rowKey="id" dataSource={data} pagination={false} columns={[
-    { title: '规则', dataIndex: 'name' }, { title: '状态', dataIndex: 'enabled', render: (value) => <StatusTag status={value ? 'ok' : 'disabled'} /> },
+    { title: '规则', dataIndex: 'name', render: (name, item) => <Button type="link" className="table-link" onClick={() => onNavigate(`rules?ruleId=${item.id}`)}>{name}</Button> }, { title: '状态', dataIndex: 'enabled', render: (value) => <StatusTag status={value ? 'ok' : 'disabled'} /> },
     { title: '通知渠道', dataIndex: 'notifyChannelIds', render: (ids: number[]) => ids.map((id) => <Tag key={id}>{channelByID.get(id) ?? `已归档渠道 #${id}`}</Tag>) }, { title: '上次触发', dataIndex: 'lastFiredAt', render: relativeDate }
   ]} />;
 }
 
-function Attempts({ data, page, loading, onPage }: { data: NotificationAttempt[]; page?: PageMeta; loading: boolean; onPage: (page: number, pageSize: number) => void }) {
+function Attempts({ data, page, loading, onPage, onNavigate }: { data: NotificationAttempt[]; page?: PageMeta; loading: boolean; onPage: (page: number, pageSize: number) => void; onNavigate: (page: string) => void }) {
   return <Table<NotificationAttempt> rowKey="id" loading={loading} dataSource={data} pagination={detailPagination(page, onPage)} scroll={{ x: 780 }} columns={[
     { title: 'ID', dataIndex: 'id', render: (id) => `#${id}` }, { title: '渠道', dataIndex: 'channelName' }, { title: '状态', dataIndex: 'status', render: (value) => <StatusTag status={value} /> },
+    { title: '关联事件', render: (_, item) => item.eventId ? <Button type="link" className="table-link" onClick={() => onNavigate(`activity?tab=events&eventId=${item.eventId}`)}>事件 #{item.eventId}</Button> : '—' },
     { title: '次数', dataIndex: 'attemptNo' }, { title: '错误', dataIndex: 'error', ellipsis: true },
     { title: '重试', render: (_, item) => item.resolved ? <Tag color="blue">已被后续尝试取代</Tag> : item.nextRetryAt ? `计划 ${relativeDate(item.nextRetryAt)}` : '—' },
     { title: '时间', dataIndex: 'createdAt', render: relativeDate }
   ]} />;
+}
+
+function monitorStatusMessage(item: { type: string; state?: Record<string, unknown>; lastMessage?: string }) {
+  const message = item.lastMessage?.trim() ?? '';
+  const normalized = message.toLowerCase();
+  if (item.type === 'rss' && normalized === 'not modified') return '暂无新增文章';
+  if (item.type === 'testflight' && normalized.includes('beta is full')) return 'TestFlight 测试名额已满';
+  if (item.type === 'github_release') {
+    const latestVersion = typeof item.state?.latestVersion === 'string' ? item.state.latestVersion.trim() : '';
+    if (latestVersion) return `最新版本：${latestVersion}`;
+  }
+  return message;
 }

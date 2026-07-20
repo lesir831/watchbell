@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, App as AntApp, Button, Card, Drawer, Form, Input, Popconfirm, Select, Space, Tag, Typography } from 'antd';
-import { ArrowRightOutlined, CopyOutlined, DeleteOutlined, EditOutlined, EyeOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons';
+import { ArrowRightOutlined, CopyOutlined, DeleteOutlined, EditOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
-import { EmptyState, formatDate, PageError, PageHeader } from '../components/Common';
+import { EmptyState, eventTitle, formatDate, PageError, PageHeader } from '../components/Common';
 import type { NotificationTemplate, NotificationTemplateInput } from '../types';
 
 const { Paragraph } = Typography;
@@ -28,6 +28,7 @@ export default function TemplatesPage() {
   const monitors = useQuery({ queryKey: ['monitors'], queryFn: api.listMonitors, refetchInterval: 30_000 });
   const channels = useQuery({ queryKey: ['channels'], queryFn: api.listChannels, refetchInterval: 30_000 });
   const variables = useMemo(() => Array.from(new Set((plugins.data ?? []).flatMap((plugin) => plugin.templateVariables))).sort(), [plugins.data]);
+  const monitorByID = useMemo(() => new Map((monitors.data ?? []).map((monitor) => [monitor.id, monitor.name])), [monitors.data]);
   const refresh = async () => Promise.all([queryClient.invalidateQueries({ queryKey: ['templates'] }), queryClient.invalidateQueries({ queryKey: ['auditLogs'] })]);
   const saveMutation = useMutation({
     mutationFn: (payload: { id?: number; input: NotificationTemplateInput }) => payload.id ? api.updateTemplate(payload.id, payload.input) : api.createTemplate(payload.input),
@@ -68,11 +69,15 @@ export default function TemplatesPage() {
     onError: (error: Error) => message.error(error.message)
   });
   const selectPreviewEvent = (eventId?: number) => {
-    previewRequestRef.current += 1;
+    const requestId = previewRequestRef.current + 1;
+    previewRequestRef.current = requestId;
     previewEventIdRef.current = eventId;
     setPreviewEventId(eventId);
     setPreview(null);
     previewMutation.reset();
+    if (previewing) {
+      previewMutation.mutate({ requestId, subjectTemplate: previewing.subjectTemplate, bodyTemplate: previewing.bodyTemplate, eventId });
+    }
   };
   const openPreview = (record: NotificationTemplate) => {
     const eventId = events.data?.[0]?.id;
@@ -84,13 +89,6 @@ export default function TemplatesPage() {
     setPreview(null);
     previewMutation.reset();
     previewMutation.mutate({ requestId, subjectTemplate: record.subjectTemplate, bodyTemplate: record.bodyTemplate, eventId });
-  };
-  const generatePreview = () => {
-    if (!previewing) return;
-    const requestId = previewRequestRef.current + 1;
-    previewRequestRef.current = requestId;
-    setPreview(null);
-    previewMutation.mutate({ requestId, subjectTemplate: previewing.subjectTemplate, bodyTemplate: previewing.bodyTemplate, eventId: previewEventId });
   };
   const openNew = () => { setEditing(null); setDrawerOpen(true); };
   useEffect(() => {
@@ -130,17 +128,16 @@ export default function TemplatesPage() {
           </section>
           <section className="preview-panel">
             <div className="preview-toolbar">
-              <div><h2>消息预览</h2><span>示例事件：{selectedMonitor?.name ?? (selectedEvent ? `事件 #${selectedEvent.id}` : '内置样例')}</span></div>
+              <div><h2>消息预览</h2><span>预览数据：{selectedEvent ? eventTitle(selectedEvent.payload, selectedMonitor?.name) : '内置样例'}</span></div>
               <div className="inline-actions">
                 <Button className="mini-action" icon={<CopyOutlined />} disabled={!preview} onClick={copyPreview}>复制内容</Button>
-                <Button className="mini-action" icon={<EyeOutlined />} loading={previewMutation.isPending} disabled={!previewing} onClick={generatePreview}>生成预览</Button>
                 <Button className="mini-action" icon={<SendOutlined />} loading={sendPreviewMutation.isPending} disabled={!previewing || !preview || !previewChannelId} onClick={() => previewing && previewChannelId && sendPreviewMutation.mutate({ templateId: previewing.id, channelId: previewChannelId, eventId: previewEventId })}>发送预览</Button>
                 <Button className="mini-action" icon={<EditOutlined />} disabled={!previewing} onClick={() => { if (previewing) { setEditing(previewing); setDrawerOpen(true); } }}>编辑</Button>
                 <Popconfirm title="归档这个模板？" description="使用它的规则会改用系统默认模板。" disabled={!previewing || previewing.isDefault} onConfirm={() => previewing && deleteMutation.mutate(previewing.id)}><Button className="mini-action icon-only" danger disabled={!previewing || previewing.isDefault} icon={<DeleteOutlined />} aria-label="归档当前模板" /></Popconfirm>
               </div>
             </div>
             <div className="preview-event-row">
-              <label><span>预览数据</span><Select allowClear value={previewEventId} placeholder="使用内置样例" options={(events.data ?? []).map((event) => ({ label: `事件 #${event.id} · ${event.type}`, value: event.id }))} onChange={selectPreviewEvent} /></label>
+              <label><span>预览数据</span><Select allowClear showSearch optionFilterProp="label" value={previewEventId} placeholder="搜索事件标题，留空使用内置样例" notFoundContent="没有匹配的事件标题" options={(events.data ?? []).map((event) => ({ label: eventTitle(event.payload, monitorByID.get(event.monitorId)), value: event.id }))} onChange={selectPreviewEvent} /></label>
               <label><span>发送渠道</span><Select value={previewChannelId} placeholder="选择已启用渠道" options={(channels.data ?? []).filter((channel) => channel.enabled).map((channel) => ({ label: `${channel.name} · ${channel.type}`, value: channel.id }))} onChange={setPreviewChannelId} /></label>
             </div>
             {previewMutation.isPending && !preview ? <Card loading className="message-preview-card" /> : preview ? (
@@ -148,7 +145,7 @@ export default function TemplatesPage() {
                 <div className="message-preview-head"><span>WATCHBELL 通知</span><strong>{preview.subject}</strong></div>
                 <div className="message-preview-body"><p>{preview.body}</p><dl><dt>监控</dt><dd>{selectedMonitor?.name ?? '示例监控'}</dd><dt>事件时间</dt><dd>{formatDate(selectedEvent?.createdAt)}</dd></dl></div>
               </article>
-            ) : <div className="preview-placeholder">选择模板并生成预览。</div>}
+            ) : <div className="preview-placeholder">选择模板或事件后将自动生成预览。</div>}
             <Alert className="preview-notice" type="info" showIcon message="变量使用 ${path} 语法；保存前会检查变量是否可用。" />
           </section>
         </div>
