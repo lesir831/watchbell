@@ -99,13 +99,31 @@ var moduleDefinitions = map[string][]Definition{
 		{Key: "github.release.assetCount", Label: "附件数量", Description: "Release 附件数量。", ValueType: "number"},
 		{Key: "github.release.assets", Label: "附件列表", Description: "附件对象列表，每项包含 name、url 和 size。", ValueType: "array"},
 	},
+	model.MonitorTypeCinemaSchedule: {
+		{Key: "cinema.provider", Label: "排期来源", Description: "影院排期数据来源，例如 maoyan。", ValueType: "string"},
+		{Key: "cinema.cinemaId", Label: "影院 ID", Description: "来源平台中的影院数字 ID。", ValueType: "number"},
+		{Key: "cinema.cinemaName", Label: "影院名称", Description: "排期页面显示的影院名称。", ValueType: "string"},
+		{Key: "cinema.movieId", Label: "影片 ID", Description: "来源平台中的影片数字 ID。", ValueType: "number"},
+		{Key: "cinema.movieName", Label: "影片名称", Description: "被监控影片的名称。", ValueType: "string"},
+		{Key: "cinema.targetDate", Label: "观影日期", Description: "被监控的本地观影日期，格式为 YYYY-MM-DD。", ValueType: "string"},
+		{Key: "cinema.hallPatterns", Label: "目标影厅规则", Description: "配置的 IMAX、杜比影院等文字匹配规则。", ValueType: "array"},
+		{Key: "cinema.sessionCount", Label: "匹配场次数量", Description: "本次事件或实时观测中匹配的场次数量。", ValueType: "number"},
+		{Key: "cinema.sessions", Label: "匹配场次", Description: "场次对象列表，每项包含日期、开散场时间、语言版本、影厅和购票地址。", ValueType: "array"},
+		{Key: "cinema.firstStartTime", Label: "最早开场时间", Description: "匹配场次中最早的开场时间。", ValueType: "string"},
+		{Key: "cinema.halls", Label: "匹配影厅", Description: "本次匹配到的影厅名称列表。", ValueType: "array"},
+		{Key: "cinema.url", Label: "影院排期地址", Description: "影院与影片的公开排期页面。", ValueType: "url"},
+		{Key: "cinema.purchaseUrl", Label: "首场购票地址", Description: "最早匹配场次的选座购票地址。", ValueType: "url"},
+		{Key: "cinema.summary", Label: "排期摘要", Description: "包含影院、影片、日期和匹配场次的通知摘要。", ValueType: "string"},
+		{Key: "cinema.status", Label: "排期状态", Description: "当前状态，例如 available、unavailable 或 expired。", ValueType: "string"},
+	},
 }
 
 var moduleNames = map[string]string{
-	model.MonitorTypeRSS:           "RSS / Atom",
-	model.MonitorTypeTestFlight:    "TestFlight",
-	model.MonitorTypeWebpage:       "网页变化",
-	model.MonitorTypeGitHubRelease: "GitHub Releases",
+	model.MonitorTypeRSS:            "RSS / Atom",
+	model.MonitorTypeTestFlight:     "TestFlight",
+	model.MonitorTypeWebpage:        "网页变化",
+	model.MonitorTypeGitHubRelease:  "GitHub Releases",
+	model.MonitorTypeCinemaSchedule: "影院排期",
 }
 
 func VariableCatalog() Catalog {
@@ -114,6 +132,7 @@ func VariableCatalog() Catalog {
 		model.MonitorTypeTestFlight,
 		model.MonitorTypeWebpage,
 		model.MonitorTypeGitHubRelease,
+		model.MonitorTypeCinemaSchedule,
 	}
 	modules := make([]Module, 0, len(moduleIDs))
 	for _, moduleID := range moduleIDs {
@@ -316,6 +335,20 @@ func normalizedValues(monitor model.Monitor, payload map[string]any) map[string]
 		} else {
 			values["status"] = "released"
 		}
+	case model.MonitorTypeCinemaSchedule:
+		values["url"] = firstNonEmpty(stringAt(payload, "cinema.purchaseUrl"), stringAt(payload, "cinema.url"))
+		movieName := stringAt(payload, "cinema.movieName")
+		cinemaName := stringAt(payload, "cinema.cinemaName")
+		cinemaTitle := movieName
+		if movieName != "" && cinemaName != "" {
+			cinemaTitle = movieName + " · " + cinemaName
+		} else if cinemaTitle == "" {
+			cinemaTitle = cinemaName
+		}
+		values["title"] = firstNonEmpty(cinemaTitle, monitor.Name)
+		values["summary"] = stringAt(payload, "cinema.summary")
+		values["content"] = stringAt(payload, "cinema.summary")
+		values["status"] = stringAt(payload, "cinema.status")
 	}
 	if strings.TrimSpace(fmt.Sprint(values["summary"])) == "" {
 		values["summary"] = values["content"]

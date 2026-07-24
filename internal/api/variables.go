@@ -143,12 +143,15 @@ func inferredMonitorType(event model.Event, fallback string) string {
 		return model.MonitorTypeWebpage
 	case strings.HasPrefix(eventType, "github."):
 		return model.MonitorTypeGitHubRelease
+	case strings.HasPrefix(eventType, "cinema."):
+		return model.MonitorTypeCinemaSchedule
 	}
 	var payload map[string]any
 	if json.Unmarshal(event.Payload, &payload) == nil {
 		for _, candidate := range []struct{ root, monitorType string }{
 			{"rss", model.MonitorTypeRSS}, {"testflight", model.MonitorTypeTestFlight},
 			{"webpage", model.MonitorTypeWebpage}, {"github", model.MonitorTypeGitHubRelease},
+			{"cinema", model.MonitorTypeCinemaSchedule},
 		} {
 			if _, ok := payload[candidate.root].(map[string]any); ok {
 				return candidate.monitorType

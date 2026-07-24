@@ -46,6 +46,21 @@ func TestEnrichPayloadMapsGlobalVariablesForEveryModule(t *testing.T) {
 			}}},
 			want: map[string]any{"url": "https://github.com/acme/app/releases/tag/v2", "title": "Version 2", "summary": "Notes", "content": "Notes", "author": "octocat", "publishedAt": "2026-07-17T12:00:00Z", "status": "released"},
 		},
+		{
+			name: "cinema", monitorType: model.MonitorTypeCinemaSchedule,
+			payload: map[string]any{"cinema": map[string]any{
+				"movieName": "蜘蛛侠：崭新之日", "cinemaName": "丰台万达杜比影院",
+				"purchaseUrl": "https://www.maoyan.com/xseats/20260801001",
+				"url":         "https://www.maoyan.com/cinema/16655?movieId=1490607",
+				"summary":     "8 月 1 日已有杜比影院排期", "status": "available",
+			}},
+			want: map[string]any{
+				"url":     "https://www.maoyan.com/xseats/20260801001",
+				"title":   "蜘蛛侠：崭新之日 · 丰台万达杜比影院",
+				"summary": "8 月 1 日已有杜比影院排期", "content": "8 月 1 日已有杜比影院排期",
+				"author": "", "publishedAt": "", "status": "available",
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -65,7 +80,7 @@ func TestEnrichPayloadMapsGlobalVariablesForEveryModule(t *testing.T) {
 
 func TestCatalogAndRuleKeysStayInSync(t *testing.T) {
 	catalog := VariableCatalog()
-	if len(catalog.Globals) == 0 || len(catalog.Modules) != 4 {
+	if len(catalog.Globals) == 0 || len(catalog.Modules) != 5 {
 		t.Fatalf("unexpected catalog: %#v", catalog)
 	}
 	for _, module := range catalog.Modules {
@@ -181,6 +196,9 @@ func mustJSON(value string) string {
 func moduleRoot(monitorType string) string {
 	if monitorType == model.MonitorTypeGitHubRelease {
 		return "github"
+	}
+	if monitorType == model.MonitorTypeCinemaSchedule {
+		return "cinema"
 	}
 	return monitorType
 }

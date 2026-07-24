@@ -6,10 +6,11 @@ import (
 )
 
 const (
-	MonitorTypeRSS           = "rss"
-	MonitorTypeTestFlight    = "testflight"
-	MonitorTypeWebpage       = "webpage"
-	MonitorTypeGitHubRelease = "github_release"
+	MonitorTypeRSS            = "rss"
+	MonitorTypeTestFlight     = "testflight"
+	MonitorTypeWebpage        = "webpage"
+	MonitorTypeGitHubRelease  = "github_release"
+	MonitorTypeCinemaSchedule = "cinema_schedule"
 
 	ChannelTypeBark     = "bark"
 	ChannelTypeDingTalk = "dingtalk"

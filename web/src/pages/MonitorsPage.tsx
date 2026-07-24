@@ -15,7 +15,7 @@ import {
   Space,
   Switch
 } from 'antd';
-import { ArrowRightOutlined, DeleteOutlined, EditOutlined, EyeOutlined, GithubOutlined, GlobalOutlined, PlayCircleOutlined, PlusOutlined, RadarChartOutlined, RocketOutlined, SearchOutlined } from '@ant-design/icons';
+import { ArrowRightOutlined, CalendarOutlined, DeleteOutlined, EditOutlined, EyeOutlined, GithubOutlined, GlobalOutlined, PlayCircleOutlined, PlusOutlined, RadarChartOutlined, RocketOutlined, SearchOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
 import ConfigFields from '../components/ConfigFields';
@@ -125,7 +125,7 @@ export default function MonitorsPage({ onNavigate, createRequest = 0 }: { onNavi
       </div>
 
       {filtered.length === 0 && !monitors.isLoading ? (
-        <div className="empty-panel"><EmptyState title={monitors.data?.length ? '没有符合筛选条件的监控' : '还没有监控'} description="选择 RSS、网页、TestFlight 或 GitHub Release 开始监听变化。" action={!monitors.data?.length ? <Button type="primary" onClick={openNew}>创建第一个监控</Button> : undefined} /></div>
+        <div className="empty-panel"><EmptyState title={monitors.data?.length ? '没有符合筛选条件的监控' : '还没有监控'} description="选择 RSS、网页、TestFlight、GitHub Release 或影院排期开始监听变化。" action={!monitors.data?.length ? <Button type="primary" onClick={openNew}>创建第一个监控</Button> : undefined} /></div>
       ) : (
         <>
         <div className="design-table-wrap monitor-table-desktop">
@@ -174,6 +174,7 @@ function monitorTypeIcon(type: MonitorType) {
   if (type === 'github_release') return <GithubOutlined />;
   if (type === 'rss') return <RadarChartOutlined />;
   if (type === 'webpage') return <GlobalOutlined />;
+  if (type === 'cinema_schedule') return <CalendarOutlined />;
   return <RocketOutlined />;
 }
 
@@ -254,7 +255,7 @@ function MonitorDrawer(props: {
             <Space.Compact block>
               <Form.Item name="intervalSeconds" noStyle rules={[{ required: true }]}><InputNumber min={30} max={2_592_000} style={{ width: '58%' }} suffix="秒" /></Form.Item>
               <Select placeholder="快捷选择" style={{ width: '42%' }} onChange={(value) => form.setFieldValue('intervalSeconds', value)} options={[
-                { value: 60, label: '1 分钟' }, { value: 300, label: '5 分钟' }, { value: 3600, label: '1 小时' },
+                { value: 60, label: '1 分钟' }, { value: 300, label: '5 分钟' }, { value: 900, label: '15 分钟' }, { value: 3600, label: '1 小时' },
                 { value: 21600, label: '6 小时' }, { value: 86400, label: '1 天' }, { value: 604800, label: '7 天' }
               ]} />
             </Space.Compact>

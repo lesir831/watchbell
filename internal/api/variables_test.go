@@ -93,7 +93,7 @@ func TestVariableCatalogAndLiveValueLinks(t *testing.T) {
 	if err := json.NewDecoder(catalogResponse.Body).Decode(&catalog); err != nil {
 		t.Fatal(err)
 	}
-	if catalogResponse.StatusCode != http.StatusOK || catalogResponse.Header.Get("Cache-Control") != "no-store" || len(catalog.Globals) != 7 || len(catalog.Modules) != 4 {
+	if catalogResponse.StatusCode != http.StatusOK || catalogResponse.Header.Get("Cache-Control") != "no-store" || len(catalog.Globals) != 7 || len(catalog.Modules) != 5 {
 		t.Fatalf("unexpected catalog response: status=%d cache=%q catalog=%#v", catalogResponse.StatusCode, catalogResponse.Header.Get("Cache-Control"), catalog)
 	}
 

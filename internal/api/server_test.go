@@ -26,7 +26,8 @@ func newTestServer(t *testing.T) (*httptest.Server, *store.Store) {
 		t.Fatal(err)
 	}
 	sched := scheduler.New(db, checker.NewRegistry(
-		checker.NewRSSChecker(), checker.NewTestFlightChecker(), checker.NewWebpageChecker(), checker.NewGitHubReleaseChecker(),
+		checker.NewRSSChecker(), checker.NewTestFlightChecker(), checker.NewWebpageChecker(),
+		checker.NewGitHubReleaseChecker(), checker.NewCinemaScheduleChecker(),
 	), notifier.NewRegistry(notifier.NewBarkNotifier(), notifier.NewDingTalkNotifier(), notifier.NewEmailNotifier()), scheduler.Options{})
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	server := httptest.NewServer(NewServer(db, sched, "", logger, nil).Routes())
@@ -58,6 +59,72 @@ func TestValidationReturnsFieldErrorsAndRequestID(t *testing.T) {
 	}
 	if response.Header.Get("X-Request-ID") != payload.RequestID {
 		t.Fatal("request id must be available in both header and body")
+	}
+}
+
+func TestCinemaScheduleMonitorValidation(t *testing.T) {
+	server, _ := newTestServer(t)
+	valid := []byte(`{
+		"name":"丰台万达杜比排期",
+		"type":"cinema_schedule",
+		"enabled":true,
+		"intervalSeconds":900,
+		"config":{
+			"provider":"maoyan",
+			"cinemaId":16655,
+			"movieId":1490607,
+			"movieName":"蜘蛛侠：崭新之日",
+			"targetDate":"2026-08-01",
+			"hallPatterns":["IMAX","杜比影院","Dolby Cinema"],
+			"notifyExisting":false,
+			"notifyNewSessions":false,
+			"timeoutSeconds":15
+		}
+	}`)
+	response, err := http.Post(server.URL+"/api/monitors", "application/json", bytes.NewReader(valid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("valid cinema monitor status = %d, want %d", response.StatusCode, http.StatusCreated)
+	}
+
+	invalid := []byte(`{
+		"name":"无效影院排期",
+		"type":"cinema_schedule",
+		"enabled":true,
+		"intervalSeconds":900,
+		"config":{
+			"provider":"unknown",
+			"cinemaId":0,
+			"movieId":1490607,
+			"movieName":"蜘蛛侠：崭新之日",
+			"targetDate":"08/01/2026",
+			"hallPatterns":[" "],
+			"timeoutSeconds":15
+		}
+	}`)
+	response, err = http.Post(server.URL+"/api/monitors", "application/json", bytes.NewReader(invalid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload struct {
+		Fields map[string]string `json:"fields"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{
+		"config.provider", "config.cinemaId", "config.targetDate", "config.hallPatterns",
+	} {
+		if payload.Fields[field] == "" {
+			t.Fatalf("missing validation error for %s: %#v", field, payload.Fields)
+		}
+	}
+	if payload.Fields["config.url"] != "" {
+		t.Fatalf("cinema monitor incorrectly required config.url: %#v", payload.Fields)
 	}
 }
 

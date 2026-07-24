@@ -46,6 +46,7 @@ function renderField(field: PluginConfigField, configured: boolean) {
   if (field.type === 'textarea') return <Input.TextArea className="code-input" rows={8} spellCheck={false} />;
   if (field.secret || field.type === 'secret') return <Input.Password autoComplete="new-password" placeholder={configured ? '已配置，留空保持原值' : '请输入敏感信息'} />;
   if (field.type === 'url') return <Input type="url" placeholder="https://" />;
+  if (field.type === 'date') return <Input type="date" />;
   return <Input />;
 }
 

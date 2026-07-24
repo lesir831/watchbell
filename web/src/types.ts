@@ -1,4 +1,4 @@
-export type MonitorType = 'rss' | 'testflight' | 'webpage' | 'github_release';
+export type MonitorType = 'rss' | 'testflight' | 'webpage' | 'github_release' | 'cinema_schedule';
 export type ChannelType = 'bark' | 'email' | 'webhook' | 'dingtalk';
 export type ProxyType = 'http' | 'https' | 'socks5';
 

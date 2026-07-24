@@ -17,6 +17,7 @@ var (
 	_ Inspector = (*TestFlightChecker)(nil)
 	_ Inspector = (*WebpageChecker)(nil)
 	_ Inspector = (*GitHubReleaseChecker)(nil)
+	_ Inspector = (*CinemaScheduleChecker)(nil)
 )
 
 func TestRSSInspectFetchesLatestItemWithoutConditionalState(t *testing.T) {

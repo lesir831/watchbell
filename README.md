@@ -13,6 +13,7 @@ WatchBell 是一个自托管的监控和通知小工具。
 - GitHub Release 发布检查，支持私有仓库和预发布版本
 - RSS / Atom / JSON Feed 拉取和关键词匹配
 - 网页文本变化检查，支持简单的 `#id`、`.class` 和标签选择器
+- 影院排期检查，支持按影片、日期和 IMAX / 杜比影院等影厅名称监控猫眼公开排期
 - Bark 推送
 - SMTP 邮件通知
 - 钉钉自定义机器人，支持加签、常用消息格式和原生参数扩展
@@ -194,7 +195,7 @@ WATCHBELL_AUTH_DISABLED=true go run ./cmd/watchbell
 - 代理不可用或已被异常移除时，使用它的监控会检查失败，不会自动绕过代理直连。仍被监控引用的代理不能归档。
 - 代理密码不会通过列表或详情 API 回显；编辑时留空保留原值，也可以显式清除。
 
-这里配置的是 RSS、TestFlight、网页和 GitHub Release 检查请求使用的“出站代理”，与 `WATCHBELL_TRUST_PROXY_HEADERS` 所描述的入站反向代理信任边界不是同一项设置。
+这里配置的是 RSS、TestFlight、网页、GitHub Release 和影院排期检查请求使用的“出站代理”，与 `WATCHBELL_TRUST_PROXY_HEADERS` 所描述的入站反向代理信任边界不是同一项设置。
 
 ## 配置项
 
@@ -288,6 +289,28 @@ TestFlight 检查目前基于公开页面里的文字判断状态。默认识别
 
 现在的网页检查是轻量版：抓 HTML，取文本，算 hash。它不执行 JavaScript。需要浏览器渲染的页面，以后可以单独加 Playwright worker，不建议一开始就放进主进程。
 
+### 影院排期
+
+```json
+{
+  "provider": "maoyan",
+  "cinemaId": 16655,
+  "movieId": 1490607,
+  "movieName": "蜘蛛侠：崭新之日",
+  "targetDate": "2026-08-01",
+  "hallPatterns": ["IMAX", "杜比影院", "Dolby Cinema"],
+  "notifyExisting": false,
+  "notifyNewSessions": false,
+  "timeoutSeconds": 15
+}
+```
+
+- `cinemaId` 是猫眼影院页 `/cinema/` 后面的数字，`movieId` 是页面查询参数中的影片数字 ID。例如 `/cinema/16655?movieId=1490607`。
+- `hallPatterns` 对影厅名和语言版本做不区分大小写的文字匹配。默认的“杜比影院”不会把仅写着“杜比全景声厅”的普通影厅当成 Dolby Cinema。
+- 默认第一次检查只建立基线；之后从没有匹配排期变成有匹配排期时，生成一个聚合事件。开启 `notifyExisting` 可让首次已有排期也通知；开启 `notifyNewSessions` 可在已经有排期后继续通知新增场次。
+- 事件类型是 `cinema.schedule.available`，`${url}` 默认指向最早匹配场次的选座页。目标日期结束后检查器会停止抓取该页面。
+- 当前只读取猫眼无需登录的公开影院 HTML，不绕过验证码或访问限制。建议保留默认 15 分钟检查间隔；遇到 `403`、`429` 或页面结构变化会按检查失败处理，不会误判为“暂无排期”。
+
 ## 规则配置
 
 管理界面可以递归组合“满足全部（AND）”和“满足任一（OR）”条件组，并用该监控最近的真实事件试跑。旧的单层规则无需迁移；`conditions` 中既可以放字段条件，也可以继续放条件组。例如“标题或正文包含关键词，并且发布时间在最近 2 分钟内”：
@@ -329,7 +352,7 @@ TestFlight 检查目前基于公开页面里的文字判断状态。默认识别
 - `exists`
 - `within_last`：判断 RFC3339 时间是否在最近一段时间内，值使用 `30s`、`2m`、`1h`、`24h` 等时长
 
-TestFlight 有空位时本身就会产生事件。如果只想有事件就通知，可以把规则条件写成空对象：
+TestFlight 有空位或影院出现目标排期时，本身就会产生事件。如果只想有事件就通知，可以把规则条件写成空对象：
 
 ```json
 {}
@@ -449,7 +472,7 @@ ${markdown:rss.content}
 
 `text` 会去除 HTML 和 Markdown 标记，保留便于阅读的段落与列表文本；`markdown` 会把 HTML 富文本转换为 Markdown，并尽量保持已经是 Markdown 的内容不变。它们适合在 RSS 正文等富文本变量用于通知模板时按目标渠道选择输出格式。
 
-跨模块快捷变量（RSS、TestFlight、网页和 GitHub Release 均可使用）：
+跨模块快捷变量（RSS、TestFlight、网页、GitHub Release 和影院排期均可使用）：
 
 ```text
 ${url}
@@ -529,6 +552,26 @@ ${github.release.assetCount}
 ${github.release.assets}
 ```
 
+影院排期：
+
+```text
+${cinema.provider}
+${cinema.cinemaId}
+${cinema.cinemaName}
+${cinema.movieId}
+${cinema.movieName}
+${cinema.targetDate}
+${cinema.hallPatterns}
+${cinema.sessionCount}
+${cinema.sessions}
+${cinema.firstStartTime}
+${cinema.halls}
+${cinema.url}
+${cinema.purchaseUrl}
+${cinema.summary}
+${cinema.status}
+```
+
 网页的“帮助”菜单会显示每个变量的含义、类型和适用位置。选择一个监控后，WatchBell 会立即按当前配置（包括指定代理）读取一次源站，并用当前观测渲染变量；RSS 使用订阅源中的最新条目。这个诊断检查不会创建检查记录或事件，不会修改监控与去重状态，不会执行规则或发送通知。每个值还提供会重新实时抓取的独立 JSON 链接：
 
 ```text
@@ -576,6 +619,7 @@ Docker Compose 使用 volume 持久化 `/data/watchbell.db`。升级镜像前，
 - 目前是单用户系统。
 - 网页检查不执行 JavaScript。
 - TestFlight 状态识别依赖页面文案。
+- 影院排期目前只支持猫眼公开页面，页面结构或访问策略变化时可能需要更新解析器。
 - 通知会按内置的保守策略重试，重试次数和退避时间暂时不能在界面自定义。
 - JSON 备份只覆盖可移植配置；运行历史和数据库级容灾仍需备份 SQLite 文件或 volume。
 

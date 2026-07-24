@@ -1129,5 +1129,15 @@ func sampleTemplateData() map[string]any {
 				"prerelease": false, "publishedAt": "2026-07-02T00:00:00Z", "author": "example",
 			},
 		},
+		"cinema": map[string]any{
+			"provider": "maoyan", "cinemaId": 16655, "cinemaName": "万达影城（丰台万达广场杜比影院店）",
+			"movieId": 1490607, "movieName": "蜘蛛侠：崭新之日", "targetDate": "2026-08-01",
+			"hallPatterns": []string{"IMAX", "杜比影院", "Dolby Cinema"},
+			"sessionCount": 1, "firstStartTime": "19:30", "halls": []string{"杜比影院"},
+			"url":         "https://www.maoyan.com/cinema/16655?movieId=1490607",
+			"purchaseUrl": "https://www.maoyan.com/xseats/20260801016655",
+			"summary":     "蜘蛛侠：崭新之日在万达影城的 2026-08-01 已有 1 场目标影厅排期：19:30 杜比影院",
+			"status":      "available",
+		},
 	}
 }

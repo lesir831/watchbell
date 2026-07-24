@@ -120,6 +120,7 @@ func main() {
 		checker.NewTestFlightChecker(),
 		checker.NewWebpageChecker(),
 		checker.NewGitHubReleaseChecker(),
+		checker.NewCinemaScheduleChecker(),
 	)
 	notifiers := notifier.NewRegistry(
 		notifier.NewBarkNotifier(),

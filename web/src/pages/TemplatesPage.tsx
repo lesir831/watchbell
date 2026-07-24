@@ -195,7 +195,7 @@ function TemplateDrawer(props: { open: boolean; record: NotificationTemplate | n
   const variables = useMemo(() => props.variableGroups.flatMap((group) => group.variables), [props.variableGroups]);
   const setInitial = () => form.setFieldsValue({
     name: props.record?.name ?? '', subjectTemplate: props.record?.subjectTemplate ?? '${monitor.name}: ${event.type}',
-    bodyTemplate: props.record?.bodyTemplate ?? '监控：${monitor.name}\n时间：${event.time}\n\n${rss.title}${testflight.message}${webpage.summary}${github.release.name}\n${rss.link}${testflight.url}${webpage.url}${github.release.url}'
+    bodyTemplate: props.record?.bodyTemplate ?? '监控：${monitor.name}\n时间：${event.time}\n\n${rss.title}${testflight.message}${webpage.summary}${github.release.name}${cinema.summary}\n${rss.link}${testflight.url}${webpage.url}${github.release.url}${cinema.purchaseUrl}'
   });
   const insertVariable = (key: string) => {
     const editor = insertTarget === 'subjectTemplate' ? subjectEditor.current : bodyEditor.current;

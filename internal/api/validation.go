@@ -8,6 +8,7 @@ import (
 	"net/mail"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/watchbell/watchbell/internal/eventvars"
 	"github.com/watchbell/watchbell/internal/model"
@@ -123,7 +124,7 @@ func validatePluginConfigFieldType(config map[string]any, field model.PluginConf
 	}
 	problemField := "config." + field.Key
 	switch field.Type {
-	case "string", "secret", "url", "textarea":
+	case "string", "secret", "url", "textarea", "date":
 		if _, ok := value.(string); !ok {
 			fields[problemField] = field.Label + "必须是字符串。"
 		}
@@ -152,7 +153,8 @@ func validatePluginConfigFieldType(config map[string]any, field model.PluginConf
 }
 
 func validateMonitorConfig(monitorType string, config map[string]any, fields map[string]string) {
-	if monitorType == model.MonitorTypeGitHubRelease {
+	switch monitorType {
+	case model.MonitorTypeGitHubRelease:
 		repository := strings.Trim(strings.TrimSpace(stringValue(config["repository"])), "/")
 		parts := strings.Split(repository, "/")
 		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(strings.TrimSuffix(parts[1], ".git")) == "" {
@@ -164,7 +166,36 @@ func validateMonitorConfig(monitorType string, config map[string]any, fields map
 		if value, ok := numberValue(config["maxReleases"]); ok && (value < 1 || value > 100) {
 			fields["config.maxReleases"] = "每次检查的 Release 数量必须在 1 到 100 之间。"
 		}
-	} else {
+	case model.MonitorTypeCinemaSchedule:
+		provider := strings.ToLower(stringValue(config["provider"]))
+		if provider != "" && provider != "maoyan" {
+			fields["config.provider"] = "当前仅支持 maoyan。"
+		}
+		if value, ok := numberValue(config["cinemaId"]); ok && value <= 0 {
+			fields["config.cinemaId"] = "影院 ID 必须是正整数。"
+		}
+		if value, ok := numberValue(config["movieId"]); ok && value <= 0 {
+			fields["config.movieId"] = "影片 ID 必须是正整数。"
+		}
+		targetDate := stringValue(config["targetDate"])
+		if targetDate != "" {
+			if _, err := time.Parse("2006-01-02", targetDate); err != nil {
+				fields["config.targetDate"] = "观影日期必须使用 YYYY-MM-DD 格式。"
+			}
+		}
+		if patterns, ok := config["hallPatterns"].([]any); ok {
+			hasPattern := false
+			for _, pattern := range patterns {
+				if strings.TrimSpace(stringValue(pattern)) != "" {
+					hasPattern = true
+					break
+				}
+			}
+			if !hasPattern {
+				fields["config.hallPatterns"] = "请至少填写一个非空的目标影厅。"
+			}
+		}
+	default:
 		if raw := stringValue(config["url"]); raw == "" || !validHTTPURL(raw) {
 			fields["config.url"] = "地址必须是有效的 HTTP 或 HTTPS URL。"
 		}

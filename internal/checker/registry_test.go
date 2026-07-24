@@ -12,6 +12,7 @@ func TestBuiltinPluginRegistry(t *testing.T) {
 		NewTestFlightChecker(),
 		NewWebpageChecker(),
 		NewGitHubReleaseChecker(),
+		NewCinemaScheduleChecker(),
 	)
 
 	for _, pluginID := range []string{
@@ -19,6 +20,7 @@ func TestBuiltinPluginRegistry(t *testing.T) {
 		model.MonitorTypeTestFlight,
 		model.MonitorTypeWebpage,
 		model.MonitorTypeGitHubRelease,
+		model.MonitorTypeCinemaSchedule,
 	} {
 		if !registry.Has(pluginID) {
 			t.Errorf("plugin %q is not registered", pluginID)
@@ -26,8 +28,8 @@ func TestBuiltinPluginRegistry(t *testing.T) {
 	}
 
 	plugins := registry.Plugins()
-	if len(plugins) != 4 {
-		t.Fatalf("got %d plugins, want 4", len(plugins))
+	if len(plugins) != 5 {
+		t.Fatalf("got %d plugins, want 5", len(plugins))
 	}
 	for _, plugin := range plugins {
 		if !plugin.Builtin || plugin.ID == "" || plugin.Name == "" || plugin.DefaultConfig == nil {
