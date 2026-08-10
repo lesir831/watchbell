@@ -373,7 +373,7 @@ TestFlight 有空位或影院出现目标排期时，本身就会产生事件。
 }
 ```
 
-如果你自己部署了 Bark Server，把 `serverUrl` 换成自己的地址即可。`url` 支持通知模板变量，点开推送可直达 RSS 条目或 GitHub Release 页面。新建渠道默认不填写跳转地址；只有确认事件 URL 不含私有订阅令牌、签名参数或其他凭据时，再显式配置 `${url}`。
+如果你自己部署了 Bark Server，把 `serverUrl` 换成自己的地址即可。`url` 支持通知模板变量，点开推送可直达 RSS 条目或 GitHub Release 页面。新建渠道默认不填写跳转地址；只有确认事件 URL 不含私有订阅令牌、签名参数或其他凭据时，再显式配置 `${url}`。Bark 最终受 APNs 4 KiB payload 上限约束；WatchBell 会在发送前按完整 payload 的编码字节数预处理，优先截断超长正文、必要时再截断标题，并保留可用的跳转地址。
 
 ### 邮件
 
