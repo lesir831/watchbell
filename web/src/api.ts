@@ -3,6 +3,10 @@ import type {
   AuditLog,
   CheckRun,
   ChangePasswordInput,
+  CinemaCity,
+  CinemaDiscoveryResult,
+  CinemaMovie,
+  CinemaVenue,
   ConfigBackup,
   ConfigImportReport,
   CurrentUser,
@@ -86,6 +90,15 @@ function withQuery(path: string, query: HistoryQuery) {
   return `${path}?${values.toString()}`;
 }
 
+function withSearchParams(path: string, query: Record<string, string | number | undefined | null>) {
+  const values = new URLSearchParams();
+  Object.entries(query).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') values.set(key, String(value));
+  });
+  const encoded = values.toString();
+  return encoded ? `${path}?${encoded}` : path;
+}
+
 function jsonInit(method: string, body?: unknown): RequestInit {
   return {
     method,
@@ -119,6 +132,7 @@ export const api = {
 
   listMonitors: () => request<Monitor[]>('/api/monitors'),
   createMonitor: (body: MonitorInput) => request<Monitor>('/api/monitors', jsonInit('POST', body)),
+  copyMonitor: (id: number) => request<Monitor>(`/api/monitors/${id}/copy`, jsonInit('POST')),
   updateMonitor: (id: number, body: MonitorInput) => request<Monitor>(`/api/monitors/${id}`, jsonInit('PUT', body)),
   deleteMonitor: (id: number) => request<void>(`/api/monitors/${id}`, jsonInit('DELETE')),
   checkMonitor: (id: number) => request<{ status: string; eventCount: number; checkRun?: CheckRun }>(`/api/monitors/${id}/check`, jsonInit('POST')),
@@ -126,24 +140,33 @@ export const api = {
 
   listRules: () => request<Rule[]>('/api/rules'),
   createRule: (body: RuleInput) => request<Rule>('/api/rules', jsonInit('POST', body)),
-  testRule: (body: Pick<RuleInput, 'monitorId' | 'condition'> & { limit?: number }) => request<RuleTestResponse>('/api/rules/test', jsonInit('POST', body)),
+  copyRule: (id: number) => request<Rule>(`/api/rules/${id}/copy`, jsonInit('POST')),
+  testRule: (body: Pick<RuleInput, 'monitorIds' | 'condition'> & { limit?: number }) => request<RuleTestResponse>('/api/rules/test', jsonInit('POST', body)),
   updateRule: (id: number, body: RuleInput) => request<Rule>(`/api/rules/${id}`, jsonInit('PUT', body)),
   deleteRule: (id: number) => request<void>(`/api/rules/${id}`, jsonInit('DELETE')),
 
   listChannels: () => request<NotifyChannel[]>('/api/channels'),
   createChannel: (body: NotifyChannelInput) => request<NotifyChannel>('/api/channels', jsonInit('POST', body)),
+  copyChannel: (id: number) => request<NotifyChannel>(`/api/channels/${id}/copy`, jsonInit('POST')),
   updateChannel: (id: number, body: NotifyChannelInput) => request<NotifyChannel>(`/api/channels/${id}`, jsonInit('PUT', body)),
   deleteChannel: (id: number) => request<void>(`/api/channels/${id}`, jsonInit('DELETE')),
   testChannel: (id: number) => request<NotificationAttempt>(`/api/channels/${id}/test`, jsonInit('POST')),
 
   listTemplates: () => request<NotificationTemplate[]>('/api/templates'),
   createTemplate: (body: NotificationTemplateInput) => request<NotificationTemplate>('/api/templates', jsonInit('POST', body)),
+  copyTemplate: (id: number) => request<NotificationTemplate>(`/api/templates/${id}/copy`, jsonInit('POST')),
   updateTemplate: (id: number, body: NotificationTemplateInput) => request<NotificationTemplate>(`/api/templates/${id}`, jsonInit('PUT', body)),
   deleteTemplate: (id: number) => request<void>(`/api/templates/${id}`, jsonInit('DELETE')),
   previewTemplate: (body: Partial<NotificationTemplateInput> & { eventId?: number }) =>
     request<{ subject: string; body: string }>('/api/templates/preview', jsonInit('POST', body)),
   sendTemplatePreview: (body: { templateId: number; channelId: number; eventId?: number }) =>
     request<NotificationAttempt>('/api/templates/send-preview', jsonInit('POST', body)),
+
+  searchCinemaCities: (q: string, proxyId?: number | null, signal?: AbortSignal) => request<CinemaDiscoveryResult<CinemaCity>>(withSearchParams('/api/cinema/cities', { q, proxyId }), { signal }),
+  searchCinemas: (cityId: number, q: string, proxyId?: number | null, signal?: AbortSignal) =>
+    request<CinemaDiscoveryResult<CinemaVenue>>(withSearchParams('/api/cinema/cinemas', { cityId, q, proxyId }), { signal }),
+  searchCinemaMovies: (cityId: number, q: string, proxyId?: number | null, signal?: AbortSignal) =>
+    request<CinemaDiscoveryResult<CinemaMovie>>(withSearchParams('/api/cinema/movies', { cityId, q, proxyId }), { signal }),
 
   listEvents: () => request<EventRecord[]>('/api/events?limit=100'),
   listEventsPage: (query: HistoryQuery) => request<HistoryPage<EventRecord>>(withQuery('/api/events', query)),

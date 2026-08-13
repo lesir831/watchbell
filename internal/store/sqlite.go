@@ -81,6 +81,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{"monitors", "failure_alert_active", "INTEGER NOT NULL DEFAULT 0"},
 		{"monitors", "deleted_at", "TEXT"},
 		{"rules", "quiet_hours_json", "TEXT NOT NULL DEFAULT '{}'"},
+		{"rules", "monitor_ids_json", "TEXT NOT NULL DEFAULT '[]'"},
 		{"rules", "deleted_at", "TEXT"},
 		{"notify_channels", "deleted_at", "TEXT"},
 		{"notification_templates", "is_default", "INTEGER NOT NULL DEFAULT 0"},
@@ -101,6 +102,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, query); err != nil {
 			return fmt.Errorf("migrate %s.%s: %w", column.table, column.name, err)
 		}
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE rules SET monitor_ids_json = '[' || monitor_id || ']' WHERE deleted_at IS NULL AND (monitor_ids_json IS NULL OR monitor_ids_json = '' OR monitor_ids_json = '[]')`); err != nil {
+		return fmt.Errorf("backfill rule monitor ids: %w", err)
 	}
 	// notification_attempts.monitor_id was added after the original trace
 	// schema. Backfill it while the event/evaluation links are still available
@@ -336,10 +340,57 @@ func (s *Store) DeleteMonitor(ctx context.Context, id int64) error {
 	if affected == 0 {
 		return sql.ErrNoRows
 	}
-	// Rules cannot be meaningfully restored without their monitor. Archive the
-	// active configuration rows while preserving all rule evaluation history.
-	if _, err := tx.ExecContext(ctx, `UPDATE rules SET enabled = 0, deleted_at = ?, updated_at = ? WHERE monitor_id = ? AND deleted_at IS NULL`, now, now, id); err != nil {
+	// Remove only this monitor from shared rules. A rule is archived when its
+	// final monitor disappears; evaluation history always remains available.
+	ruleRows, err := tx.QueryContext(ctx, `SELECT id, monitor_id, monitor_ids_json FROM rules WHERE deleted_at IS NULL`)
+	if err != nil {
 		return err
+	}
+	type ruleMonitorReference struct {
+		id, primary int64
+		raw         string
+	}
+	references := make([]ruleMonitorReference, 0)
+	for ruleRows.Next() {
+		var reference ruleMonitorReference
+		if err := ruleRows.Scan(&reference.id, &reference.primary, &reference.raw); err != nil {
+			ruleRows.Close()
+			return err
+		}
+		references = append(references, reference)
+	}
+	if err := ruleRows.Err(); err != nil {
+		ruleRows.Close()
+		return err
+	}
+	ruleRows.Close()
+	for _, reference := range references {
+		monitorIDs, err := decodeRuleMonitorIDs(reference.primary, reference.raw)
+		if err != nil {
+			return fmt.Errorf("decode rule %d monitors: %w", reference.id, err)
+		}
+		filtered := removeID(monitorIDs, id)
+		if len(filtered) == len(monitorIDs) {
+			continue
+		}
+		if len(filtered) == 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE rules SET enabled = 0, deleted_at = ?, monitor_ids_json = '[]', updated_at = ? WHERE id = ?`, now, now, reference.id); err != nil {
+				return err
+			}
+			continue
+		}
+		var ruleName string
+		if err := tx.QueryRowContext(ctx, `SELECT name FROM rules WHERE id = ?`, reference.id).Scan(&ruleName); err != nil {
+			return err
+		}
+		ruleName, err = availableRuleName(ctx, tx, reference.id, filtered, ruleName)
+		if err != nil {
+			return err
+		}
+		encoded, _ := json.Marshal(filtered)
+		if _, err := tx.ExecContext(ctx, `UPDATE rules SET monitor_id = ?, monitor_ids_json = ?, name = ?, updated_at = ? WHERE id = ?`, filtered[0], string(encoded), ruleName, now, reference.id); err != nil {
+			return err
+		}
 	}
 	// Events already discovered remain part of history, but no notification
 	// should be dispatched after the owning monitor and its rules are archived.
@@ -354,8 +405,48 @@ func (s *Store) DeleteMonitor(ctx context.Context, id int64) error {
 	return tx.Commit()
 }
 
+func availableRuleName(ctx context.Context, tx *sql.Tx, ruleID int64, monitorIDs []int64, currentName string) (string, error) {
+	for attempt := 0; attempt < 10_000; attempt++ {
+		candidate := currentName
+		if attempt > 0 {
+			candidate = fmt.Sprintf("%s（监控调整 %d）", currentName, attempt)
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT monitor_id, monitor_ids_json FROM rules WHERE id <> ? AND name = ? AND deleted_at IS NULL`, ruleID, candidate)
+		if err != nil {
+			return "", err
+		}
+		conflict := false
+		for rows.Next() {
+			var primaryID int64
+			var rawMonitorIDs string
+			if err := rows.Scan(&primaryID, &rawMonitorIDs); err != nil {
+				rows.Close()
+				return "", err
+			}
+			otherIDs, err := decodeRuleMonitorIDs(primaryID, rawMonitorIDs)
+			if err != nil {
+				rows.Close()
+				return "", err
+			}
+			if ruleMonitorSetsOverlap(monitorIDs, otherIDs) {
+				conflict = true
+				break
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return "", err
+		}
+		rows.Close()
+		if !conflict {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("generate unique rule name after monitor adjustment for rule %d", ruleID)
+}
+
 func (s *Store) ListRules(ctx context.Context) ([]model.Rule, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, last_fired_at, created_at, updated_at FROM rules WHERE deleted_at IS NULL ORDER BY id DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, monitor_ids_json, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, last_fired_at, created_at, updated_at FROM rules WHERE deleted_at IS NULL ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -364,20 +455,35 @@ func (s *Store) ListRules(ctx context.Context) ([]model.Rule, error) {
 }
 
 func (s *Store) ListRulesForMonitor(ctx context.Context, monitorID int64) ([]model.Rule, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, last_fired_at, created_at, updated_at FROM rules WHERE monitor_id = ? AND enabled = 1 AND deleted_at IS NULL ORDER BY id ASC`, monitorID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, monitor_id, monitor_ids_json, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, last_fired_at, created_at, updated_at FROM rules WHERE enabled = 1 AND deleted_at IS NULL ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanRules(rows)
+	items, err := scanRules(rows)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]model.Rule, 0, len(items))
+	for _, item := range items {
+		if containsID(item.MonitorIDs, monitorID) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered, nil
 }
 
 func (s *Store) GetRule(ctx context.Context, id int64) (model.Rule, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, last_fired_at, created_at, updated_at FROM rules WHERE id = ? AND deleted_at IS NULL`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, monitor_id, monitor_ids_json, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, last_fired_at, created_at, updated_at FROM rules WHERE id = ? AND deleted_at IS NULL`, id)
 	return scanRule(row)
 }
 
 func (s *Store) CreateRule(ctx context.Context, input model.RuleInput) (model.Rule, error) {
+	monitorIDs := normalizeRuleMonitorIDs(input.MonitorID, input.MonitorIDs)
+	if len(monitorIDs) == 0 {
+		return model.Rule{}, errors.New("rule requires at least one monitor")
+	}
+	input.MonitorID = monitorIDs[0]
 	now := nowString()
 	condition := normalizedJSON(input.Condition, "{}")
 	channelIDs, err := json.Marshal(input.NotifyChannelIDs)
@@ -388,17 +494,37 @@ func (s *Store) CreateRule(ctx context.Context, input model.RuleInput) (model.Ru
 	if err != nil {
 		return model.Rule{}, err
 	}
+	monitorIDsJSON, err := json.Marshal(monitorIDs)
+	if err != nil {
+		return model.Rule{}, err
+	}
 	name := strings.TrimSpace(input.Name)
-	res, err := s.db.ExecContext(ctx, `INSERT INTO rules (monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, created_at, updated_at)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-		WHERE NOT EXISTS (SELECT 1 FROM rules WHERE monitor_id = ? AND name = ? AND deleted_at IS NULL)`,
-		input.MonitorID, name, boolInt(input.Enabled), string(condition), string(channelIDs), input.TemplateID, input.CooldownSeconds, string(quietHours), now, now, input.MonitorID, name)
+	if err := s.requireActiveMonitors(ctx, monitorIDs); err != nil {
+		return model.Rule{}, err
+	}
+	if conflict, err := s.ruleNameOverlaps(ctx, 0, monitorIDs, name); err != nil {
+		return model.Rule{}, err
+	} else if conflict {
+		return model.Rule{}, fmt.Errorf("%w: rule overlaps an active monitor (%s)", ErrDuplicateNaturalKey, name)
+	}
+	res, err := s.db.ExecContext(ctx, `INSERT INTO rules (monitor_id, monitor_ids_json, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, created_at, updated_at)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (SELECT 1 FROM json_each(?) incoming WHERE NOT EXISTS (SELECT 1 FROM monitors WHERE id = incoming.value AND deleted_at IS NULL))
+		AND NOT EXISTS (
+			SELECT 1 FROM rules duplicate
+			WHERE duplicate.name = ? AND duplicate.deleted_at IS NULL
+			AND EXISTS (SELECT 1 FROM json_each(duplicate.monitor_ids_json) existing JOIN json_each(?) incoming ON existing.value = incoming.value)
+		)`,
+		input.MonitorID, string(monitorIDsJSON), name, boolInt(input.Enabled), string(condition), string(channelIDs), input.TemplateID, input.CooldownSeconds, string(quietHours), now, now, string(monitorIDsJSON), name, string(monitorIDsJSON))
 	if err != nil {
 		return model.Rule{}, err
 	}
 	if duplicate, err := insertWasSkipped(res); err != nil {
 		return model.Rule{}, err
 	} else if duplicate {
+		if err := s.requireActiveMonitors(ctx, monitorIDs); err != nil {
+			return model.Rule{}, err
+		}
 		return model.Rule{}, fmt.Errorf("%w: rule (%d, %s)", ErrDuplicateNaturalKey, input.MonitorID, name)
 	}
 	id, err := res.LastInsertId()
@@ -409,6 +535,11 @@ func (s *Store) CreateRule(ctx context.Context, input model.RuleInput) (model.Ru
 }
 
 func (s *Store) UpdateRule(ctx context.Context, id int64, input model.RuleInput) (model.Rule, error) {
+	monitorIDs := normalizeRuleMonitorIDs(input.MonitorID, input.MonitorIDs)
+	if len(monitorIDs) == 0 {
+		return model.Rule{}, errors.New("rule requires at least one monitor")
+	}
+	input.MonitorID = monitorIDs[0]
 	condition := normalizedJSON(input.Condition, "{}")
 	channelIDs, err := json.Marshal(input.NotifyChannelIDs)
 	if err != nil {
@@ -418,9 +549,28 @@ func (s *Store) UpdateRule(ctx context.Context, id int64, input model.RuleInput)
 	if err != nil {
 		return model.Rule{}, err
 	}
+	monitorIDsJSON, err := json.Marshal(monitorIDs)
+	if err != nil {
+		return model.Rule{}, err
+	}
 	name := strings.TrimSpace(input.Name)
-	res, err := s.db.ExecContext(ctx, `UPDATE rules SET monitor_id = ?, name = ?, enabled = ?, condition_json = ?, notify_channel_ids_json = ?, template_id = ?, cooldown_seconds = ?, quiet_hours_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM rules duplicate WHERE duplicate.monitor_id = ? AND duplicate.name = ? AND duplicate.deleted_at IS NULL AND duplicate.id <> ?)`,
-		input.MonitorID, name, boolInt(input.Enabled), string(condition), string(channelIDs), input.TemplateID, input.CooldownSeconds, string(quietHours), nowString(), id, input.MonitorID, name, id)
+	if err := s.requireActiveMonitors(ctx, monitorIDs); err != nil {
+		return model.Rule{}, err
+	}
+	if conflict, err := s.ruleNameOverlaps(ctx, id, monitorIDs, name); err != nil {
+		return model.Rule{}, err
+	} else if conflict {
+		return model.Rule{}, fmt.Errorf("%w: rule overlaps an active monitor (%s)", ErrDuplicateNaturalKey, name)
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE rules SET monitor_id = ?, monitor_ids_json = ?, name = ?, enabled = ?, condition_json = ?, notify_channel_ids_json = ?, template_id = ?, cooldown_seconds = ?, quiet_hours_json = ?, updated_at = ?
+		WHERE id = ? AND deleted_at IS NULL
+		AND NOT EXISTS (SELECT 1 FROM json_each(?) incoming WHERE NOT EXISTS (SELECT 1 FROM monitors WHERE id = incoming.value AND deleted_at IS NULL))
+		AND NOT EXISTS (
+			SELECT 1 FROM rules duplicate
+			WHERE duplicate.id <> ? AND duplicate.name = ? AND duplicate.deleted_at IS NULL
+			AND EXISTS (SELECT 1 FROM json_each(duplicate.monitor_ids_json) existing JOIN json_each(?) incoming ON existing.value = incoming.value)
+		)`,
+		input.MonitorID, string(monitorIDsJSON), name, boolInt(input.Enabled), string(condition), string(channelIDs), input.TemplateID, input.CooldownSeconds, string(quietHours), nowString(), id, string(monitorIDsJSON), id, name, string(monitorIDsJSON))
 	if err != nil {
 		return model.Rule{}, err
 	}
@@ -430,6 +580,9 @@ func (s *Store) UpdateRule(ctx context.Context, id int64, input model.RuleInput)
 			return model.Rule{}, lookupErr
 		} else if !exists {
 			return model.Rule{}, sql.ErrNoRows
+		}
+		if err := s.requireActiveMonitors(ctx, monitorIDs); err != nil {
+			return model.Rule{}, err
 		}
 		return model.Rule{}, fmt.Errorf("%w: rule (%d, %s)", ErrDuplicateNaturalKey, input.MonitorID, name)
 	}
@@ -876,6 +1029,88 @@ func normalizedIDs(ids []int64) []int64 {
 	return ids
 }
 
+func normalizeRuleMonitorIDs(primary int64, ids []int64) []int64 {
+	if len(ids) == 0 && primary > 0 {
+		ids = []int64{primary}
+	}
+	result := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result
+}
+
+func (s *Store) ruleNameOverlaps(ctx context.Context, excludeID int64, monitorIDs []int64, name string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT monitor_id, monitor_ids_json FROM rules WHERE id <> ? AND name = ? AND deleted_at IS NULL`, excludeID, strings.TrimSpace(name))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var primaryID int64
+		var rawMonitorIDs string
+		if err := rows.Scan(&primaryID, &rawMonitorIDs); err != nil {
+			return false, err
+		}
+		otherIDs, err := decodeRuleMonitorIDs(primaryID, rawMonitorIDs)
+		if err != nil {
+			return false, err
+		}
+		if ruleMonitorSetsOverlap(monitorIDs, otherIDs) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+func (s *Store) requireActiveMonitors(ctx context.Context, monitorIDs []int64) error {
+	for _, monitorID := range monitorIDs {
+		var active bool
+		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM monitors WHERE id = ? AND deleted_at IS NULL)`, monitorID).Scan(&active); err != nil {
+			return err
+		}
+		if !active {
+			return fmt.Errorf("active monitor %d is required", monitorID)
+		}
+	}
+	return nil
+}
+
+func decodeRuleMonitorIDs(primary int64, raw string) ([]int64, error) {
+	var ids []int64
+	if err := json.Unmarshal([]byte(defaultJSON(raw, "[]")), &ids); err != nil {
+		return nil, err
+	}
+	return normalizeRuleMonitorIDs(primary, ids), nil
+}
+
+func removeID(ids []int64, remove int64) []int64 {
+	result := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id != remove {
+			result = append(result, id)
+		}
+	}
+	return result
+}
+
+func containsID(ids []int64, target int64) bool {
+	for _, id := range ids {
+		if id == target {
+			return true
+		}
+	}
+	return false
+}
+
 func removeJSONID(raw string, remove int64) ([]int64, bool, error) {
 	var ids []int64
 	if err := json.Unmarshal([]byte(defaultJSON(raw, "[]")), &ids); err != nil {
@@ -908,15 +1143,22 @@ func scanRules(rows *sql.Rows) ([]model.Rule, error) {
 func scanRule(row scanner) (model.Rule, error) {
 	var item model.Rule
 	var enabled int
-	var condition, channelIDs, quietHours string
+	var monitorIDs, condition, channelIDs, quietHours string
 	var templateID sql.NullInt64
 	var lastFired sql.NullString
 	var createdAt, updatedAt string
-	err := row.Scan(&item.ID, &item.MonitorID, &item.Name, &enabled, &condition, &channelIDs, &templateID, &item.CooldownSeconds, &quietHours, &lastFired, &createdAt, &updatedAt)
+	err := row.Scan(&item.ID, &item.MonitorID, &monitorIDs, &item.Name, &enabled, &condition, &channelIDs, &templateID, &item.CooldownSeconds, &quietHours, &lastFired, &createdAt, &updatedAt)
 	if err != nil {
 		return model.Rule{}, err
 	}
 	item.Enabled = enabled == 1
+	item.MonitorIDs, err = decodeRuleMonitorIDs(item.MonitorID, monitorIDs)
+	if err != nil {
+		return model.Rule{}, err
+	}
+	if len(item.MonitorIDs) > 0 {
+		item.MonitorID = item.MonitorIDs[0]
+	}
 	item.Condition = json.RawMessage(defaultJSON(condition, "{}"))
 	if templateID.Valid {
 		item.TemplateID = &templateID.Int64

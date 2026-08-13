@@ -24,7 +24,7 @@ export default function MonitorDetailPage({ monitorId, onNavigate }: { monitorId
   const attempts = useQuery({ queryKey: ['notificationAttempts', 'monitorDetail', monitorId, attemptsPaging], queryFn: () => api.listNotificationAttemptsPage({ ...attemptsPaging, monitorId }), refetchInterval: 15_000, placeholderData: (previous, query) => query?.queryKey[2] === monitorId ? previous : undefined });
   const failedAttempts = useQuery({ queryKey: ['notificationAttempts', 'monitorDetail', monitorId, 'failedCount'], queryFn: () => api.listNotificationAttemptsPage({ page: 1, pageSize: 1, monitorId, status: 'failed' }), refetchInterval: 15_000 });
   const monitor = monitors.data?.find((item) => item.id === monitorId);
-  const monitorRules = (rules.data ?? []).filter((item) => item.monitorId === monitorId);
+  const monitorRules = (rules.data ?? []).filter((item) => (item.monitorIds?.length ? item.monitorIds : [item.monitorId]).includes(monitorId));
   const monitorRuns = runs.data?.items ?? [];
   const monitorEvents = events.data?.items ?? [];
   const monitorAttempts = attempts.data?.items ?? [];

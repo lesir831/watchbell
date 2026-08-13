@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -85,6 +86,50 @@ func TestNaturalKeyCreatesAreAtomic(t *testing.T) {
 				t.Fatalf("successful creates = %d, want 1", successes.Load())
 			}
 		})
+	}
+}
+
+func TestOverlappingMultiMonitorRuleCreatesAreAtomic(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	monitors := make([]model.Monitor, 0, 3)
+	for index := range 3 {
+		monitor, err := db.CreateMonitor(ctx, model.MonitorInput{Name: fmt.Sprintf("Rule monitor %d", index), Type: "rss", Enabled: true, IntervalSeconds: 60, Config: json.RawMessage(`{}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		monitors = append(monitors, monitor)
+	}
+	inputs := []model.RuleInput{
+		{MonitorIDs: []int64{monitors[0].ID, monitors[1].ID}, Name: "Concurrent overlap", Enabled: true, Condition: json.RawMessage(`{}`)},
+		{MonitorIDs: []int64{monitors[1].ID, monitors[2].ID}, Name: "Concurrent overlap", Enabled: true, Condition: json.RawMessage(`{}`)},
+	}
+	start := make(chan struct{})
+	var successes atomic.Int32
+	var group sync.WaitGroup
+	for _, input := range inputs {
+		group.Add(1)
+		go func(input model.RuleInput) {
+			defer group.Done()
+			<-start
+			_, err := db.CreateRule(ctx, input)
+			switch {
+			case err == nil:
+				successes.Add(1)
+			case errors.Is(err, ErrDuplicateNaturalKey):
+			default:
+				t.Errorf("CreateRule() error = %v", err)
+			}
+		}(input)
+	}
+	close(start)
+	group.Wait()
+	if successes.Load() != 1 {
+		t.Fatalf("successful overlapping creates = %d, want 1", successes.Load())
 	}
 }
 

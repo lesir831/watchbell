@@ -134,6 +134,7 @@ export interface MonitorInput {
 export interface Rule {
   id: number;
   monitorId: number;
+  monitorIds: number[];
   name: string;
   enabled: boolean;
   condition: RuleConditionExpression;
@@ -147,7 +148,7 @@ export interface Rule {
 }
 
 export interface RuleInput {
-  monitorId: number;
+  monitorIds: number[];
   name: string;
   enabled: boolean;
   condition: RuleConditionExpression;
@@ -223,12 +224,44 @@ export interface RuleTestResponse {
   tested: number;
   matched: number;
   results: Array<{
+    monitorId: number;
+    monitorName: string;
     eventId: number;
     eventType: string;
     matched: string[];
     payload: Record<string, unknown>;
     createdAt: string;
   }>;
+}
+
+export interface CinemaCity {
+  id: number;
+  name: string;
+  pinyin: string;
+}
+
+export interface CinemaVenue {
+  id: number;
+  name: string;
+  address: string;
+  distance?: string;
+  hallTypes: string[];
+}
+
+export interface CinemaMovie {
+  id: number;
+  name: string;
+  englishName?: string;
+  alias?: string;
+  releaseDate?: string;
+  releaseDescription?: string;
+  categories: string[];
+  version?: string;
+}
+
+export interface CinemaDiscoveryResult<T> {
+  items: T[];
+  total: number;
 }
 
 export interface NotifyChannel {

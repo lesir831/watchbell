@@ -16,10 +16,10 @@ import {
   Tag,
   Typography
 } from 'antd';
-import { BranchesOutlined, DeleteOutlined, EditOutlined, ExperimentOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
+import { BranchesOutlined, CopyOutlined, DeleteOutlined, EditOutlined, ExperimentOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
-import ConditionBuilder, { defaultConditionGroup, normalizeConditionGroup, validateConditionGroup } from '../components/ConditionBuilder';
+import ConditionBuilder, { defaultConditionGroup, isConditionGroup, normalizeConditionGroup, validateConditionGroup } from '../components/ConditionBuilder';
 import { EmptyState, PageError, PageHeader, relativeDate } from '../components/Common';
 import type { Monitor, MonitorPlugin, NotificationTemplate, NotifyChannel, Rule, RuleConditionGroup, RuleInput } from '../types';
 
@@ -55,6 +55,17 @@ export default function RulesPage({ editRuleId }: { editRuleId?: number }) {
     mutationFn: (payload: { id?: number; input: RuleInput }) => payload.id ? api.updateRule(payload.id, payload.input) : api.createRule(payload.input),
     onSuccess: async () => { await refresh(); setDrawerOpen(false); setEditing(null); message.success('规则已保存'); }
   });
+  const copyMutation = useMutation({
+    mutationFn: api.copyRule,
+    onSuccess: async (item) => {
+      await refresh();
+      saveMutation.reset();
+      setEditing(item);
+      setDrawerOpen(true);
+      message.success('规则副本已创建，默认处于停用状态');
+    },
+    onError: (error: Error) => message.error(error.message)
+  });
   const deleteMutation = useMutation({
     mutationFn: api.deleteRule,
     onSuccess: async () => { await refresh(); message.success('规则已归档，历史判断记录仍会保留'); },
@@ -62,7 +73,7 @@ export default function RulesPage({ editRuleId }: { editRuleId?: number }) {
   });
   const toggleMutation = useMutation({
     mutationFn: ({ record, enabled }: { record: Rule; enabled: boolean }) => api.updateRule(record.id, {
-      monitorId: record.monitorId, name: record.name, enabled, condition: record.condition,
+      monitorIds: ruleMonitorIds(record), name: record.name, enabled, condition: record.condition,
       notifyChannelIds: record.notifyChannelIds, templateId: record.templateId ?? null,
       cooldownSeconds: record.cooldownSeconds, quietHours: record.quietHours
     }),
@@ -70,15 +81,15 @@ export default function RulesPage({ editRuleId }: { editRuleId?: number }) {
     onError: (error: Error) => message.error(error.message)
   });
   const testMutation = useMutation({
-    mutationFn: (record: Rule) => api.testRule({ monitorId: record.monitorId, condition: record.condition, limit: 20 }),
+    mutationFn: (record: Rule) => api.testRule({ monitorIds: ruleMonitorIds(record), condition: record.condition, limit: 20 }),
     onSuccess: (result) => message.success(`测试 ${result.tested} 条事件，命中 ${result.matched} 条`),
     onError: (error: Error) => message.error(error.message)
   });
   const normalizedSearch = search.trim().toLowerCase();
   const filtered = (rules.data ?? []).filter((item) => {
-    const monitorName = monitorByID.get(item.monitorId)?.name ?? '';
+    const monitorNames = ruleMonitorIds(item).map((id) => monitorByID.get(id)?.name ?? '').join(' ');
     return (status === 'all' || (status === 'enabled' ? item.enabled : !item.enabled))
-      && `${item.name} ${monitorName}`.toLowerCase().includes(normalizedSearch);
+      && `${item.name} ${monitorNames}`.toLowerCase().includes(normalizedSearch);
   });
   const canCreate = Boolean(monitors.data?.length && channels.data?.some((item) => item.enabled));
   const openNew = () => { setEditing(null); setDrawerOpen(true); };
@@ -114,11 +125,12 @@ export default function RulesPage({ editRuleId }: { editRuleId?: number }) {
       ) : (
         <div className="collection-grid">
           {filtered.map((item) => {
-            const monitor = monitorByID.get(item.monitorId);
-            const eventLabel = pluginByID.get(monitor?.type ?? 'rss')?.events?.[0] ?? monitor?.type ?? '全部事件';
+            const selectedMonitors = ruleMonitorIds(item).map((id) => monitorByID.get(id)).filter((monitor): monitor is Monitor => Boolean(monitor));
+            const eventTypes = Array.from(new Set(selectedMonitors.flatMap((monitor) => pluginByID.get(monitor.type)?.events ?? [monitor.type])));
+            const eventLabel = eventTypes.length ? eventTypes.join('、') : '全部事件';
             return <article key={item.id} className="resource-card">
               <div className="resource-card-head">
-                <div className="resource-card-title"><span className="type-mark"><BranchesOutlined /></span><div><h2>{item.name}</h2><p>{monitor?.name ?? `监控 #${item.monitorId}`}</p></div></div>
+                <div className="resource-card-title"><span className="type-mark"><BranchesOutlined /></span><div><h2>{item.name}</h2><p>{monitorSummary(ruleMonitorIds(item), monitorByID)}</p></div></div>
                 <Switch checked={item.enabled} loading={toggleMutation.isPending && toggleMutation.variables?.record.id === item.id} aria-label={`${item.enabled ? '停用' : '启用'} ${item.name}`} onChange={(enabled) => toggleMutation.mutate({ record: item, enabled })} />
               </div>
               <p className="resource-description">{conditionSummary(item)}，命中后通过 {item.notifyChannelIds.length} 个渠道发送通知。</p>
@@ -130,6 +142,7 @@ export default function RulesPage({ editRuleId }: { editRuleId?: number }) {
               </div>
               <div className="resource-actions">
                 <Button className="mini-action" icon={<ExperimentOutlined />} loading={testMutation.isPending && testMutation.variables?.id === item.id} onClick={() => testMutation.mutate(item)}>测试规则</Button>
+                <Button className="mini-action icon-only" icon={<CopyOutlined />} loading={copyMutation.isPending && copyMutation.variables === item.id} aria-label={`复制 ${item.name}`} title="复制规则" onClick={() => copyMutation.mutate(item.id)} />
                 <Button className="mini-action" icon={<EditOutlined />} onClick={() => { setEditing(item); setDrawerOpen(true); }}>编辑</Button>
                 <Popconfirm title="归档这条规则？" description="既有规则判断与通知历史会继续保留。" onConfirm={() => deleteMutation.mutate(item.id)}><Button className="mini-action icon-only" danger icon={<DeleteOutlined />} aria-label={`归档 ${item.name}`} /></Popconfirm>
               </div>
@@ -148,8 +161,35 @@ export default function RulesPage({ editRuleId }: { editRuleId?: number }) {
 
 function conditionSummary(rule: Rule) {
   const conditions = (rule.condition as Partial<RuleConditionGroup>).conditions;
-  if (!Array.isArray(conditions) || conditions.length === 0) return '匹配该监控产生的全部新事件';
+  if (!Array.isArray(conditions) || conditions.length === 0) return '匹配所选监控产生的全部新事件';
   return `${(rule.condition as RuleConditionGroup).match === 'any' ? '任一' : '全部'}满足 ${conditions.length} 个条件`;
+}
+
+function ruleMonitorIds(rule: Rule) {
+  const ids = Array.isArray(rule.monitorIds) ? rule.monitorIds.filter((id) => id > 0) : [];
+  if (ids.length) return Array.from(new Set(ids));
+  return rule.monitorId > 0 ? [rule.monitorId] : [];
+}
+
+function monitorSummary(ids: number[], monitorByID: Map<number, Monitor>) {
+  const labels = ids.map((id) => monitorByID.get(id)?.name ?? `监控 #${id}`);
+  if (labels.length <= 2) return labels.join('、') || '未关联监控';
+  return `${labels.slice(0, 2).join('、')} 等 ${labels.length} 个监控`;
+}
+
+function conditionFieldsForMonitors(ids: number[], monitors: Monitor[], plugins: MonitorPlugin[]) {
+  const pluginByType = new Map(plugins.map((plugin) => [plugin.id, plugin]));
+  const monitorByID = new Map(monitors.map((monitor) => [monitor.id, monitor]));
+  return Array.from(new Set(ids.flatMap((id) => {
+    const monitor = monitorByID.get(id);
+    return monitor ? pluginByType.get(monitor.type)?.templateVariables ?? [] : [];
+  })));
+}
+
+function isUntouchedConditionGroup(group: RuleConditionGroup) {
+  if (group.conditions.length !== 1) return false;
+  const node = group.conditions[0];
+  return !isConditionGroup(node) && node.operator === 'contains' && !(node.value ?? '').trim();
 }
 
 function RuleDrawer(props: {
@@ -159,20 +199,20 @@ function RuleDrawer(props: {
   const [form] = Form.useForm();
   const { message } = AntApp.useApp();
   const [conditionTree, setConditionTree] = useState<RuleConditionGroup>(() => defaultConditionGroup());
-  const monitorId = Form.useWatch<number>('monitorId', form);
+  const monitorIds = Form.useWatch<number[]>('monitorIds', form) ?? [];
   const allEvents = Form.useWatch<boolean>('allEvents', form);
   const quietHoursEnabled = Form.useWatch<boolean>(['quietHours', 'enabled'], form);
-  const monitor = props.monitors.find((item) => item.id === monitorId);
-  const plugin = props.plugins.find((item) => item.id === monitor?.type);
+  const selectedMonitors = monitorIds.map((id) => props.monitors.find((item) => item.id === id)).filter((monitor): monitor is Monitor => Boolean(monitor));
+  const selectedPlugins = Array.from(new Set(selectedMonitors.map((item) => item.type))).map((type) => props.plugins.find((item) => item.id === type)).filter((plugin): plugin is MonitorPlugin => Boolean(plugin));
   const defaultTemplateId = props.templates.find((item) => item.isDefault)?.id;
-  const conditionFields = plugin?.templateVariables ?? [];
+  const conditionFields = Array.from(new Set(selectedPlugins.flatMap((plugin) => plugin.templateVariables)));
   const testRule = useMutation({
     mutationFn: async () => {
-      const values = await form.validateFields(['monitorId', 'allEvents']);
+      const values = await form.validateFields(['monitorIds', 'allEvents']);
       const conditionError = values.allEvents ? null : validateConditionGroup(conditionTree);
       if (conditionError) throw new Error(conditionError);
       const condition = values.allEvents ? {} : conditionTree;
-      return api.testRule({ monitorId: values.monitorId, condition, limit: 20 });
+      return api.testRule({ monitorIds: values.monitorIds, condition, limit: 20 });
     },
     onError: (error: Error) => message.error(error.message)
   });
@@ -182,11 +222,11 @@ function RuleDrawer(props: {
     const condition = props.record?.condition;
     const storedConditions = (condition as Partial<RuleConditionGroup> | undefined)?.conditions;
     const isAllEvents = !condition || Object.keys(condition).length === 0 || (Array.isArray(storedConditions) && storedConditions.length === 0);
-    const initialMonitor = props.monitors.find((item) => item.id === (props.record?.monitorId ?? props.monitors[0]?.id));
-    const initialPlugin = props.plugins.find((item) => item.id === initialMonitor?.type);
-    setConditionTree(normalizeConditionGroup(condition, initialPlugin?.templateVariables[0] ?? ''));
+    const initialMonitorIds = props.record ? ruleMonitorIds(props.record) : props.monitors[0]?.id ? [props.monitors[0].id] : [];
+    const initialFields = conditionFieldsForMonitors(initialMonitorIds, props.monitors, props.plugins);
+    setConditionTree(normalizeConditionGroup(condition, initialFields[0] ?? ''));
     form.setFieldsValue({
-      name: props.record?.name ?? '', monitorId: props.record?.monitorId ?? props.monitors[0]?.id,
+      name: props.record?.name ?? '', monitorIds: initialMonitorIds,
       enabled: props.record?.enabled ?? true, cooldownSeconds: props.record?.cooldownSeconds ?? 0,
       notifyChannelIds: props.record?.notifyChannelIds ?? [], templateId: props.record?.templateId ?? defaultTemplateId,
       allEvents: isAllEvents,
@@ -202,7 +242,7 @@ function RuleDrawer(props: {
     }
     const condition = values.allEvents ? {} : conditionTree;
     props.onSave({
-      name: values.name.trim(), monitorId: values.monitorId, enabled: values.enabled,
+      name: values.name.trim(), monitorIds: values.monitorIds, enabled: values.enabled,
       cooldownSeconds: values.cooldownSeconds ?? 0, notifyChannelIds: values.notifyChannelIds,
       templateId: values.templateId ?? null, condition,
       quietHours: {
@@ -218,15 +258,14 @@ function RuleDrawer(props: {
       <PageError error={props.error} />
       <Form form={form} layout="vertical" requiredMark="optional" onValuesChange={(changed) => {
         testRule.reset();
-        if (changed.monitorId && !props.record) {
-          const nextMonitor = props.monitors.find((item) => item.id === changed.monitorId);
-          const nextPlugin = props.plugins.find((item) => item.id === nextMonitor?.type);
-          setConditionTree(defaultConditionGroup(nextPlugin?.templateVariables[0] ?? ''));
+        if (changed.monitorIds && !props.record && isUntouchedConditionGroup(conditionTree)) {
+          const fields = conditionFieldsForMonitors(changed.monitorIds, props.monitors, props.plugins);
+          setConditionTree(defaultConditionGroup(fields[0] ?? ''));
         }
       }}>
         <Form.Item name="name" label="规则名称" rules={[{ required: true, whitespace: true }]}><Input placeholder="例如：标题包含 TestFlight" /></Form.Item>
-        <Form.Item name="monitorId" label="关联监控" rules={[{ required: true }]}><Select options={props.monitors.map((item) => ({ label: item.name, value: item.id }))} /></Form.Item>
-        {plugin && <Alert className="form-intro" type="info" showIcon message={`监听 ${plugin.events.join('、')}`} description="条件字段会根据所选监控自动限制，避免保存无法匹配的规则。" />}
+        <Form.Item name="monitorIds" label="关联监控" rules={[{ required: true, type: 'array', min: 1, message: '请至少选择一个监控' }]}><Select mode="multiple" showSearch optionFilterProp="label" maxTagCount="responsive" placeholder="选择一个或多个监控" options={props.monitors.map((item) => ({ label: `${item.name} · ${item.type}`, value: item.id }))} /></Form.Item>
+        {selectedPlugins.length > 0 && <Alert className="form-intro" type="info" showIcon message={`监听 ${Array.from(new Set(selectedPlugins.flatMap((plugin) => plugin.events))).join('、')}`} description={selectedPlugins.length > 1 ? '条件字段取所选监控类型的并集；某个事件没有对应字段时，该条件按不匹配处理。' : `条件字段适用于已选择的 ${selectedMonitors.length} 个同类型监控。`} />}
         <Form.Item name="allEvents" label="匹配所有新事件" valuePropName="checked"><Switch /></Form.Item>
         {!allEvents && (
           <div className="condition-builder">
@@ -236,9 +275,9 @@ function RuleDrawer(props: {
         )}
         <div className="rule-test-row">
           <Button icon={<ExperimentOutlined />} loading={testRule.isPending} onClick={() => testRule.mutate()}>用最近事件测试</Button>
-          <Text type="secondary">只读取最近 20 条事件，不会发送通知或修改规则。</Text>
+          <Text type="secondary">读取所选监控最近的 20 条事件，不会发送通知或修改规则。</Text>
         </div>
-        {testRule.data && <Alert className="rule-test-result" type={testRule.data.matched ? 'success' : 'warning'} showIcon message={`测试 ${testRule.data.tested} 条事件，命中 ${testRule.data.matched} 条`} description={testRule.data.results.length ? <Space wrap>{testRule.data.results.map((item) => <Tag key={item.eventId}>事件 #{item.eventId} · {item.eventType}</Tag>)}</Space> : '当前最近事件没有符合该条件的记录。'} />}
+        {testRule.data && <Alert className="rule-test-result" type={testRule.data.matched ? 'success' : 'warning'} showIcon message={`测试 ${testRule.data.tested} 条事件，命中 ${testRule.data.matched} 条`} description={testRule.data.results.length ? <Space wrap>{testRule.data.results.map((item) => <Tag key={item.eventId}>{item.monitorName} · 事件 #{item.eventId} · {item.eventType}</Tag>)}</Space> : '当前最近事件没有符合该条件的记录。'} />}
         <div className="condition-builder">
           <Form.Item name={['quietHours', 'enabled']} label="免打扰时段" valuePropName="checked" extra="命中的事件仍会留下规则判断记录，但不会发送通知。"><Switch /></Form.Item>
           {quietHoursEnabled && (

@@ -81,6 +81,20 @@ export default function TemplatesPage() {
       message.success('模板已保存');
     }
   });
+  const copyMutation = useMutation({
+    mutationFn: api.copyTemplate,
+    onSuccess: async (item) => {
+      await refresh();
+      saveMutation.reset();
+      previewingRef.current = item;
+      setPreviewing(item);
+      renderPreview(item, previewEventIdRef.current);
+      setEditing(item);
+      setDrawerOpen(true);
+      message.success('模板副本已创建');
+    },
+    onError: (error: Error) => message.error(error.message)
+  });
   const sendPreviewMutation = useMutation({
     mutationFn: api.sendTemplatePreview,
     onSuccess: async (attempt) => {
@@ -147,6 +161,7 @@ export default function TemplatesPage() {
               <div><h2>消息预览</h2><span>预览数据：{selectedEvent ? eventTitle(selectedEvent.payload, selectedMonitor?.name) : '内置样例'}</span></div>
               <div className="inline-actions">
                 <Button className="mini-action" icon={<CopyOutlined />} disabled={!preview} onClick={copyPreview}>复制内容</Button>
+                <Button className="mini-action" icon={<CopyOutlined />} loading={copyMutation.isPending} disabled={!previewing} onClick={() => previewing && copyMutation.mutate(previewing.id)}>复制模板</Button>
                 <Button className="mini-action" icon={<SendOutlined />} loading={sendPreviewMutation.isPending} disabled={!previewing || !preview || !previewChannelId} onClick={() => previewing && previewChannelId && sendPreviewMutation.mutate({ templateId: previewing.id, channelId: previewChannelId, eventId: previewEventId })}>发送预览</Button>
                 <Button className="mini-action" icon={<EditOutlined />} disabled={!previewing} onClick={() => { if (previewing) { setEditing(previewing); setDrawerOpen(true); } }}>编辑</Button>
                 <Popconfirm title="归档这个模板？" description="使用它的规则会改用系统默认模板。" disabled={!previewing || previewing.isDefault} onConfirm={() => previewing && deleteMutation.mutate(previewing.id)}><Button className="mini-action icon-only" danger disabled={!previewing || previewing.isDefault} icon={<DeleteOutlined />} aria-label="归档当前模板" /></Popconfirm>

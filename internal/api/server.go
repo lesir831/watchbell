@@ -36,6 +36,7 @@ type Server struct {
 	runtimeDefaults    store.RuntimeSettings
 	runtimeDefaultsSet bool
 	networkCheck       func(context.Context) NetworkCheckReport
+	cinemaDiscovery    cinemaDiscovery
 }
 
 type ServerOption func(*Server)
@@ -57,6 +58,9 @@ func NewServer(store *store.Store, scheduler *scheduler.Scheduler, webDir string
 	}
 	if server.networkCheck == nil {
 		server.networkCheck = runNetworkCheck
+	}
+	if server.cinemaDiscovery == nil {
+		server.cinemaDiscovery = defaultCinemaDiscovery()
 	}
 	return server
 }
@@ -114,6 +118,9 @@ func (s *Server) privateRoutes(r chi.Router) {
 	r.Put("/settings/proxies/{id}", s.updateProxyProfile)
 	r.Delete("/settings/proxies/{id}", s.deleteProxyProfile)
 	r.Get("/plugins", s.listPlugins)
+	r.Get("/cinema/cities", s.listCinemaCities)
+	r.Get("/cinema/cinemas", s.searchCinemas)
+	r.Get("/cinema/movies", s.searchCinemaMovies)
 	r.Get("/help/variables", s.variableCatalog)
 	r.Get("/dashboard", s.dashboard)
 	r.Get("/system/status", s.systemStatus)
@@ -125,6 +132,7 @@ func (s *Server) privateRoutes(r chi.Router) {
 	r.Post("/monitors", s.createMonitor)
 	r.Put("/monitors/{id}", s.updateMonitor)
 	r.Delete("/monitors/{id}", s.deleteMonitor)
+	r.Post("/monitors/{id}/copy", s.copyMonitor)
 	r.Post("/monitors/{id}/check", s.checkMonitor)
 	r.Get("/monitors/{id}/variables", s.latestMonitorVariables)
 	r.Get("/monitors/{id}/variables/{key}", s.latestMonitorVariables)
@@ -134,17 +142,20 @@ func (s *Server) privateRoutes(r chi.Router) {
 	r.Post("/rules/test", s.testRule)
 	r.Put("/rules/{id}", s.updateRule)
 	r.Delete("/rules/{id}", s.deleteRule)
+	r.Post("/rules/{id}/copy", s.copyRule)
 
 	r.Get("/channels", s.listNotifyChannels)
 	r.Post("/channels", s.createNotifyChannel)
 	r.Put("/channels/{id}", s.updateNotifyChannel)
 	r.Delete("/channels/{id}", s.deleteNotifyChannel)
+	r.Post("/channels/{id}/copy", s.copyNotifyChannel)
 	r.Post("/channels/{id}/test", s.testNotifyChannel)
 
 	r.Get("/templates", s.listNotificationTemplates)
 	r.Post("/templates", s.createNotificationTemplate)
 	r.Put("/templates/{id}", s.updateNotificationTemplate)
 	r.Delete("/templates/{id}", s.deleteNotificationTemplate)
+	r.Post("/templates/{id}/copy", s.copyNotificationTemplate)
 	r.Post("/templates/preview", s.previewTemplate)
 	r.Post("/templates/send-preview", s.sendTemplatePreview)
 
@@ -380,6 +391,7 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	normalizeRuleInput(&input)
 	if err := s.validateRuleNaturalKey(r.Context(), input, 0); err != nil {
 		writeError(w, r, err)
 		return
@@ -405,6 +417,7 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	normalizeRuleInput(&input)
 	if err := s.validateRuleNaturalKey(r.Context(), input, id); err != nil {
 		writeError(w, r, err)
 		return

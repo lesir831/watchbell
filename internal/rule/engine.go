@@ -231,6 +231,9 @@ func evalDetailed(condition Condition, payload map[string]any, now time.Time, pa
 	value, exists := lookup(payload, condition.Field)
 	actual := fmt.Sprint(value)
 	var matched bool
+	if !exists && operator != "exists" {
+		return conditionEvaluation{failure: conditionFailure(condition, path, value, false)}, nil
+	}
 	switch operator {
 	case "exists":
 		matched = exists

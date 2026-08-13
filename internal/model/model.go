@@ -107,6 +107,7 @@ type ProxyProfileInput struct {
 type Rule struct {
 	ID               int64           `json:"id"`
 	MonitorID        int64           `json:"monitorId"`
+	MonitorIDs       []int64         `json:"monitorIds"`
 	Name             string          `json:"name"`
 	Enabled          bool            `json:"enabled"`
 	Condition        json.RawMessage `json:"condition"`
@@ -128,6 +129,7 @@ type QuietHours struct {
 
 type RuleInput struct {
 	MonitorID        int64           `json:"monitorId"`
+	MonitorIDs       []int64         `json:"monitorIds"`
 	Name             string          `json:"name"`
 	Enabled          bool            `json:"enabled"`
 	Condition        json.RawMessage `json:"condition"`

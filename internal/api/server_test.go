@@ -177,6 +177,50 @@ func TestCreateEndpointsRejectAmbiguousNaturalKeys(t *testing.T) {
 	postDuplicate("/api/rules", ruleInput)
 }
 
+func TestRuleRejectsSameNameOnOverlappingMonitors(t *testing.T) {
+	server, db := newTestServer(t)
+	ctx := context.Background()
+	monitors := make([]model.Monitor, 0, 3)
+	for index := range 3 {
+		monitor, err := db.CreateMonitor(ctx, model.MonitorInput{
+			Name: fmt.Sprintf("Overlap feed %d", index), Type: model.MonitorTypeRSS, Enabled: true, IntervalSeconds: 300,
+			Config: json.RawMessage(fmt.Sprintf(`{"url":"https://example.com/%d.xml"}`, index)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		monitors = append(monitors, monitor)
+	}
+	channel, err := db.CreateNotifyChannel(ctx, model.NotifyChannelInput{Name: "Overlap phone", Type: model.ChannelTypeBark, Enabled: true, Config: json.RawMessage(`{"deviceKey":"key"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := model.RuleInput{MonitorIDs: []int64{monitors[0].ID, monitors[1].ID}, Name: "Same overlap rule", Enabled: true, Condition: json.RawMessage(`{}`), NotifyChannelIDs: []int64{channel.ID}}
+	if _, err := db.CreateRule(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	duplicate := base
+	duplicate.MonitorIDs = []int64{monitors[2].ID, monitors[1].ID}
+	body, err := json.Marshal(duplicate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Post(server.URL+"/api/rules", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload struct {
+		Fields map[string]string `json:"fields"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusUnprocessableEntity || payload.Fields["name"] == "" {
+		t.Fatalf("overlap duplicate status=%d fields=%#v", response.StatusCode, payload.Fields)
+	}
+}
+
 func TestMonitorManifestFieldTypesAreValidatedBeforeSave(t *testing.T) {
 	server, _ := newTestServer(t)
 	body := []byte(`{"name":"Typed config","type":"webpage","enabled":true,"intervalSeconds":300,"config":{"url":"https://example.com","selector":7,"timeoutSeconds":"999","ignorePatterns":["safe",2]}}`)

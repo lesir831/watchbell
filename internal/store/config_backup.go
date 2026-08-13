@@ -239,10 +239,23 @@ func (s *Store) importConfigMerge(ctx context.Context, backup model.ConfigBackup
 	}
 
 	for index, item := range backup.Rules {
-		monitorID, ok := report.IDMap.Monitors[sourceIDKey(item.MonitorID)]
-		if !ok {
-			return report, &ConfigImportError{Field: fmt.Sprintf("backup.rules.%d.monitorId", index), Message: fmt.Sprintf("规则 %q 引用了未导入的监控 ID %d。", item.Name, item.MonitorID)}
+		sourceMonitorIDs := normalizeRuleMonitorIDs(item.MonitorID, item.MonitorIDs)
+		monitorIDs := make([]int64, 0, len(sourceMonitorIDs))
+		for monitorIndex, sourceMonitorID := range sourceMonitorIDs {
+			monitorID, ok := report.IDMap.Monitors[sourceIDKey(sourceMonitorID)]
+			if !ok {
+				field := fmt.Sprintf("backup.rules.%d.monitorIds.%d", index, monitorIndex)
+				if len(item.MonitorIDs) == 0 {
+					field = fmt.Sprintf("backup.rules.%d.monitorId", index)
+				}
+				return report, &ConfigImportError{Field: field, Message: fmt.Sprintf("规则 %q 引用了未导入的监控 ID %d。", item.Name, sourceMonitorID)}
+			}
+			monitorIDs = append(monitorIDs, monitorID)
 		}
+		if len(monitorIDs) == 0 {
+			return report, &ConfigImportError{Field: fmt.Sprintf("backup.rules.%d.monitorIds", index), Message: fmt.Sprintf("规则 %q 没有关联监控。", item.Name)}
+		}
+		monitorID := monitorIDs[0]
 		channelIDs := make([]int64, 0, len(item.NotifyChannelIDs))
 		for channelIndex, sourceChannelID := range item.NotifyChannelIDs {
 			channelID, exists := report.IDMap.Channels[sourceIDKey(sourceChannelID)]
@@ -263,23 +276,27 @@ func (s *Store) importConfigMerge(ctx context.Context, backup model.ConfigBackup
 		if err != nil {
 			return report, err
 		}
+		monitorJSON, err := json.Marshal(monitorIDs)
+		if err != nil {
+			return report, err
+		}
 		quietHoursJSON, err := json.Marshal(item.QuietHours)
 		if err != nil {
 			return report, err
 		}
-		id, found, err := findMergeRule(ctx, tx, monitorID, item.Name)
+		id, found, err := findMergeRule(ctx, tx, monitorIDs, item.Name)
 		if err != nil {
 			return report, importLookupError(fmt.Sprintf("backup.rules.%d", index), "规则", err)
 		}
 		if found {
 			// last_fired_at remains intact so cooldown semantics survive a merge.
-			_, err = tx.ExecContext(ctx, `UPDATE rules SET monitor_id = ?, name = ?, enabled = ?, condition_json = ?, notify_channel_ids_json = ?, template_id = ?, cooldown_seconds = ?, quiet_hours_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
-				monitorID, strings.TrimSpace(item.Name), boolInt(item.Enabled), string(item.Condition), string(channelJSON), templateID, item.CooldownSeconds, string(quietHoursJSON), nowString(), id)
+			_, err = tx.ExecContext(ctx, `UPDATE rules SET monitor_id = ?, monitor_ids_json = ?, name = ?, enabled = ?, condition_json = ?, notify_channel_ids_json = ?, template_id = ?, cooldown_seconds = ?, quiet_hours_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+				monitorID, string(monitorJSON), strings.TrimSpace(item.Name), boolInt(item.Enabled), string(item.Condition), string(channelJSON), templateID, item.CooldownSeconds, string(quietHoursJSON), nowString(), id)
 			report.Updated.Rules++
 		} else {
 			var result sql.Result
-			result, err = tx.ExecContext(ctx, `INSERT INTO rules (monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				monitorID, strings.TrimSpace(item.Name), boolInt(item.Enabled), string(item.Condition), string(channelJSON), templateID, item.CooldownSeconds, string(quietHoursJSON), nowString(), nowString())
+			result, err = tx.ExecContext(ctx, `INSERT INTO rules (monitor_id, monitor_ids_json, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				monitorID, string(monitorJSON), strings.TrimSpace(item.Name), boolInt(item.Enabled), string(item.Condition), string(channelJSON), templateID, item.CooldownSeconds, string(quietHoursJSON), nowString(), nowString())
 			if err == nil {
 				id, err = result.LastInsertId()
 			}
@@ -445,8 +462,8 @@ func findMergeTemplate(ctx context.Context, tx *sql.Tx, name string, isDefault, 
 	return id, count == 1, nil
 }
 
-func findMergeRule(ctx context.Context, tx *sql.Tx, monitorID int64, name string) (int64, bool, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM rules WHERE monitor_id = ? AND name = ? AND deleted_at IS NULL ORDER BY id LIMIT 2`, monitorID, strings.TrimSpace(name))
+func findMergeRule(ctx context.Context, tx *sql.Tx, monitorIDs []int64, name string) (int64, bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, monitor_id, monitor_ids_json FROM rules WHERE name = ? AND deleted_at IS NULL ORDER BY id`, strings.TrimSpace(name))
 	if err != nil {
 		return 0, false, err
 	}
@@ -454,9 +471,19 @@ func findMergeRule(ctx context.Context, tx *sql.Tx, monitorID int64, name string
 	var id int64
 	count := 0
 	for rows.Next() {
-		if err := rows.Scan(&id); err != nil {
+		var candidateID, primaryID int64
+		var rawMonitorIDs string
+		if err := rows.Scan(&candidateID, &primaryID, &rawMonitorIDs); err != nil {
 			return 0, false, err
 		}
+		candidateMonitorIDs, err := decodeRuleMonitorIDs(primaryID, rawMonitorIDs)
+		if err != nil {
+			return 0, false, err
+		}
+		if !ruleMonitorSetsOverlap(monitorIDs, candidateMonitorIDs) {
+			continue
+		}
+		id = candidateID
 		count++
 	}
 	if err := rows.Err(); err != nil {
@@ -466,6 +493,19 @@ func findMergeRule(ctx context.Context, tx *sql.Tx, monitorID int64, name string
 		return 0, false, errAmbiguousMergeTarget
 	}
 	return id, count == 1, nil
+}
+
+func ruleMonitorSetsOverlap(left, right []int64) bool {
+	seen := make(map[int64]struct{}, len(left))
+	for _, id := range left {
+		seen[id] = struct{}{}
+	}
+	for _, id := range right {
+		if _, exists := seen[id]; exists {
+			return true
+		}
+	}
+	return false
 }
 
 func templateNameOwnedByAnotherActiveRow(ctx context.Context, tx *sql.Tx, name string, excludeID int64) (bool, error) {

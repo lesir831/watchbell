@@ -122,7 +122,7 @@ func (s *Server) buildConfigBackup(r *http.Request, includeSecrets bool) (model.
 			channelIDs = []int64{}
 		}
 		backup.Rules = append(backup.Rules, model.ConfigBackupRule{
-			ID: item.ID, MonitorID: item.MonitorID, Name: item.Name, Enabled: item.Enabled,
+			ID: item.ID, MonitorID: item.MonitorID, MonitorIDs: append([]int64(nil), item.MonitorIDs...), Name: item.Name, Enabled: item.Enabled,
 			Condition: item.Condition, NotifyChannelIDs: channelIDs, TemplateID: item.TemplateID,
 			CooldownSeconds: item.CooldownSeconds, QuietHours: item.QuietHours,
 		})
@@ -173,7 +173,13 @@ func validateSnapshotNaturalKeys(snapshot store.ConfigSnapshot) error {
 	}
 	ruleKeys := map[string]int64{}
 	for _, item := range snapshot.Rules {
-		check("rules", item.ID, strconv.FormatInt(item.MonitorID, 10)+"\x00"+strings.TrimSpace(item.Name), "同一监控下的同名规则无法可靠合并", ruleKeys)
+		monitorIDs := item.MonitorIDs
+		if len(monitorIDs) == 0 {
+			monitorIDs = []int64{item.MonitorID}
+		}
+		for _, monitorID := range monitorIDs {
+			check("rules", item.ID, strconv.FormatInt(monitorID, 10)+"\x00"+strings.TrimSpace(item.Name), "关联同一监控的同名规则无法可靠合并", ruleKeys)
+		}
 	}
 	if len(fields) > 0 {
 		return &problemError{Status: http.StatusConflict, Code: "ambiguous_config", Message: "当前配置存在重复自然键，无法生成可安全回放的备份。", Fields: fields}
@@ -298,10 +304,29 @@ func (s *Server) validateConfigImport(ctx context.Context, request model.ConfigI
 		if strings.TrimSpace(item.Name) == "" {
 			fields[prefix+".name"] = "请输入规则名称。"
 		}
-		validateNaturalKey(prefix+".name", fmt.Sprintf("%d\x00%s", item.MonitorID, strings.TrimSpace(item.Name)), ruleKeys, "备份中同一监控存在同名规则。", fields)
-		monitorType, monitorExists := monitorTypes[item.MonitorID]
-		if !monitorExists {
-			fields[prefix+".monitorId"] = fmt.Sprintf("备份中不存在监控 ID %d。", item.MonitorID)
+		sourceMonitorIDs := effectiveRuleMonitorIDs(item.MonitorID, item.MonitorIDs)
+		if len(sourceMonitorIDs) == 0 {
+			fields[prefix+".monitorIds"] = "请至少关联一个监控。"
+		}
+		selectedMonitorTypes := make([]string, 0, len(sourceMonitorIDs))
+		seenMonitors := map[int64]struct{}{}
+		for monitorIndex, monitorID := range sourceMonitorIDs {
+			field := fmt.Sprintf("%s.monitorIds.%d", prefix, monitorIndex)
+			if len(item.MonitorIDs) == 0 {
+				field = prefix + ".monitorId"
+			}
+			if _, duplicate := seenMonitors[monitorID]; duplicate {
+				fields[field] = "监控 ID 不能重复。"
+				continue
+			}
+			seenMonitors[monitorID] = struct{}{}
+			validateNaturalKey(prefix+".name", fmt.Sprintf("%d\x00%s", monitorID, strings.TrimSpace(item.Name)), ruleKeys, "备份中关联同一监控的规则名称不能重复。", fields)
+			monitorType, monitorExists := monitorTypes[monitorID]
+			if !monitorExists {
+				fields[field] = fmt.Sprintf("备份中不存在监控 ID %d。", monitorID)
+				continue
+			}
+			selectedMonitorTypes = append(selectedMonitorTypes, monitorType)
 		}
 		if item.CooldownSeconds < 0 || item.CooldownSeconds > 31_536_000 {
 			fields[prefix+".cooldownSeconds"] = "冷却时间必须在 0 到 365 天之间。"
@@ -330,9 +355,9 @@ func (s *Server) validateConfigImport(ctx context.Context, request model.ConfigI
 		}
 		if err := rule.Validate(item.Condition); err != nil {
 			fields[prefix+".condition"] = err.Error()
-		} else if monitorExists {
+		} else if len(selectedMonitorTypes) > 0 {
 			conditionFields := map[string]string{}
-			validateConditionFields(item.Condition, monitorType, s.scheduler.Plugins(), conditionFields)
+			validateConditionFieldsForTypes(item.Condition, selectedMonitorTypes, s.scheduler.Plugins(), conditionFields)
 			for field, message := range conditionFields {
 				fields[prefix+"."+field] = message
 			}

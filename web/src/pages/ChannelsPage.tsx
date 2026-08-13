@@ -11,7 +11,7 @@ import {
   Space,
   Switch
 } from 'antd';
-import { BellOutlined, CodeOutlined, DeleteOutlined, DingdingOutlined, EditOutlined, MailOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons';
+import { BellOutlined, CodeOutlined, CopyOutlined, DeleteOutlined, DingdingOutlined, EditOutlined, MailOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, APIError } from '../api';
 import ConfigFields from '../components/ConfigFields';
@@ -111,6 +111,17 @@ export default function ChannelsPage() {
     onSuccess: async () => { await refresh(); message.success('测试通知已发送，结果已记录'); },
     onError: async (error: APIError) => { await refresh(); message.error(error.message); }
   });
+  const copyMutation = useMutation({
+    mutationFn: api.copyChannel,
+    onSuccess: async (item) => {
+      await refresh();
+      saveMutation.reset();
+      setEditing(item);
+      setDrawerOpen(true);
+      message.success('通知渠道副本已创建，默认处于停用状态');
+    },
+    onError: (error: Error) => message.error(error.message)
+  });
   const deleteMutation = useMutation({
     mutationFn: api.deleteChannel,
     onSuccess: async () => { await refresh(); message.success('渠道已归档，历史发送记录仍会保留'); },
@@ -120,6 +131,7 @@ export default function ChannelsPage() {
   const actions = (record: NotifyChannel) => (
     <div className="resource-actions">
       <Button className="mini-action" icon={<SendOutlined />} loading={testMutation.isPending && testMutation.variables === record.id} onClick={() => testMutation.mutate(record.id)}>发送测试</Button>
+      <Button className="mini-action icon-only" icon={<CopyOutlined />} loading={copyMutation.isPending && copyMutation.variables === record.id} aria-label={`复制 ${record.name}`} title="复制通知渠道" onClick={() => copyMutation.mutate(record.id)} />
       <Button className="mini-action" icon={<EditOutlined />} onClick={() => { setEditing(record); setDrawerOpen(true); }}>编辑</Button>
       <Popconfirm title="归档这个渠道？" description="关联会从规则和故障告警中移除；失去全部渠道的规则将一并归档。历史发送记录会保留。" onConfirm={() => deleteMutation.mutate(record.id)}><Button danger icon={<DeleteOutlined />} aria-label={`归档 ${record.name}`} /></Popconfirm>
     </div>

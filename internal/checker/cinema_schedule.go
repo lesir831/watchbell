@@ -28,7 +28,10 @@ const (
 
 type CinemaScheduleConfig struct {
 	Provider          string   `json:"provider"`
+	CityID            int64    `json:"cityId"`
+	CityName          string   `json:"cityName"`
 	CinemaID          int64    `json:"cinemaId"`
+	CinemaName        string   `json:"cinemaName"`
 	MovieID           int64    `json:"movieId"`
 	MovieName         string   `json:"movieName"`
 	TargetDate        string   `json:"targetDate"`
@@ -98,14 +101,17 @@ func (c *CinemaScheduleChecker) Plugin() model.MonitorPlugin {
 		DefaultIntervalSeconds: 900,
 		DefaultConfig: map[string]any{
 			"provider": defaultCinemaScheduleProvider,
-			"cinemaId": 16655, "movieId": 1490607, "movieName": "蜘蛛侠：崭新之日",
-			"targetDate":     "2026-08-01",
+			"cityId":   nil, "cityName": "", "cinemaId": nil, "cinemaName": "",
+			"movieId": nil, "movieName": "", "targetDate": "",
 			"hallPatterns":   []string{"IMAX", "杜比影院", "Dolby Cinema"},
 			"notifyExisting": false, "notifyNewSessions": false, "timeoutSeconds": 15,
 		},
 		ConfigFields: []model.PluginConfigField{
-			{Key: "cinemaId", Label: "猫眼影院 ID", Type: "number", Required: true, Description: "影院页面地址 /cinema/ 后面的数字"},
-			{Key: "movieId", Label: "猫眼影片 ID", Type: "number", Required: true, Description: "影院页面 movieId 参数中的数字"},
+			{Key: "cityId", Label: "猫眼城市 ID", Type: "number", Description: "通过城市选择器填写；旧监控可以不包含此字段"},
+			{Key: "cityName", Label: "城市名称", Type: "string", Description: "通过城市选择器填写"},
+			{Key: "cinemaId", Label: "猫眼影院 ID", Type: "number", Required: true, Description: "通过影院查询选择"},
+			{Key: "cinemaName", Label: "影院名称", Type: "string", Description: "通过影院查询选择"},
+			{Key: "movieId", Label: "猫眼影片 ID", Type: "number", Required: true, Description: "通过影片查询选择"},
 			{Key: "movieName", Label: "影片名称", Type: "string", Required: true},
 			{Key: "targetDate", Label: "观影日期", Type: "date", Required: true},
 			{Key: "hallPatterns", Label: "目标影厅", Type: "string-list", Required: true, Description: "按影厅名或版本名进行不区分大小写的文字匹配"},
@@ -192,8 +198,9 @@ func (c *CinemaScheduleChecker) Inspect(ctx context.Context, monitor model.Monit
 	}
 	if c.targetDateExpired(cfg.TargetDate) {
 		snapshot := cinemaScheduleSnapshot{
-			MovieName: cfg.MovieName,
-			URL:       cinemaScheduleURL(defaultMaoyanURL, cfg.CinemaID, cfg.MovieID),
+			CinemaName: cfg.CinemaName,
+			MovieName:  cfg.MovieName,
+			URL:        cinemaScheduleURL(defaultMaoyanURL, cfg.CinemaID, cfg.MovieID),
 		}
 		return model.Observation{
 			Type: "cinema.schedule.available", Message: "目标观影日期已结束", Available: false,
@@ -234,6 +241,8 @@ func decodeCinemaScheduleConfig(monitor model.Monitor) (CinemaScheduleConfig, st
 	if cfg.Provider != defaultCinemaScheduleProvider {
 		return CinemaScheduleConfig{}, "", fmt.Errorf("unsupported cinema schedule provider %q", cfg.Provider)
 	}
+	cfg.CityName = cleanCinemaText(cfg.CityName)
+	cfg.CinemaName = cleanCinemaText(cfg.CinemaName)
 	if cfg.CinemaID <= 0 {
 		return CinemaScheduleConfig{}, "", fmt.Errorf("cinema id must be greater than zero")
 	}
@@ -480,9 +489,14 @@ func cinemaSchedulePayload(
 	if strings.TrimSpace(movieName) == "" {
 		movieName = cfg.MovieName
 	}
-	summary := cinemaScheduleSummary(movieName, snapshot.CinemaName, cfg.TargetDate, sessions, status)
+	cinemaName := snapshot.CinemaName
+	if strings.TrimSpace(cinemaName) == "" {
+		cinemaName = cfg.CinemaName
+	}
+	summary := cinemaScheduleSummary(movieName, cinemaName, cfg.TargetDate, sessions, status)
 	return map[string]any{"cinema": map[string]any{
-		"provider": cfg.Provider, "cinemaId": cfg.CinemaID, "cinemaName": snapshot.CinemaName,
+		"provider": cfg.Provider, "cityId": cfg.CityID, "cityName": cfg.CityName,
+		"cinemaId": cfg.CinemaID, "cinemaName": cinemaName,
 		"movieId": cfg.MovieID, "movieName": movieName, "targetDate": cfg.TargetDate,
 		"hallPatterns": cfg.HallPatterns, "sessionCount": len(sessions), "sessions": sessionValues,
 		"firstStartTime": firstStartTime, "halls": halls, "url": snapshot.URL,

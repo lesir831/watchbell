@@ -719,6 +719,78 @@ func TestMatchedRuleIsTraceablySkippedDuringQuietHours(t *testing.T) {
 	}
 }
 
+func TestSharedRuleCooldownSerializesConcurrentMonitorEvents(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	monitors := make([]model.Monitor, 0, 2)
+	events := make([]model.Event, 0, 2)
+	for index := range 2 {
+		monitor, err := db.CreateMonitor(ctx, model.MonitorInput{Name: fmt.Sprintf("Concurrent monitor %d", index), Type: "trace_test", Enabled: false, IntervalSeconds: 60, Config: json.RawMessage(`{}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		monitors = append(monitors, monitor)
+		event, _, err := db.CreateEvent(ctx, monitor.ID, model.EventData{Type: "trace.event", Fingerprint: fmt.Sprintf("concurrent-%d", index), Payload: map[string]any{"trace": map[string]any{"value": "ready"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, event)
+	}
+	channel, err := db.CreateNotifyChannel(ctx, model.NotifyChannelInput{Name: "Concurrent channel", Type: "trace_channel", Enabled: true, Config: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	templateID := int64(1)
+	if _, err := db.CreateRule(ctx, model.RuleInput{MonitorIDs: []int64{monitors[0].ID, monitors[1].ID}, Name: "Concurrent cooldown", Enabled: true, Condition: json.RawMessage(`{}`), NotifyChannelIDs: []int64{channel.ID}, TemplateID: &templateID, CooldownSeconds: 60}); err != nil {
+		t.Fatal(err)
+	}
+	fixedNow := time.Date(2026, time.August, 13, 5, 0, 0, 0, time.UTC)
+	sender := &traceNotifier{}
+	scheduler := New(db, checker.NewRegistry(traceChecker{}), notifier.NewRegistry(sender), Options{Now: func() time.Time { return fixedNow }})
+	start := make(chan struct{})
+	errorsCh := make(chan error, 2)
+	var group sync.WaitGroup
+	for index := range 2 {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			<-start
+			errorsCh <- scheduler.dispatchEvent(ctx, monitors[index], events[index])
+		}(index)
+	}
+	close(start)
+	group.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if sender.sentCount() != 1 {
+		t.Fatalf("concurrent shared rule sent %d notifications, want 1", sender.sentCount())
+	}
+	evaluations, err := db.ListRuleEvaluations(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matched, skipped := 0, 0
+	for _, evaluation := range evaluations {
+		switch evaluation.Status {
+		case "matched":
+			matched++
+		case "skipped":
+			skipped++
+		}
+	}
+	if matched != 1 || skipped != 1 {
+		t.Fatalf("evaluations matched=%d skipped=%d all=%#v", matched, skipped, evaluations)
+	}
+}
+
 func TestMonitorFailureAndRecoveryAlertsAreOneShotTraceableAndRetryable(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir()+"/watchbell.db")

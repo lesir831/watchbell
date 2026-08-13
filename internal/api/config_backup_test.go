@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -213,6 +214,63 @@ func TestConfigBackupRoundTripRedactionAndMerge(t *testing.T) {
 	proxies, _ := freshStore.ListProxyProfiles(ctx)
 	if len(monitors) != 0 || len(channels) != 0 || len(proxies) != 0 {
 		t.Fatalf("failed redacted restore changed fresh database: monitors=%d channels=%d proxies=%d", len(monitors), len(channels), len(proxies))
+	}
+}
+
+func TestConfigBackupRoundTripPreservesMultipleRuleMonitors(t *testing.T) {
+	ctx := context.Background()
+	sourceServer, sourceStore := newTestServer(t)
+	monitors := make([]model.Monitor, 0, 2)
+	for index, name := range []string{"Primary feed", "Secondary feed"} {
+		monitor, err := sourceStore.CreateMonitor(ctx, model.MonitorInput{
+			Name: name, Type: model.MonitorTypeRSS, Enabled: true, IntervalSeconds: 300,
+			Config: json.RawMessage(fmt.Sprintf(`{"url":"https://example.com/feed-%d.xml"}`, index)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		monitors = append(monitors, monitor)
+	}
+	channel, err := sourceStore.CreateNotifyChannel(ctx, model.NotifyChannelInput{
+		Name: "Backup phone", Type: model.ChannelTypeBark, Enabled: true,
+		Config: json.RawMessage(`{"serverUrl":"https://api.day.app","deviceKey":"backup-secret"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ruleItem, err := sourceStore.CreateRule(ctx, model.RuleInput{
+		MonitorIDs: []int64{monitors[0].ID, monitors[1].ID}, Name: "Shared backup rule", Enabled: true,
+		Condition: json.RawMessage(`{}`), NotifyChannelIDs: []int64{channel.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := http.Get(sourceServer.URL + "/api/config/export?includeSecrets=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var backup model.ConfigBackup
+	if response.StatusCode != http.StatusOK || json.NewDecoder(response.Body).Decode(&backup) != nil {
+		t.Fatalf("export status = %d", response.StatusCode)
+	}
+	if len(backup.Rules) != 1 || len(backup.Rules[0].MonitorIDs) != 2 {
+		t.Fatalf("exported rule monitors = %#v", backup.Rules)
+	}
+
+	targetServer, targetStore := newTestServer(t)
+	report := importBackup(t, targetServer.URL, backup, http.StatusOK)
+	stored, err := targetStore.GetRule(ctx, report.IDMap.Rules[fmt.Sprint(ruleItem.ID)])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int64{
+		report.IDMap.Monitors[fmt.Sprint(monitors[0].ID)],
+		report.IDMap.Monitors[fmt.Sprint(monitors[1].ID)],
+	}
+	if !slices.Equal(stored.MonitorIDs, want) || stored.MonitorID != want[0] {
+		t.Fatalf("restored rule monitors = primary %d, all %#v; want %#v", stored.MonitorID, stored.MonitorIDs, want)
 	}
 }
 

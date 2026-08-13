@@ -2,6 +2,7 @@ package rule
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -264,5 +265,25 @@ func TestEvaluateAtExplainsMissingField(t *testing.T) {
 	}
 	if details.Matched || !strings.Contains(details.MismatchReason, `第 1 个条件（字段 "rss.link" 应存在）未满足：事件中不存在字段 "rss.link"`) {
 		t.Fatalf("unexpected details: %#v", details)
+	}
+}
+
+func TestMissingFieldNeverMatchesValueOperators(t *testing.T) {
+	for _, operator := range []string{"contains", "not_contains", "equals", "regex", "within_last"} {
+		t.Run(operator, func(t *testing.T) {
+			value := "anything"
+			if operator == "regex" {
+				value = ".*"
+			} else if operator == "within_last" {
+				value = "5m"
+			}
+			details, err := EvaluateAt(json.RawMessage(fmt.Sprintf(`{"match":"all","conditions":[{"field":"movie.title","operator":%q,"value":%q}]}`, operator, value)), map[string]any{}, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if details.Matched || !strings.Contains(details.MismatchReason, `事件中不存在字段 "movie.title"`) {
+				t.Fatalf("operator=%s details=%#v", operator, details)
+			}
+		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -90,6 +91,102 @@ func TestSoftArchiveRepairsActiveConfigurationReferences(t *testing.T) {
 	}
 	if _, err := db.GetRule(ctx, secondRule.ID); !IsNotFound(err) {
 		t.Fatalf("monitor rules should be archived, got %v", err)
+	}
+}
+
+func TestRuleSupportsMultipleMonitorsAndUnbindsArchivedMonitor(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	first, err := db.CreateMonitor(ctx, model.MonitorInput{Name: "First feed", Type: model.MonitorTypeRSS, Enabled: true, IntervalSeconds: 300, Config: json.RawMessage(`{"url":"https://example.com/first.xml"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.CreateMonitor(ctx, model.MonitorInput{Name: "Second feed", Type: model.MonitorTypeRSS, Enabled: true, IntervalSeconds: 300, Config: json.RawMessage(`{"url":"https://example.com/second.xml"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, err := db.CreateNotifyChannel(ctx, model.NotifyChannelInput{Name: "Phone", Type: model.ChannelTypeBark, Enabled: true, Config: json.RawMessage(`{"deviceKey":"secret"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ruleItem, err := db.CreateRule(ctx, model.RuleInput{
+		MonitorIDs: []int64{first.ID, second.ID}, Name: "Shared rule", Enabled: true,
+		Condition: json.RawMessage(`{}`), NotifyChannelIDs: []int64{channel.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ruleItem.MonitorID != first.ID || len(ruleItem.MonitorIDs) != 2 {
+		t.Fatalf("created rule monitors = primary %d, all %#v", ruleItem.MonitorID, ruleItem.MonitorIDs)
+	}
+	for _, monitorID := range []int64{first.ID, second.ID} {
+		items, err := db.ListRulesForMonitor(ctx, monitorID)
+		if err != nil || len(items) != 1 || items[0].ID != ruleItem.ID {
+			t.Fatalf("rules for monitor %d = %#v err=%v", monitorID, items, err)
+		}
+	}
+
+	if err := db.DeleteMonitor(ctx, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := db.GetRule(ctx, ruleItem.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining.MonitorID != second.ID || len(remaining.MonitorIDs) != 1 || remaining.MonitorIDs[0] != second.ID {
+		t.Fatalf("rule was not rebound to remaining monitor: %#v", remaining)
+	}
+	if err := db.DeleteMonitor(ctx, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GetRule(ctx, ruleItem.ID); !IsNotFound(err) {
+		t.Fatalf("rule should be archived after its final monitor, got %v", err)
+	}
+}
+
+func TestDeletingPrimaryMonitorKeepsRuleNaturalKeysUnambiguous(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir()+"/watchbell.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	first, err := db.CreateMonitor(ctx, model.MonitorInput{Name: "Retired primary", Type: model.MonitorTypeRSS, Enabled: true, IntervalSeconds: 300, Config: json.RawMessage(`{"url":"https://example.com/first.xml"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := db.CreateMonitor(ctx, model.MonitorInput{Name: "Remaining monitor", Type: model.MonitorTypeRSS, Enabled: true, IntervalSeconds: 300, Config: json.RawMessage(`{"url":"https://example.com/remaining.xml"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, err := db.CreateNotifyChannel(ctx, model.NotifyChannelInput{Name: "Natural key phone", Type: model.ChannelTypeBark, Enabled: true, Config: json.RawMessage(`{"deviceKey":"secret"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := db.CreateRule(ctx, model.RuleInput{MonitorIDs: []int64{first.ID, remaining.ID}, Name: "Same name", Enabled: true, Condition: json.RawMessage(`{}`), NotifyChannelIDs: []int64{channel.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `INSERT INTO rules (monitor_id, monitor_ids_json, name, enabled, condition_json, notify_channel_ids_json, created_at, updated_at) VALUES (?, ?, ?, 1, '{}', ?, ?, ?)`, remaining.ID, fmt.Sprintf("[%d]", remaining.ID), "Same name", fmt.Sprintf("[%d]", channel.ID), nowString(), nowString()); err != nil {
+		t.Fatalf("insert legacy overlapping rule: %v", err)
+	}
+	if err := db.DeleteMonitor(ctx, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := db.GetRule(ctx, shared.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.MonitorID != remaining.ID || updated.Name == "Same name" {
+		t.Fatalf("adjusted shared rule = %#v", updated)
+	}
+	if _, err := db.ReadConfigSnapshot(ctx); err != nil {
+		t.Fatalf("snapshot became ambiguous after primary deletion: %v", err)
 	}
 }
 

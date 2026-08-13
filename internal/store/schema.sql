@@ -42,6 +42,7 @@ CREATE INDEX IF NOT EXISTS idx_monitors_enabled ON monitors(enabled);
 CREATE TABLE IF NOT EXISTS rules (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   monitor_id INTEGER NOT NULL REFERENCES monitors(id) ON DELETE CASCADE,
+  monitor_ids_json TEXT NOT NULL DEFAULT '[]',
   name TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
   condition_json TEXT NOT NULL DEFAULT '{}',

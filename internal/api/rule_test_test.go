@@ -124,3 +124,64 @@ func TestNestedRuleValidationWalksEveryGroupAndChecksTimeFields(t *testing.T) {
 		t.Fatalf("time field validation: status=%d payload=%#v", status, payload)
 	}
 }
+
+func TestRuleDryRunCombinesMultipleMonitors(t *testing.T) {
+	server, db := newTestServer(t)
+	ctx := context.Background()
+	monitorIDs := make([]int64, 0, 2)
+	for index, name := range []string{"First multi feed", "Second multi feed"} {
+		monitor, err := db.CreateMonitor(ctx, model.MonitorInput{
+			Name: name, Type: model.MonitorTypeRSS, Enabled: false, IntervalSeconds: 300,
+			Config: json.RawMessage(fmt.Sprintf(`{"url":"https://example.com/%d.xml"}`, index)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		monitorIDs = append(monitorIDs, monitor.ID)
+		if _, _, err := db.CreateEvent(ctx, monitor.ID, model.EventData{
+			Type: "rss.item", Fingerprint: fmt.Sprintf("multi-%d", index),
+			Payload: map[string]any{"rss": map[string]any{"title": "release"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body, err := json.Marshal(map[string]any{
+		"monitorIds": monitorIDs,
+		"condition":  map[string]any{"match": "all", "conditions": []map[string]any{{"field": "rss.title", "operator": "contains", "value": "release"}}},
+		"limit":      20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Post(server.URL+"/api/rules/test", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var result struct {
+		Tested  int `json:"tested"`
+		Matched int `json:"matched"`
+		Results []struct {
+			MonitorID   int64  `json:"monitorId"`
+			MonitorName string `json:"monitorName"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || result.Tested != 2 || result.Matched != 2 || len(result.Results) != 2 {
+		t.Fatalf("multi-monitor dry run status=%d result=%#v", response.StatusCode, result)
+	}
+	seen := map[int64]bool{}
+	for _, item := range result.Results {
+		if item.MonitorName == "" {
+			t.Fatalf("missing monitor name in result %#v", item)
+		}
+		seen[item.MonitorID] = true
+	}
+	for _, id := range monitorIDs {
+		if !seen[id] {
+			t.Fatalf("monitor %d missing from result %#v", id, result)
+		}
+	}
+}

@@ -25,9 +25,74 @@ func (s *Store) repairActiveConfigReferences(ctx context.Context) error {
 		return err
 	}
 
-	if _, err := tx.ExecContext(ctx, `UPDATE rules SET enabled = 0, deleted_at = ?, updated_at = ?
-		WHERE deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM monitors m WHERE m.id = rules.monitor_id AND m.deleted_at IS NULL)`, now, now); err != nil {
+	monitorRows, err := tx.QueryContext(ctx, `SELECT id FROM monitors WHERE deleted_at IS NULL`)
+	if err != nil {
 		return err
+	}
+	activeMonitors := map[int64]struct{}{}
+	for monitorRows.Next() {
+		var id int64
+		if err := monitorRows.Scan(&id); err != nil {
+			monitorRows.Close()
+			return err
+		}
+		activeMonitors[id] = struct{}{}
+	}
+	if err := monitorRows.Err(); err != nil {
+		monitorRows.Close()
+		return err
+	}
+	monitorRows.Close()
+
+	type ruleMonitorReference struct {
+		id, primary int64
+		raw         string
+	}
+	ruleMonitorRows, err := tx.QueryContext(ctx, `SELECT id, monitor_id, monitor_ids_json FROM rules WHERE deleted_at IS NULL`)
+	if err != nil {
+		return err
+	}
+	ruleMonitorReferences := make([]ruleMonitorReference, 0)
+	for ruleMonitorRows.Next() {
+		var reference ruleMonitorReference
+		if err := ruleMonitorRows.Scan(&reference.id, &reference.primary, &reference.raw); err != nil {
+			ruleMonitorRows.Close()
+			return err
+		}
+		ruleMonitorReferences = append(ruleMonitorReferences, reference)
+	}
+	if err := ruleMonitorRows.Err(); err != nil {
+		ruleMonitorRows.Close()
+		return err
+	}
+	ruleMonitorRows.Close()
+	for _, reference := range ruleMonitorReferences {
+		ids, err := decodeRuleMonitorIDs(reference.primary, reference.raw)
+		if err != nil {
+			return fmt.Errorf("repair rule %d monitors: %w", reference.id, err)
+		}
+		filtered := existingSnapshotIDs(ids, activeMonitors)
+		if len(filtered) == 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE rules SET enabled = 0, deleted_at = ?, monitor_ids_json = '[]', updated_at = ? WHERE id = ? AND deleted_at IS NULL`, now, now, reference.id); err != nil {
+				return err
+			}
+			continue
+		}
+		if slices.Equal(ids, filtered) && reference.primary == filtered[0] {
+			continue
+		}
+		var ruleName string
+		if err := tx.QueryRowContext(ctx, `SELECT name FROM rules WHERE id = ?`, reference.id).Scan(&ruleName); err != nil {
+			return err
+		}
+		ruleName, err = availableRuleName(ctx, tx, reference.id, filtered, ruleName)
+		if err != nil {
+			return err
+		}
+		encoded, _ := json.Marshal(filtered)
+		if _, err := tx.ExecContext(ctx, `UPDATE rules SET monitor_id = ?, monitor_ids_json = ?, name = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, filtered[0], string(encoded), ruleName, now, reference.id); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE rules SET template_id = NULL, updated_at = ?
 		WHERE deleted_at IS NULL AND template_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM notification_templates t WHERE t.id = rules.template_id AND t.deleted_at IS NULL)`, now); err != nil {

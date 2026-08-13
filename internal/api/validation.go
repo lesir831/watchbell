@@ -171,6 +171,9 @@ func validateMonitorConfig(monitorType string, config map[string]any, fields map
 		if provider != "" && provider != "maoyan" {
 			fields["config.provider"] = "当前仅支持 maoyan。"
 		}
+		if value, ok := numberValue(config["cityId"]); ok && value <= 0 {
+			fields["config.cityId"] = "城市 ID 必须是正整数。"
+		}
 		if value, ok := numberValue(config["cinemaId"]); ok && value <= 0 {
 			fields["config.cinemaId"] = "影院 ID 必须是正整数。"
 		}
@@ -210,9 +213,32 @@ func (s *Server) validateRuleInput(ctx context.Context, input model.RuleInput) e
 	if strings.TrimSpace(input.Name) == "" {
 		fields["name"] = "请输入规则名称。"
 	}
-	monitor, err := s.store.GetMonitor(ctx, input.MonitorID)
-	if err != nil {
-		fields["monitorId"] = "请选择一个现有监控。"
+	monitorIDs := effectiveRuleMonitorIDs(input.MonitorID, input.MonitorIDs)
+	if len(monitorIDs) == 0 {
+		fields["monitorIds"] = "请至少选择一个现有监控。"
+	}
+	if len(monitorIDs) > 100 {
+		fields["monitorIds"] = "一条规则最多关联 100 个监控。"
+	}
+	monitorTypes := make([]string, 0, len(monitorIDs))
+	seenMonitors := map[int64]struct{}{}
+	for index, monitorID := range monitorIDs {
+		field := fmt.Sprintf("monitorIds.%d", index)
+		if monitorID <= 0 {
+			fields[field] = "监控 ID 必须是正整数。"
+			continue
+		}
+		if _, duplicate := seenMonitors[monitorID]; duplicate {
+			fields[field] = "关联监控不能重复。"
+			continue
+		}
+		seenMonitors[monitorID] = struct{}{}
+		monitor, err := s.store.GetMonitor(ctx, monitorID)
+		if err != nil {
+			fields[field] = fmt.Sprintf("监控 %d 不存在或已归档。", monitorID)
+			continue
+		}
+		monitorTypes = append(monitorTypes, monitor.Type)
 	}
 	if input.CooldownSeconds < 0 || input.CooldownSeconds > 31_536_000 {
 		fields["cooldownSeconds"] = "冷却时间必须在 0 到 365 天之间。"
@@ -236,8 +262,8 @@ func (s *Server) validateRuleInput(ctx context.Context, input model.RuleInput) e
 	}
 	if err := rule.Validate(input.Condition); err != nil {
 		fields["condition"] = err.Error()
-	} else if monitor.ID > 0 {
-		validateConditionFields(input.Condition, monitor.Type, s.scheduler.Plugins(), fields)
+	} else if len(monitorTypes) > 0 {
+		validateConditionFieldsForTypes(input.Condition, monitorTypes, s.scheduler.Plugins(), fields)
 	}
 	if len(fields) > 0 {
 		return validationProblem("请修正规则配置中的问题。", fields)
@@ -251,15 +277,43 @@ func (s *Server) validateRuleNaturalKey(ctx context.Context, input model.RuleInp
 		return err
 	}
 	name := strings.TrimSpace(input.Name)
+	monitorIDs := effectiveRuleMonitorIDs(input.MonitorID, input.MonitorIDs)
+	if len(monitorIDs) == 0 {
+		return validationProblem("请至少选择一个现有监控。", map[string]string{"monitorIds": "请选择关联监控。"})
+	}
+	primaryMonitorID := monitorIDs[0]
 	for _, item := range items {
-		if item.ID != excludeID && item.MonitorID == input.MonitorID && strings.TrimSpace(item.Name) == name {
-			return validationProblem("同一监控下的规则名称不能重复。", map[string]string{"name": "这个监控已有同名规则。"})
+		if item.ID == excludeID || strings.TrimSpace(item.Name) != name {
+			continue
+		}
+		if item.MonitorID == primaryMonitorID {
+			return validationProblem("同一主监控下的规则名称不能重复。", map[string]string{"name": "这个主监控已有同名规则。"})
+		}
+		if overlappingMonitorID(monitorIDs, item.MonitorIDs) > 0 {
+			return validationProblem("关联同一监控的规则名称不能重复。", map[string]string{"name": "另一个同名规则关联了相同监控。"})
 		}
 	}
 	return nil
 }
 
+func overlappingMonitorID(left, right []int64) int64 {
+	seen := make(map[int64]struct{}, len(left))
+	for _, id := range left {
+		seen[id] = struct{}{}
+	}
+	for _, id := range right {
+		if _, exists := seen[id]; exists {
+			return id
+		}
+	}
+	return 0
+}
+
 func validateConditionFields(raw json.RawMessage, monitorType string, plugins []model.MonitorPlugin, fields map[string]string) {
+	validateConditionFieldsForTypes(raw, []string{monitorType}, plugins, fields)
+}
+
+func validateConditionFieldsForTypes(raw json.RawMessage, monitorTypes []string, plugins []model.MonitorPlugin, fields map[string]string) {
 	if len(raw) == 0 || string(raw) == "{}" {
 		return
 	}
@@ -268,21 +322,29 @@ func validateConditionFields(raw json.RawMessage, monitorType string, plugins []
 		return
 	}
 	allowed := map[string]struct{}{}
+	selectedTypes := map[string]struct{}{}
+	for _, monitorType := range monitorTypes {
+		selectedTypes[monitorType] = struct{}{}
+	}
 	for _, plugin := range plugins {
-		if plugin.ID == monitorType {
+		if _, selected := selectedTypes[plugin.ID]; selected {
 			for _, variable := range plugin.TemplateVariables {
 				allowed[variable] = struct{}{}
 			}
 		}
 	}
-	validateConditionNodeFields(set.Conditions, "condition.conditions", monitorType, allowed, fields)
+	validateConditionNodeFieldsForTypes(set.Conditions, "condition.conditions", monitorTypes, allowed, fields)
 }
 
 func validateConditionNodeFields(conditions []rule.Condition, path, monitorType string, allowed map[string]struct{}, fields map[string]string) {
+	validateConditionNodeFieldsForTypes(conditions, path, []string{monitorType}, allowed, fields)
+}
+
+func validateConditionNodeFieldsForTypes(conditions []rule.Condition, path string, monitorTypes []string, allowed map[string]struct{}, fields map[string]string) {
 	for index, condition := range conditions {
 		nodePath := fmt.Sprintf("%s.%d", path, index)
 		if condition.Conditions != nil || strings.TrimSpace(condition.Match) != "" {
-			validateConditionNodeFields(condition.Conditions, nodePath+".conditions", monitorType, allowed, fields)
+			validateConditionNodeFieldsForTypes(condition.Conditions, nodePath+".conditions", monitorTypes, allowed, fields)
 			continue
 		}
 		if _, ok := allowed[condition.Field]; !ok {
@@ -290,11 +352,48 @@ func validateConditionNodeFields(conditions []rule.Condition, path, monitorType 
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(condition.Operator), "within_last") {
-			definition, exists := eventvars.EventDefinition(monitorType, condition.Field)
-			if !exists || definition.ValueType != "datetime" {
+			validDateTime := false
+			for _, monitorType := range monitorTypes {
+				definition, exists := eventvars.EventDefinition(monitorType, condition.Field)
+				if exists && definition.ValueType == "datetime" {
+					validDateTime = true
+					break
+				}
+			}
+			if !validDateTime {
 				fields[nodePath+".operator"] = "“在最近时间内”只能用于时间字段。"
 			}
 		}
+	}
+}
+
+func effectiveRuleMonitorIDs(primary int64, monitorIDs []int64) []int64 {
+	if len(monitorIDs) > 0 {
+		return monitorIDs
+	}
+	if primary > 0 {
+		return []int64{primary}
+	}
+	return []int64{}
+}
+
+func normalizeRuleInput(input *model.RuleInput) {
+	ids := effectiveRuleMonitorIDs(input.MonitorID, input.MonitorIDs)
+	result := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	input.MonitorIDs = result
+	if len(result) > 0 {
+		input.MonitorID = result[0]
 	}
 }
 

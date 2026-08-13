@@ -43,7 +43,7 @@ func (s *Store) ReadConfigSnapshot(ctx context.Context) (ConfigSnapshot, error) 
 		return ConfigSnapshot{}, err
 	}
 
-	ruleRows, err := tx.QueryContext(ctx, `SELECT id, monitor_id, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, last_fired_at, created_at, updated_at FROM rules WHERE deleted_at IS NULL ORDER BY id DESC`)
+	ruleRows, err := tx.QueryContext(ctx, `SELECT id, monitor_id, monitor_ids_json, name, enabled, condition_json, notify_channel_ids_json, template_id, cooldown_seconds, quiet_hours_json, last_fired_at, created_at, updated_at FROM rules WHERE deleted_at IS NULL ORDER BY id DESC`)
 	if err != nil {
 		return ConfigSnapshot{}, err
 	}
@@ -115,9 +115,11 @@ func normalizeConfigSnapshot(snapshot ConfigSnapshot) ConfigSnapshot {
 
 	rules := make([]model.Rule, 0, len(snapshot.Rules))
 	for _, item := range snapshot.Rules {
-		if _, exists := monitorIDs[item.MonitorID]; !exists {
+		item.MonitorIDs = existingSnapshotIDs(item.MonitorIDs, monitorIDs)
+		if len(item.MonitorIDs) == 0 {
 			continue
 		}
+		item.MonitorID = item.MonitorIDs[0]
 		item.NotifyChannelIDs = existingSnapshotIDs(item.NotifyChannelIDs, channelIDs)
 		if len(item.NotifyChannelIDs) == 0 {
 			continue

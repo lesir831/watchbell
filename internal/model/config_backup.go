@@ -48,6 +48,7 @@ type ConfigBackupMonitor struct {
 type ConfigBackupRule struct {
 	ID               int64           `json:"id"`
 	MonitorID        int64           `json:"monitorId"`
+	MonitorIDs       []int64         `json:"monitorIds,omitempty"`
 	Name             string          `json:"name"`
 	Enabled          bool            `json:"enabled"`
 	Condition        json.RawMessage `json:"condition"`

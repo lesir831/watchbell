@@ -53,6 +53,7 @@ type Scheduler struct {
 	startedAt   time.Time
 	lastTickAt  *time.Time
 	inFlight    map[int64]struct{}
+	ruleLocks   sync.Map
 	maintenance bool
 	mu          sync.Mutex
 }
@@ -496,64 +497,96 @@ func (s *Scheduler) dispatchEvent(ctx context.Context, monitor model.Monitor, ev
 	}
 	var dispatchErr error
 	for _, item := range rules {
+		ruleLock := s.ruleDispatchLock(item.ID)
+		ruleLock.Lock()
+		currentItem, refreshErr := s.store.GetRule(ctx, item.ID)
+		if refreshErr != nil {
+			ruleLock.Unlock()
+			if store.IsNotFound(refreshErr) {
+				continue
+			}
+			return refreshErr
+		}
+		item = currentItem
+		if !containsInt64(item.MonitorIDs, monitor.ID) || !item.Enabled {
+			ruleLock.Unlock()
+			continue
+		}
 		ruleID := item.ID
 		if item.CooldownSeconds > 0 && item.LastFiredAt != nil && s.nowUTC().Sub(*item.LastFiredAt) < time.Duration(item.CooldownSeconds)*time.Second {
 			reason := fmt.Sprintf("规则处于冷却期，结束时间：%s。", item.LastFiredAt.Add(time.Duration(item.CooldownSeconds)*time.Second).Format(time.RFC3339))
 			if _, err := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "skipped", reason, nil); err != nil {
+				ruleLock.Unlock()
 				return err
 			}
+			ruleLock.Unlock()
 			continue
 		}
 		matchDetails, matchErr := rule.EvaluateAt(item.Condition, payload, s.nowUTC())
 		matched := matchDetails.Values
 		if matchErr != nil {
 			if _, err := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "error", matchErr.Error(), matched); err != nil {
+				ruleLock.Unlock()
 				return err
 			}
+			ruleLock.Unlock()
 			continue
 		}
 		if !matchDetails.Matched {
 			if _, err := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "not_matched", matchDetails.MismatchReason, matched); err != nil {
+				ruleLock.Unlock()
 				return err
 			}
+			ruleLock.Unlock()
 			continue
 		}
 		quiet, quietErr := rule.QuietHoursActiveAt(item.QuietHours, s.nowUTC())
 		if quietErr != nil {
 			if _, err := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "error", "免打扰时段配置无效："+quietErr.Error(), matched); err != nil {
+				ruleLock.Unlock()
 				return err
 			}
+			ruleLock.Unlock()
 			continue
 		}
 		if quiet {
 			reason := fmt.Sprintf("规则已匹配，但当前处于免打扰时段（%s–%s，%s），未发送通知。", item.QuietHours.Start, item.QuietHours.End, item.QuietHours.Timezone)
 			if _, err := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "skipped", reason, matched); err != nil {
+				ruleLock.Unlock()
 				return err
 			}
+			ruleLock.Unlock()
 			continue
 		}
 		channels, err := s.store.ListNotifyChannelsByIDs(ctx, item.NotifyChannelIDs)
 		if err != nil {
+			ruleLock.Unlock()
 			return err
 		}
 		if len(channels) == 0 {
 			if _, err := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "skipped", "所选通知渠道均未启用。", matched); err != nil {
+				ruleLock.Unlock()
 				return err
 			}
+			ruleLock.Unlock()
 			continue
 		}
 		template, err := s.templateForRule(ctx, item)
 		if err != nil {
 			if _, recordErr := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "error", err.Error(), matched); recordErr != nil {
+				ruleLock.Unlock()
 				return recordErr
 			}
+			ruleLock.Unlock()
 			continue
 		}
 		data, err := s.notificationData(ctx, monitor, item, event, payload, matched)
 		if err != nil {
 			if _, recordErr := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "error", "格式化通知时间失败："+err.Error(), matched); recordErr != nil {
+				ruleLock.Unlock()
 				return recordErr
 			}
+			ruleLock.Unlock()
 			continue
 		}
 		message := notifier.Message{
@@ -563,6 +596,7 @@ func (s *Scheduler) dispatchEvent(ctx context.Context, monitor model.Monitor, ev
 		}
 		evaluation, err := s.store.CreateRuleEvaluation(ctx, event.ID, &ruleID, item.Name, "matched", "规则已匹配，并已尝试发送通知。", matched)
 		if err != nil {
+			ruleLock.Unlock()
 			return err
 		}
 		successCount := 0
@@ -584,8 +618,23 @@ func (s *Scheduler) dispatchEvent(ctx context.Context, monitor model.Monitor, ev
 				s.logger.Error("update rule fired at", "rule_id", item.ID, "error", err)
 			}
 		}
+		ruleLock.Unlock()
 	}
 	return dispatchErr
+}
+
+func (s *Scheduler) ruleDispatchLock(ruleID int64) *sync.Mutex {
+	value, _ := s.ruleLocks.LoadOrStore(ruleID, &sync.Mutex{})
+	return value.(*sync.Mutex)
+}
+
+func containsInt64(values []int64, target int64) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scheduler) sendAndRecord(ctx context.Context, channel model.NotifyChannel, message notifier.Message, input model.NotificationAttemptInput) (model.NotificationAttempt, error) {

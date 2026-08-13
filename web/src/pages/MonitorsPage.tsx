@@ -15,10 +15,11 @@ import {
   Space,
   Switch
 } from 'antd';
-import { ArrowRightOutlined, CalendarOutlined, DeleteOutlined, EditOutlined, EyeOutlined, GithubOutlined, GlobalOutlined, PlayCircleOutlined, PlusOutlined, RadarChartOutlined, RocketOutlined, SearchOutlined } from '@ant-design/icons';
+import { ArrowRightOutlined, CalendarOutlined, CopyOutlined, DeleteOutlined, EditOutlined, EyeOutlined, GithubOutlined, GlobalOutlined, PlayCircleOutlined, PlusOutlined, RadarChartOutlined, RocketOutlined, SearchOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
 import ConfigFields from '../components/ConfigFields';
+import CinemaScheduleFields, { cinemaDiscoveryConfigKeys } from '../components/CinemaScheduleFields';
 import { AdvancedConfigField, ConfigMode, parseConfigJSON } from '../components/ConfigMode';
 import { EmptyState, formatInterval, PageError, PageHeader, relativeDate, StatusTag } from '../components/Common';
 import type { Monitor, MonitorInput, MonitorPlugin, MonitorType, NotifyChannel, ProxyProfile } from '../types';
@@ -82,6 +83,17 @@ export default function MonitorsPage({ onNavigate, createRequest = 0 }: { onNavi
     onSuccess: async (result) => { await refresh(); message.success(result.eventCount > 0 ? `检查完成，发现 ${result.eventCount} 个新事件` : '检查完成，未发现新事件'); },
     onError: async (error: Error) => { await refresh(); message.error(error.message); }
   });
+  const copyMutation = useMutation({
+    mutationFn: api.copyMonitor,
+    onSuccess: async (item) => {
+      await refresh();
+      saveMutation.reset();
+      setEditing(item);
+      setDrawerOpen(true);
+      message.success('监控副本已创建，默认处于停用状态');
+    },
+    onError: (error: Error) => message.error(error.message)
+  });
   const deleteMutation = useMutation({
     mutationFn: api.deleteMonitor,
     onSuccess: async () => { await refresh(); message.success('监控已归档，历史记录仍会保留'); },
@@ -99,8 +111,9 @@ export default function MonitorsPage({ onNavigate, createRequest = 0 }: { onNavi
     <div className="row-actions">
       <Button className="mini-action" icon={<PlayCircleOutlined />} loading={checkMutation.isPending && checkMutation.variables === record.id} onClick={() => checkMutation.mutate(record.id)}>检查</Button>
       <Button className="mini-action" icon={<EyeOutlined />} onClick={() => onNavigate(`monitors/${record.id}`)}>详情<ArrowRightOutlined /></Button>
+      <Button className="mini-action icon-only" icon={<CopyOutlined />} loading={copyMutation.isPending && copyMutation.variables === record.id} aria-label={`复制 ${record.name}`} title="复制监控" onClick={() => copyMutation.mutate(record.id)} />
       <Button className="mini-action icon-only" icon={<EditOutlined />} aria-label={`编辑 ${record.name}`} onClick={() => { setEditing(record); setDrawerOpen(true); }} />
-      <Popconfirm title="归档这个监控？" description="监控及其规则将停止运行，既有检查、事件和通知历史会保留。" onConfirm={() => deleteMutation.mutate(record.id)}>
+      <Popconfirm title="归档这个监控？" description="它会从共享规则中解除关联；仅关联此监控的规则会一并归档，既有历史保持不变。" onConfirm={() => deleteMutation.mutate(record.id)}>
         <Button className="mini-action icon-only" danger icon={<DeleteOutlined />} aria-label={`归档 ${record.name}`} />
       </Popconfirm>
     </div>
@@ -204,6 +217,7 @@ function MonitorDrawer(props: {
   const [form] = Form.useForm();
   const [advanced, setAdvanced] = useState(false);
   const selectedType = Form.useWatch<MonitorType>('type', form);
+  const proxyId = Form.useWatch<number | null>('proxyId', form);
   const intervalSeconds = Form.useWatch<number>('intervalSeconds', form);
   const failureAlertsEnabled = Form.useWatch<boolean>('failureAlertsEnabled', form);
   const plugin = props.plugins.find((item) => item.id === selectedType) ?? props.plugins[0];
@@ -275,7 +289,12 @@ function MonitorDrawer(props: {
           </Row>}
         </Card>
         <ConfigMode form={form} advanced={advanced} onChange={setAdvanced} />
-        {advanced ? <AdvancedConfigField /> : plugin && <ConfigFields fields={plugin.configFields} configuredSecrets={props.record?.configuredSecrets} />}
+        {advanced ? <AdvancedConfigField /> : plugin && (
+          <>
+            {plugin.id === 'cinema_schedule' && <CinemaScheduleFields proxyId={proxyId} />}
+            <ConfigFields fields={plugin.id === 'cinema_schedule' ? plugin.configFields.filter((field) => !cinemaDiscoveryConfigKeys.has(field.key)) : plugin.configFields} configuredSecrets={props.record?.configuredSecrets} />
+          </>
+        )}
       </Form>
     </Drawer>
   );
