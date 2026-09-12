@@ -113,15 +113,16 @@ func TestWeComConfigValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*WeComConfig){
-		"no secret":   func(c *WeComConfig) { c.CorpSecret = "" },
-		"no agent":    func(c *WeComConfig) { c.AgentID = 0 },
-		"bad key":     func(c *WeComConfig) { c.EncodingAESKey = "short" },
-		"no members":  func(c *WeComConfig) { c.AllowedUserIDs = nil },
-		"all members": func(c *WeComConfig) { c.AllowedUserIDs = []string{"@all"} },
-		"bad token":   func(c *WeComConfig) { c.Token = "secret with spaces" },
-		"private":     func(c *WeComConfig) { c.APIBaseURL = "https://127.0.0.1" },
-		"plaintext":   func(c *WeComConfig) { c.APIBaseURL = "http://example.com" },
-		"query":       func(c *WeComConfig) { c.APIBaseURL = "https://example.com?secret=x" },
+		"no secret":          func(c *WeComConfig) { c.CorpSecret = "" },
+		"no agent":           func(c *WeComConfig) { c.AgentID = 0 },
+		"bad key":            func(c *WeComConfig) { c.EncodingAESKey = "short" },
+		"no members":         func(c *WeComConfig) { c.AllowedUserIDs = nil },
+		"all members":        func(c *WeComConfig) { c.AllowedUserIDs = []string{"@all"} },
+		"bad token":          func(c *WeComConfig) { c.Token = "secret with spaces" },
+		"private":            func(c *WeComConfig) { c.APIBaseURL = "https://127.0.0.1" },
+		"unsupported scheme": func(c *WeComConfig) { c.APIBaseURL = "ftp://example.com" },
+		"private HTTP":       func(c *WeComConfig) { c.APIBaseURL = "http://127.0.0.1" },
+		"query":              func(c *WeComConfig) { c.APIBaseURL = "https://example.com?secret=x" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := base

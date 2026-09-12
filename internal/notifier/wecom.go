@@ -61,9 +61,6 @@ func DecodeWeComConfig(raw json.RawMessage) (WeComConfig, error) {
 	if u.RawQuery != "" || u.ForceQuery || strings.Contains(cfg.APIBaseURL, "${") {
 		return cfg, fmt.Errorf("WeCom API address must not contain query parameters or variables")
 	}
-	if u.Scheme != "https" && !cfg.AllowPrivate {
-		return cfg, fmt.Errorf("WeCom API address must use HTTPS (HTTP is only allowed for trusted private endpoints)")
-	}
 	if cfg.CommandsEnabled {
 		if len(cfg.Token) < 3 || len(cfg.Token) > 32 || strings.IndexFunc(cfg.Token, func(r rune) bool { return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') }) >= 0 {
 			return cfg, fmt.Errorf("callback token must contain 3–32 letters or digits")

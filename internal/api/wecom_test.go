@@ -428,3 +428,58 @@ func TestWeComMenuSyncUsesSavedApplication(t *testing.T) {
 		t.Fatalf("menu sync failed: %d", response.StatusCode)
 	}
 }
+
+// Saving an HTTP forwarding endpoint must not require private-network access
+// or a working outbound connection before WeCom can verify the callback URL.
+func TestWeComHTTPProxyCanSaveThenVerifyCallback(t *testing.T) {
+	server, db := newTestServer(t)
+	cfg := weComTestConfig()
+	cfg.APIBaseURL = "http://wecom-proxy.example.invalid:8080/forward"
+	cfg.AllowPrivate = false
+	raw, _ := json.Marshal(cfg)
+	body, _ := json.Marshal(model.NotifyChannelInput{Name: "HTTP proxy", Type: "wecom", Enabled: true, Config: raw})
+	response, err := http.Post(server.URL+"/api/channels", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("save HTTP proxy: %d %s", response.StatusCode, data)
+	}
+	var channel model.NotifyChannel
+	if err := json.Unmarshal(data, &channel); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.GetNotifyChannel(context.Background(), channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := notifier.DecodeWeComConfig(stored.Config)
+	if err != nil || saved.APIBaseURL != cfg.APIBaseURL || saved.AllowPrivate {
+		t.Fatalf("saved config changed: %v", err)
+	}
+	_, query := weComEnvelope(t, cfg, []byte("verified-without-outbound-proxy"), time.Now().Unix())
+	response, err = http.Get(fmt.Sprintf("%s/api/wecom/%d/callback?%s", server.URL, channel.ID, query.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || string(data) != "verified-without-outbound-proxy" {
+		t.Fatalf("callback verification: %d %s", response.StatusCode, data)
+	}
+	// Editing the redacted form retains credentials and keeps HTTP permitted.
+	body, _ = json.Marshal(model.NotifyChannelInput{Name: channel.Name, Type: channel.Type, Enabled: true, Config: channel.Config})
+	request, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/api/channels/%d", server.URL, channel.ID), bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("edit HTTP proxy: %d %s", response.StatusCode, data)
+	}
+}
