@@ -20,6 +20,8 @@ import { AdvancedConfigField, ConfigMode, parseConfigJSON } from '../components/
 import { EmptyState, PageError, PageHeader, relativeDate, StatusTag } from '../components/Common';
 import type { ChannelType, NotifyChannel, NotifyChannelInput, PluginConfigField } from '../types';
 
+const defaultWeComAPIBaseURL = 'https://qyapi.weixin.qq.com';
+
 const channelSchemas: Record<ChannelType, { name: string; description: string; fields: PluginConfigField[]; defaults: Record<string, unknown> }> = {
   bark: {
     name: 'Bark', description: '向 iPhone 或自托管 Bark Server 推送即时通知。',
@@ -59,14 +61,14 @@ const channelSchemas: Record<ChannelType, { name: string; description: string; f
       { key: 'corpSecret', label: '应用 Secret', type: 'secret', secret: true, required: true },
       { key: 'agentId', label: '应用 AgentID', type: 'number', required: true, description: '应用管理 → 自建应用。' },
       { key: 'toUser', label: '通知接收成员', type: 'string', description: '成员 UserID 用 | 分隔；留空或 @all 表示应用可见范围内所有成员。' },
-      { key: 'apiBaseUrl', label: '消息 API 地址', type: 'url', description: '默认 https://qyapi.weixin.qq.com；可填写可信的企业微信 API 反向代理地址。该服务器会接收应用 Secret，请仅使用你信任的服务。' },
+      { key: 'apiBaseUrl', label: '微信消息转发代理地址', type: 'url', description: '2022 年 6 月 20 日后创建的自建应用，需要通过固定可信 IP 转发时填写代理根地址（不含 /cgi-bin）。不使用代理时请保留默认值 https://qyapi.weixin.qq.com。代理会接收应用 Secret，请仅使用可信服务。' },
       { key: 'allowPrivate', label: '允许内网代理', type: 'boolean', description: '仅连接自己管理的内网代理时开启；也允许该代理使用 HTTP。' },
       { key: 'commandsEnabled', label: '启用指令操作', type: 'boolean', description: '接收查询、立即检查及启停监控指令；需要配置下方回调密钥和成员白名单。' },
       { key: 'token', label: '回调 Token', type: 'secret', secret: true, description: '自建应用 → 接收消息 → 设置 API 接收中生成，3–32 位字母或数字。', showWhen: { key: 'commandsEnabled', equals: true } },
       { key: 'encodingAESKey', label: '回调 EncodingAESKey', type: 'secret', secret: true, description: '企业微信生成的 43 位加密密钥；编辑留空保留已保存密钥。', showWhen: { key: 'commandsEnabled', equals: true } },
       { key: 'allowedUserIds', label: '指令成员白名单', type: 'string-list', description: '填写通讯录中的成员 UserID，输入后按回车。仅这些成员能查询和控制全部监控；不接受 @all。', showWhen: { key: 'commandsEnabled', equals: true } }
     ],
-    defaults: { corpId: '', corpSecret: '', agentId: undefined, toUser: '@all', apiBaseUrl: 'https://qyapi.weixin.qq.com', allowPrivate: false, commandsEnabled: false, token: '', encodingAESKey: '', allowedUserIds: [] }
+    defaults: { corpId: '', corpSecret: '', agentId: undefined, toUser: '@all', apiBaseUrl: defaultWeComAPIBaseURL, allowPrivate: false, commandsEnabled: false, token: '', encodingAESKey: '', allowedUserIds: [] }
   },
   dingtalk: {
     name: '钉钉机器人', description: '通过钉钉群自定义机器人 Webhook 发送通知，支持文本、Markdown、链接、ActionCard 和 FeedCard。',
@@ -211,7 +213,10 @@ function ChannelDrawer(props: { open: boolean; record: NotifyChannel | null; sav
   const selectedType = Form.useWatch<ChannelType>('type', form) ?? props.record?.type ?? 'bark';
   const schema = channelSchemas[selectedType];
   const setInitial = () => {
-    const config = props.record?.config ?? channelSchemas.bark.defaults;
+    const config = { ...(props.record?.config ?? channelSchemas.bark.defaults) };
+    if (props.record?.type === 'wecom' && (config.apiBaseUrl == null || (typeof config.apiBaseUrl === 'string' && !config.apiBaseUrl.trim()))) {
+      config.apiBaseUrl = defaultWeComAPIBaseURL;
+    }
     setAdvanced(false);
     form.resetFields();
     form.setFieldsValue({ name: props.record?.name ?? '', type: props.record?.type ?? 'bark', enabled: props.record?.enabled ?? true });
@@ -221,6 +226,9 @@ function ChannelDrawer(props: { open: boolean; record: NotifyChannel | null; sav
   const submit = async (testAfter: boolean) => {
     const values = await form.validateFields();
     const config = advanced ? parseConfigJSON(values.rawConfig) : (form.getFieldValue('config') ?? {});
+    if (values.type === 'wecom' && (config.apiBaseUrl == null || (typeof config.apiBaseUrl === 'string' && !config.apiBaseUrl.trim()))) {
+      config.apiBaseUrl = defaultWeComAPIBaseURL;
+    }
     props.onSave({ name: values.name.trim(), type: values.type, enabled: values.enabled, config }, testAfter);
   };
   return (
