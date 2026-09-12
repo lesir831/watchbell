@@ -9,9 +9,10 @@ import {
   Popconfirm,
   Select,
   Space,
-  Switch
+  Switch,
+  Typography
 } from 'antd';
-import { BellOutlined, CodeOutlined, CopyOutlined, DeleteOutlined, DingdingOutlined, EditOutlined, MailOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons';
+import { BellOutlined, CodeOutlined, CopyOutlined, DeleteOutlined, DingdingOutlined, WechatOutlined, EditOutlined, MailOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, APIError } from '../api';
 import ConfigFields from '../components/ConfigFields';
@@ -50,6 +51,22 @@ const channelSchemas: Record<ChannelType, { name: string; description: string; f
       { key: 'allowPrivate', label: '允许内网地址', type: 'boolean', description: '仅在连接你信任的内网/本机服务时开启；默认阻止 SSRF' }
     ],
     defaults: { url: '', method: 'POST', headers: { 'Content-Type': 'application/json' }, bodyTemplate: '', allowPrivate: false }
+  },
+  wecom: {
+    name: '企业微信', description: '使用企业微信自建应用发送通知，通过加密回调接收文字指令和菜单操作。',
+    fields: [
+      { key: 'corpId', label: '企业 ID（CorpID）', type: 'string', required: true, description: '企业微信管理后台 → 我的企业 → 企业信息。' },
+      { key: 'corpSecret', label: '应用 Secret', type: 'secret', secret: true, required: true },
+      { key: 'agentId', label: '应用 AgentID', type: 'number', required: true, description: '应用管理 → 自建应用。' },
+      { key: 'toUser', label: '通知接收成员', type: 'string', description: '成员 UserID 用 | 分隔；留空或 @all 表示应用可见范围内所有成员。' },
+      { key: 'apiBaseUrl', label: '消息 API 地址', type: 'url', description: '默认 https://qyapi.weixin.qq.com；可填写可信的企业微信 API 反向代理地址。该服务器会接收应用 Secret，请仅使用你信任的服务。' },
+      { key: 'allowPrivate', label: '允许内网代理', type: 'boolean', description: '仅连接自己管理的内网代理时开启；也允许该代理使用 HTTP。' },
+      { key: 'commandsEnabled', label: '启用指令操作', type: 'boolean', description: '接收查询、立即检查及启停监控指令；需要配置下方回调密钥和成员白名单。' },
+      { key: 'token', label: '回调 Token', type: 'secret', secret: true, description: '自建应用 → 接收消息 → 设置 API 接收中生成，3–32 位字母或数字。', showWhen: { key: 'commandsEnabled', equals: true } },
+      { key: 'encodingAESKey', label: '回调 EncodingAESKey', type: 'secret', secret: true, description: '企业微信生成的 43 位加密密钥；编辑留空保留已保存密钥。', showWhen: { key: 'commandsEnabled', equals: true } },
+      { key: 'allowedUserIds', label: '指令成员白名单', type: 'string-list', description: '填写通讯录中的成员 UserID，输入后按回车。仅这些成员能查询和控制全部监控；不接受 @all。', showWhen: { key: 'commandsEnabled', equals: true } }
+    ],
+    defaults: { corpId: '', corpSecret: '', agentId: undefined, toUser: '@all', apiBaseUrl: 'https://qyapi.weixin.qq.com', allowPrivate: false, commandsEnabled: false, token: '', encodingAESKey: '', allowedUserIds: [] }
   },
   dingtalk: {
     name: '钉钉机器人', description: '通过钉钉群自定义机器人 Webhook 发送通知，支持文本、Markdown、链接、ActionCard 和 FeedCard。',
@@ -111,6 +128,11 @@ export default function ChannelsPage() {
     onSuccess: async () => { await refresh(); message.success('测试通知已发送，结果已记录'); },
     onError: async (error: APIError) => { await refresh(); message.error(error.message); }
   });
+  const menuMutation = useMutation({
+    mutationFn: api.syncWeComMenu,
+    onSuccess: async () => { await refresh(); message.success('企业微信菜单已同步，客户端可能稍后显示'); },
+    onError: (error: Error) => message.error(error.message)
+  });
   const copyMutation = useMutation({
     mutationFn: api.copyChannel,
     onSuccess: async (item) => {
@@ -131,6 +153,7 @@ export default function ChannelsPage() {
   const actions = (record: NotifyChannel) => (
     <div className="resource-actions">
       <Button className="mini-action" icon={<SendOutlined />} loading={testMutation.isPending && testMutation.variables === record.id} onClick={() => testMutation.mutate(record.id)}>发送测试</Button>
+      {record.type === 'wecom' && record.enabled && Boolean(record.config.commandsEnabled) && <Popconfirm title="同步 WatchBell 菜单？" description="将覆盖此企业微信应用的现有菜单，提供监控列表、运行状态和指令帮助。" onConfirm={() => menuMutation.mutate(record.id)}><Button className="mini-action" loading={menuMutation.isPending && menuMutation.variables === record.id}>同步菜单</Button></Popconfirm>}
       <Button className="mini-action icon-only" icon={<CopyOutlined />} loading={copyMutation.isPending && copyMutation.variables === record.id} aria-label={`复制 ${record.name}`} title="复制通知渠道" onClick={() => copyMutation.mutate(record.id)} />
       <Button className="mini-action" icon={<EditOutlined />} onClick={() => { setEditing(record); setDrawerOpen(true); }}>编辑</Button>
       <Popconfirm title="归档这个渠道？" description="关联会从规则和故障告警中移除；失去全部渠道的规则将一并归档。历史发送记录会保留。" onConfirm={() => deleteMutation.mutate(record.id)}><Button danger icon={<DeleteOutlined />} aria-label={`归档 ${record.name}`} /></Popconfirm>
@@ -146,7 +169,7 @@ export default function ChannelsPage() {
       />
       <PageError error={(channels.error || rules.error || attempts.error) as Error | null} onRetry={() => { channels.refetch(); rules.refetch(); attempts.refetch(); }} />
       {!channels.data?.length && !channels.isLoading ? (
-        <div className="empty-panel"><EmptyState title="还没有通知渠道" description="先配置 Bark、钉钉机器人或 SMTP，并发送一次测试通知。" action={<Button type="primary" onClick={openNew}>创建第一个渠道</Button>} /></div>
+        <div className="empty-panel"><EmptyState title="还没有通知渠道" description="先配置 Bark、企业微信、钉钉机器人或 SMTP，并发送一次测试通知。" action={<Button type="primary" onClick={openNew}>创建第一个渠道</Button>} /></div>
       ) : (
         <div className="collection-grid">
           {(channels.data ?? []).map((item) => {
@@ -176,6 +199,7 @@ export default function ChannelsPage() {
 
 function channelIcon(type: ChannelType) {
   if (type === 'bark') return <BellOutlined />;
+  if (type === 'wecom') return <WechatOutlined />;
   if (type === 'email') return <MailOutlined />;
   if (type === 'dingtalk') return <DingdingOutlined />;
   return <CodeOutlined />;
@@ -213,6 +237,13 @@ function ChannelDrawer(props: { open: boolean; record: NotifyChannel | null; sav
         <Form.Item name="name" label="名称" rules={[{ required: true, whitespace: true }]}><Input placeholder="例如：我的 iPhone" /></Form.Item>
         <Form.Item name="type" label="渠道类型" extra={props.record ? '已创建渠道的类型不可修改。' : undefined}><Select disabled={Boolean(props.record)} options={Object.entries(channelSchemas).map(([value, item]) => ({ label: item.name, value }))} /></Form.Item>
         <Form.Item name="enabled" label="启用渠道" valuePropName="checked"><Switch /></Form.Item>
+        {selectedType === 'wecom' && <Alert type="info" showIcon style={{ marginBottom: 16 }} message="企业微信接收消息设置" description={<Space direction="vertical" size={8}>
+          <span>先保存渠道，再将回调地址填入企业微信自建应用的“接收消息”配置。Token 和 EncodingAESKey 必须与这里一致。</span>
+          {props.record ? <Typography.Text copyable code>{`${window.location.origin}/api/wecom/${props.record.id}/callback`}</Typography.Text> : <span>保存后重新编辑，即可复制此渠道的回调地址。</span>}
+          <span>地址需从公网访问；若当前使用内网地址，请替换成实际公网 HTTPS 域名。企业微信后台还需配置应用可信 IP 和成员可见范围。</span>
+          <span>指令：/help、/monitors [页码]、/status [ID]、/check ID、/enable ID、/disable ID。也支持“帮助、监控、状态、检查、启用、停用”。</span>
+          <span>保存并完成回调验证后，可在渠道卡片上同步应用菜单。</span>
+        </Space>} />}
         <ConfigMode form={form} advanced={advanced} onChange={setAdvanced} />
         {advanced ? <AdvancedConfigField /> : <ConfigFields fields={schema.fields} configuredSecrets={props.record?.configuredSecrets} />}
       </Form>

@@ -14,6 +14,7 @@ const (
 
 	ChannelTypeBark     = "bark"
 	ChannelTypeDingTalk = "dingtalk"
+	ChannelTypeWeCom    = "wecom"
 	ChannelTypeEmail    = "email"
 	ChannelTypeWebhook  = "webhook"
 

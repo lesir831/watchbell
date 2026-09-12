@@ -28,6 +28,8 @@ import (
 )
 
 type Server struct {
+	weCom              *notifier.WeComNotifier
+	weComSlots         chan struct{}
 	store              *store.Store
 	scheduler          *scheduler.Scheduler
 	webDir             string
@@ -52,7 +54,7 @@ func NewServer(store *store.Store, scheduler *scheduler.Scheduler, webDir string
 	if logger == nil {
 		logger = slog.Default()
 	}
-	server := &Server{store: store, scheduler: scheduler, webDir: webDir, logger: logger, auth: authManager}
+	server := &Server{weCom: notifier.NewWeComNotifier(), weComSlots: make(chan struct{}, 4), store: store, scheduler: scheduler, webDir: webDir, logger: logger, auth: authManager}
 	for _, option := range options {
 		option(server)
 	}
@@ -79,6 +81,10 @@ func (s *Server) Routes() http.Handler {
 	}
 	r.Use(s.accessLog)
 	r.Use(middleware.Recoverer)
+
+	// Enterprise callbacks authenticate with their own signature, not a browser session.
+	r.Get("/api/wecom/{id}/callback", s.weComCallback)
+	r.Post("/api/wecom/{id}/callback", s.weComCallback)
 
 	r.Route("/api", func(r chi.Router) {
 		if s.auth != nil && s.auth.Enabled() {
@@ -150,6 +156,7 @@ func (s *Server) privateRoutes(r chi.Router) {
 	r.Delete("/channels/{id}", s.deleteNotifyChannel)
 	r.Post("/channels/{id}/copy", s.copyNotifyChannel)
 	r.Post("/channels/{id}/test", s.testNotifyChannel)
+	r.Post("/channels/{id}/wecom-menu", s.syncWeComMenu)
 
 	r.Get("/templates", s.listNotificationTemplates)
 	r.Post("/templates", s.createNotificationTemplate)

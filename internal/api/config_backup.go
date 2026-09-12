@@ -454,6 +454,8 @@ func backupSecretValidationValues(channelType string) map[string]any {
 			"url":     "https://example.com/watchbell-validation",
 			"headers": map[string]any{"X-WatchBell-Validation": "redacted"},
 		}
+	case model.ChannelTypeWeCom:
+		return map[string]any{"corpSecret": "validation-secret", "token": "validationToken", "encodingAESKey": strings.Repeat("a", 43)}
 	case model.ChannelTypeDingTalk:
 		return map[string]any{
 			"webhookUrl": "https://oapi.dingtalk.com/robot/send?access_token=watchbell-validation",

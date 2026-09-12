@@ -402,7 +402,7 @@ func validateChannelInput(input model.NotifyChannelInput) error {
 	if strings.TrimSpace(input.Name) == "" {
 		fields["name"] = "请输入渠道名称。"
 	}
-	if input.Type != model.ChannelTypeBark && input.Type != model.ChannelTypeDingTalk && input.Type != model.ChannelTypeEmail && input.Type != model.ChannelTypeWebhook {
+	if input.Type != model.ChannelTypeWeCom && input.Type != model.ChannelTypeBark && input.Type != model.ChannelTypeDingTalk && input.Type != model.ChannelTypeEmail && input.Type != model.ChannelTypeWebhook {
 		fields["type"] = "请选择支持的渠道类型。"
 	}
 	configObject, err := decodeJSONObject(input.Config)
@@ -424,6 +424,10 @@ func validateChannelInput(input model.NotifyChannelInput) error {
 			if raw := strings.TrimSpace(cfg.Icon); raw != "" && !validHTTPURL(raw) {
 				fields["config.icon"] = "图标必须是有效的 HTTP 或 HTTPS URL。"
 			}
+		}
+	} else if input.Type == model.ChannelTypeWeCom {
+		if err := notifier.ValidateWeComConfig(input.Config); err != nil {
+			fields["config"] = "企业微信配置无效：" + err.Error()
 		}
 	} else if input.Type == model.ChannelTypeDingTalk {
 		if err := notifier.ValidateDingTalkConfig(input.Config); err != nil {

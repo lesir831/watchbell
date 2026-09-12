@@ -247,3 +247,13 @@ Time: ${event.time}
 ${rss.title}${testflight.message}${webpage.summary}
 
 ${rss.link}${testflight.url}${webpage.url}';
+
+-- Signed callback receipts survive process restarts; timestamps older than
+-- five minutes are rejected before this table is consulted.
+CREATE TABLE IF NOT EXISTS wecom_callback_receipts (
+    channel_id INTEGER NOT NULL,
+    message_key TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (channel_id, message_key)
+);
+CREATE INDEX IF NOT EXISTS idx_wecom_callback_receipts_created ON wecom_callback_receipts(created_at);

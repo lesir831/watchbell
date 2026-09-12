@@ -1,5 +1,5 @@
 export type MonitorType = 'rss' | 'testflight' | 'webpage' | 'github_release' | 'cinema_schedule';
-export type ChannelType = 'bark' | 'email' | 'webhook' | 'dingtalk';
+export type ChannelType = 'bark' | 'email' | 'webhook' | 'dingtalk' | 'wecom';
 export type ProxyType = 'http' | 'https' | 'socks5';
 
 export interface PluginConfigField {

@@ -148,6 +148,8 @@ func channelSecretKeys(channelType string) []string {
 	switch channelType {
 	case model.ChannelTypeBark:
 		return []string{"deviceKey"}
+	case model.ChannelTypeWeCom:
+		return []string{"corpSecret", "token", "encodingAESKey"}
 	case model.ChannelTypeDingTalk:
 		// The access token is embedded in webhookUrl; secret is the optional
 		// HMAC signing key configured in DingTalk's robot security settings.

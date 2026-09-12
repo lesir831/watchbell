@@ -125,6 +125,7 @@ func main() {
 	notifiers := notifier.NewRegistry(
 		notifier.NewBarkNotifier(),
 		notifier.NewDingTalkNotifier(),
+		notifier.NewWeComNotifier(),
 		notifier.NewEmailNotifier(),
 		notifier.NewWebhookNotifier(),
 	)

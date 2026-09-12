@@ -150,6 +150,7 @@ export const api = {
   copyChannel: (id: number) => request<NotifyChannel>(`/api/channels/${id}/copy`, jsonInit('POST')),
   updateChannel: (id: number, body: NotifyChannelInput) => request<NotifyChannel>(`/api/channels/${id}`, jsonInit('PUT', body)),
   deleteChannel: (id: number) => request<void>(`/api/channels/${id}`, jsonInit('DELETE')),
+  syncWeComMenu: (id: number) => request<{ status: string }>(`/api/channels/${id}/wecom-menu`, jsonInit('POST')),
   testChannel: (id: number) => request<NotificationAttempt>(`/api/channels/${id}/test`, jsonInit('POST')),
 
   listTemplates: () => request<NotificationTemplate[]>('/api/templates'),
